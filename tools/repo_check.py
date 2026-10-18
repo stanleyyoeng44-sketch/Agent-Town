@@ -855,28 +855,67 @@ def c11_readme_docker_flags(root):
     # 3. The volume MOUNTS are the thing that was missing, so compare the
     #    mount TARGETS, not just the -v flag. A block with one -v and a code
     #    path with three is still the defect.
+    def _target(mount):
+        """Container path of a `host:container[:ro]` mount.
+
+        rstrip(":ro") is a CHARACTER-CLASS strip, not a suffix strip: it turns
+        "ro" into "" and silently erases every read-only mount from both
+        sides. That made the system-prompt and transfer-token mounts
+        invisible to this check (found 2026-10-18 by adding a fourth volume
+        to start_agent and watching C11 stay green). Use removesuffix.
+        """
+        cont = mount.split(":")[-1] if mount.count(":") < 2 else mount.split(":")[1]
+        if mount.endswith(":ro"):
+            cont = mount[:-3].split(":")[-1]
+        return cont
+
     code_mounts = set(re.findall(r'"([^"]*?:/[^"]*)"', body))
-    code_targets = {m.split(":")[-1].rstrip(":ro") for m in code_mounts
-                    if ":" in m}
-    readme_targets = {m.split(":")[-1].rstrip(":ro")
-                      for m in re.findall(r"-v\s+(\S+)", block) if ":" in m}
-    lost = sorted(set(code_targets) - {"/workspace/self", "/workspace/transcripts",
-                                       "/workspace/.claude"} - readme_targets)
-    missing_durable = sorted({"/workspace/self", "/workspace/transcripts",
-                              "/workspace/.claude"} - readme_targets)
-    if missing_durable:
+    code_targets = {_target(m) for m in code_mounts} - {""}
+    readme_targets = {_target(m) for m in re.findall(r"-v\s+(\S+)", block)} - {""}
+    # The transfer token is mounted ONLY for agent-0 (control.py:190) and the
+    # README block is agent-1's, so it is excluded BY NAME, with the reason
+    # here, rather than silently absorbed by a subtraction.
+    conditional = {"/app/agent0-transfer-token"}
+    code_targets -= conditional
+
+    # ONE comparison covers all three failures this check exists for. Listing
+    # the three durable paths separately is how the first version missed a
+    # FOURTH volume: it checked the three names it knew and had no limb for
+    # "a mount the code makes that the block does not have" (it computed that
+    # set and then discarded it with `del lost`). A transcription is wrong if
+    # it omits ANY flag, not only the three that were once forgotten.
+    #
+    # `test -v` and the transfer token are the only deliberate absences; each
+    # is named, and a new one has to be argued for here.
+    lost = sorted(code_targets - readme_targets)
+    if lost:
         return "C11 readme docker flags", "FAIL", [
-            f"README's docker run does not mount {missing_durable} -- these "
-            f"are the durable volumes; without them the agent is a first-boot "
-            f"stranger after every stop/start."]
-    if "CLAUDE_CONFIG_DIR" not in block:
+            f"start_agent mounts {lost} but the README's docker run does not. "
+            f"The block is presented as what the code runs; a mount it omits "
+            f"is a mount an operator will not have."]
+    # THE ENV VARS, AS A SET -- not one hard-coded name. The first version
+    # checked only CLAUDE_CONFIG_DIR, which was the env var that had been
+    # forgotten; adding ANY OTHER -e to start_agent left C11 green while
+    # agent-7's flagcheck (which compares env NAMES) went red. Two
+    # implementations of one fact disagreeing is the signal, and the answer
+    # is to compare the set here too.
+    #
+    # AGENT_NAME/AGENT_MODEL are per-agent values the code sets from `name`
+    # and `model`; the README block is agent-1's, so they are named as
+    # conditional rather than silently excluded.
+    conditional_env = {"AGENT_NAME", "AGENT_MODEL"}
+    code_env = {v for v in re.findall(r'"([A-Z][A-Z0-9_]{2,})=', body)} - conditional_env
+    readme_env = set(re.findall(r"-e\s+(?:[A-Z_]+=)?([A-Z][A-Z0-9_]{2,})=", block))
+    readme_env |= {v for v in re.findall(r"-e\s+([A-Z][A-Z0-9_]{2,})=", block)}
+    missing_env = sorted(code_env - readme_env)
+    if missing_env:
         return "C11 readme docker flags", "FAIL", [
-            "README's docker run does not set CLAUDE_CONFIG_DIR; without it "
-            "the CLI's session records are not on a volume and resume cannot "
-            "work at all."]
-    del lost
+            f"start_agent sets {missing_env} but the README's docker run does "
+            f"not. An env var an operator does not set is a behaviour they do "
+            f"not get (CLAUDE_CONFIG_DIR is the one that already bit us)."]
     return "C11 readme docker flags", "PASS", [
-        "README block carries every durable mount and CLAUDE_CONFIG_DIR"]
+        f"README block carries all {len(code_targets)} mounts and "
+        f"{len(code_env)} env vars the code sets"]
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
@@ -1374,6 +1413,12 @@ def selftest():
         open(os.path.join(d, "README.md"), "w", encoding="utf-8").write(readme_text)
         open(os.path.join(d, "ui", "control.py"), "w",
              encoding="utf-8").write(ctl_text)
+        # C8 in the farm reads the README's numbers and needs demo/, exactly
+        # as the other C8 arms do; without it the run is red for a reason
+        # having nothing to do with C11, which would make every C11 arm pass.
+        for rel in ("demo/town.py", "demo/selftest_demo.py"):
+            os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
         _git(d, "add", "-f", ".")
         _git(d, "commit", "-qm", "c11 fixture")
         _ok, r = run(d)
@@ -1391,6 +1436,43 @@ def selftest():
     outcomes.append(("C11 catches a dropped durable volume",
                      stripped != readme_src
                      and c11_on(stripped, ctl_src) == "FAIL"))
+
+    # Arm 4: a MOUNT THE CODE MAKES THAT THE BLOCK DOES NOT. This is the limb
+    # that was computed and thrown away (del lost) and the rstrip bug that hid
+    # every :ro mount: adding a fourth volume to start_agent left C11 GREEN
+    # until 14:47 today. The control adds it to the code side only, so the
+    # only way to pass is to compare the two sets for real -- not just the
+    # three known durable paths.
+    four = ctl_src.replace(
+        '"-v", f"{workspace_volume(name, \'claude\')}:/workspace/.claude",',
+        '"-v", f"{workspace_volume(name, \'claude\')}:/workspace/.claude",\n'
+        '        "-v", f"{workspace_volume(name, \'inbox\')}:/workspace/inbox",',
+        1)
+    outcomes.append(("C11 catches a mount the code makes and the README omits",
+                     four != ctl_src and c11_on(readme_src, four) == "FAIL"))
+
+    # Arm 5: a read-only mount must not be invisible. rstrip(":ro") is a
+    # character strip and erased every `:ro` mount from BOTH sides, so the
+    # system prompt and transfer token never reached the comparison at all.
+    # A block that omits the system-prompt mount must FAIL.
+    noprompt = readme_src.replace(
+        "  -v <prompts>/agent-1/system-prompt.txt:/app/system-prompt.txt:ro \\\n",
+        "", 1)
+    outcomes.append(("C11 catches a dropped :ro mount (system prompt)",
+                     noprompt != readme_src
+                     and c11_on(noprompt, ctl_src) == "FAIL"))
+
+    # Arm 6: a NEW env var in start_agent must be caught. The first version
+    # hard-coded CLAUDE_CONFIG_DIR and nothing else, so any other -e added to
+    # the code left C11 green; agent-7's independent flagcheck caught it,
+    # which is what two witnesses are for. This arm fails unless the env
+    # comparison is a SET.
+    newev = ctl_src.replace(
+        '"-e", "CLAUDE_CONFIG_DIR=/workspace/.claude",',
+        '"-e", "CLAUDE_CONFIG_DIR=/workspace/.claude",\n'
+        '        "-e", "AGENT_NEW_ENV=1",', 1)
+    outcomes.append(("C11 catches a NEW env var the README does not set",
+                     newev != ctl_src and c11_on(readme_src, newev) == "FAIL"))
 
     # Arm 2: the env var that makes resume work is dropped.
     noenv = readme_src.replace("  -e CLAUDE_CONFIG_DIR=/workspace/.claude \\\n",
