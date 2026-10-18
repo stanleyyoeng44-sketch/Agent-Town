@@ -318,8 +318,18 @@ def _strip_env_prefix(line):
 
     it consumed 'docker0=$(ip' and returned '-o addr show docker0 | ...'.
     That value is what C5 CLASSIFIES and what it SHOWS as the skip reason, so
-    the checker reported a fragment of a command as the command. A corrupted
-    view is worse than no view: it makes a real skip read like noise.
+    the checker reported a fragment of a command as the command.
+
+    IT WAS REPORTED AS COSMETIC AND IT WAS NOT. MEASURED on ede3310, same
+    parser, a block that is ONE shell assignment:
+
+        X=$(env python3 -c "open('/tmp/.../SIDE_EFFECT','w').write('ran')")
+
+    parsed as first='python3 -c "open(...)...")', matched RUNNABLE, and THE
+    WHOLE LINE WAS EXECUTED -- the file appeared and the run said PASS. So a
+    garbled parse is not a garbled label: it decides WHETHER A DOCUMENT'S CODE
+    RUNS. The arm ("C5 does not EXECUTE a block that is only an assignment")
+    asserts the positive artifact, and the old parser fails it.
 
     Rules, in order:
       * VAR=$( ... )  consume to the MATCHING ')' (quotes respected), then
@@ -1661,6 +1671,33 @@ def selftest():
     outcomes.append(("C5 _first_cmd still strips an ordinary VAR=value",
                      _first_cmd("PYTHONPATH=/x python3 -c 'print(1)'")
                      == "python3 -c 'print(1)'"))
+
+    # C5a4: THE CONSEQUENCE, as an artifact rather than a status word.
+    # The parse bug was reported as cosmetic -- a garbled skip REASON. It was
+    # not: the fragment is what C5 hands to subprocess. MEASURED on ede3310,
+    # a doc block consisting of ONE shell assignment
+    #     X=$(env python3 -c "open('<path>','w').write('ran')")
+    # was parsed as first='python3 -c "open(...)...")', matched RUNNABLE, and
+    # THE WHOLE LINE WAS EXECUTED: the marker file appeared, and the run
+    # reported PASS. That is the docstring's own courier rule -- a doc command
+    # is a new courier -- defeated by a parser. The evidence is the positive
+    # artifact, inside the fixture's own temp directory.
+    d = farm()
+    leak = os.path.join(d, "SIDE_EFFECT")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\nX=$(env python3 -c \"open(%r,'w').write('ran')\")\n```\n"
+        % leak)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "assignment block")
+    _, r = run(d)
+    written = os.path.exists(leak)
+    # Leave no artifact behind even when the arm FAILS, so the failure is
+    # about the checker and not about the fixture.
+    shutil.rmtree(d)
+    outcomes.append(("C5 does not EXECUTE a block that is only an assignment",
+                     not written))
 
     # C5b: SKIP must not silence a command that would have PASSED.
     # "SKIP" used to be a universal silencer: any doc could disable its own
