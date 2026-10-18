@@ -1399,7 +1399,13 @@ def c14_check_registry(root):
 
     SCOPE, and it is narrower than it looks: this compares NAMES. A check
     whose body is gutted to `return ("x", "PASS", [])` is still registered and
-    still named, and C14 passes. That is the boundary of a registry check, not
+    still named, and C14 passes. Second limit, added after agent-7 asked for
+    the sentence to match the predicate: a check-shaped function that is
+    CALLED FROM PRODUCTION CODE is treated as a helper and is not reported,
+    so "C14 PASS" means every check-shaped function is either registered or
+    called by production code -- not simply registered. A check called only
+    from the selftest IS reported; that distinction is the fix in this
+    commit, because liveness is not registration. That is the boundary of a registry check, not
     a defect in this one -- catching a gutted body needs a different
     instrument (inject a defect per check and require red). Stated here so
     "registry PASS" is not read as more than it is. (agent-2's review.)
