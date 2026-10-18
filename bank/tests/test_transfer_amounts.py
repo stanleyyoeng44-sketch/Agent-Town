@@ -46,10 +46,26 @@ def build(fixed):
     work = tempfile.mkdtemp()
     path = os.path.join(work, "bank.py")
     src = open(BANK, encoding="utf-8").read()
-    src = src.replace('DATA = "/data/accounts.json"',
-                      "DATA = %r" % os.path.join(work, "accounts.json"))
+    # Redirect the ledger and mailbox to the temp dir. Master reads DATA from
+    # the environment; older branches hardcode the literal. Patch whichever is
+    # present, then ASSERT the patch took effect -- a redirect that quietly
+    # misses is a no-op, and a no-op test still prints PASS.
+    ledger = os.path.join(work, "accounts.json")
+    data_env = 'DATA = os.environ.get("DATA", "/data/accounts.json")'
+    data_lit = 'DATA = "/data/accounts.json"'
+    if data_env in src:
+        src = src.replace(data_env, "DATA = %r" % ledger)
+    elif data_lit in src:
+        src = src.replace(data_lit, "DATA = %r" % ledger)
+    else:
+        raise AssertionError("bank.py has no DATA assignment this test knows "
+                             "how to redirect; the ledger would be shared")
+    assert ledger in src, "ledger redirect did not take effect"
+    box = os.path.join(work, "mailbox")
+    assert 'MAILBOX = "/shared/mailbox"' in src, "mailbox literal not found"
     src = src.replace('MAILBOX = "/shared/mailbox"',
-                      'MAILBOX = %r' % os.path.join(work, "mailbox"))
+                      'MAILBOX = %r' % box)
+    assert box in src, "mailbox redirect did not take effect"
     guard = ('            if sender not in _accounts:\n'
              '                return self._send(400, {"error": "unknown sender"})\n')
     if fixed:
