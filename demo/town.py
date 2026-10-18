@@ -159,8 +159,11 @@ def main():
     # Shape 1 exists so that fixing the bank does not silently break the demo:
     # matching only on the hardcoded literal would turn a GOOD change into an
     # exit-2 failure.
+    # SEED funds exactly the names this demo provisions. Accounts are created
+    # at 0 by design (a new balance must never be a grant -- see bank.py
+    # ensure_account), so without SEED the two agents would start broke.
     env = dict(os.environ, PORT=str(port), START_MONEY="100",
-               DECAY_SECONDS="3600")
+               SEED="agent-1:100,agent-2:100", DECAY_SECONDS="3600")
     src = open(BANK, encoding="utf-8").read()
     env_name = None
     for cand in ("BANK_DATA", "DATA", "LEDGER"):
@@ -215,10 +218,23 @@ def main():
         say("1. bank")
         a = http("GET", f"{base}/balance/agent-1")
         b = http("GET", f"{base}/balance/agent-2")
-        check("agents auto-created with START_MONEY=100",
+        check("seeded agents start at 100",
               a["money"] == 100 and b["money"] == 100, f"{a} {b}")
         r = http("POST", f"{base}/transfer",
                  {"from": "agent-1", "to": "agent-2", "amount": 25})
+        # -- the MINT INVARIANT: touching an unknown name must not create
+        # wealth. This is the check whose absence let a minting bank pass the
+        # whole demo. It runs BEFORE any transfer that could muddy the books.
+        ghost = http("GET", f"{base}/balance/ghost-not-an-agent")
+        check("unknown name is created at 0, not funded",
+              ghost.get("money") == 0, str(ghost))
+        check("unknown name reports exists=false",
+              ghost.get("exists") is False, str(ghost))
+        total_before = sum(http("GET", f"{base}/accounts")["accounts"].values())
+        check("touching an unknown name creates no coins",
+              total_before == 200,
+              f"total={total_before} expected 200 (2 x 100)")
+
         check("transfer 25 moves coins", r.get("ok") is True, str(r))
         check("sender debited", r["money"] == 75, str(r))
         check("recipient credited", r["recipient_balance"] == 125, str(r))

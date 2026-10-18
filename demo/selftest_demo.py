@@ -90,6 +90,24 @@ def unknown_shape(src):
     # neither the literal nor an env read the demo recognises
     return _mutate_data(src, 'DATA = "/srv/x/ledger.json"  # mutated: unknown shape')
 
+def grant_on_create(src):
+    """A bank that GRANTS on first touch must fail the demo.
+
+    This is the mint as a negative control. Accounts are created at 0 on
+    purpose; if creating one also pays START_MONEY, then naming a fresh
+    account is free money. The demo asserts the exact seeded balances and that
+    touching an unknown name creates no coins, so this mutation must make it
+    FAIL. If this control ever passes, the demo has stopped testing the
+    property the bank exists to guarantee.
+    """
+    needle = "    _accounts[name] = 0\n    return 0, True"
+    assert needle in src, ("ensure_account no longer creates at 0 -- this "
+                           "control would be testing nothing")
+    return src.replace(needle,
+                       "    _accounts[name] = START_MONEY\n"
+                       "    return START_MONEY, True")
+
+
 def single_value_guard(src):
     """agent-2's attack: refuse overdrafts ONLY at the amount the demo tests.
 
@@ -105,6 +123,10 @@ rc5, out5, err5 = run_demo_with_bank(single_value_guard)
 print(f"single-value guard (agent-2): rc={rc5}  (expect 1)")
 print("  " + ([l for l in out5.splitlines() if "FAIL" in l][:1] or ["(none)"])[0])
 
+rc6, out6, err6 = run_demo_with_bank(grant_on_create)
+print(f"grant-on-create (the mint): rc={rc6}  (expect 1)")
+print("  " + ([l for l in out6.splitlines() if "FAIL" in l][:1] or ["(none)"])[0])
+
 rc3, out3, err3 = run_demo_with_bank(env_fix)
 print(f"env-var fix applied: rc={rc3}  (expect 0)")
 print("  " + ([l for l in out3.splitlines() if "DEMO" in l][-1]
@@ -113,8 +135,8 @@ rc4, out4, err4 = run_demo_with_bank(unknown_shape)
 print(f"unknown ledger shape: rc={rc4}  (expect 2)")
 print("  " + ([l for l in out4.splitlines() if "FAIL" in l][:1] or ["(none)"])[0])
 
-ok = (rc == 0 and rc2 == 1 and rc3 == 0 and rc4 == 2 and rc5 == 1)
+ok = (rc == 0 and rc2 == 1 and rc3 == 0 and rc4 == 2 and rc5 == 1 and rc6 == 1)
 print("\nSELFTEST", "PASS" if ok else "FAIL", end="")
 print(" - control fires, single-value guard caught, bank fix does not break "
-      "the demo, unknown shape refuses" if ok else "")
+      "the demo, unknown shape refuses, grant-on-create caught" if ok else "")
 sys.exit(0 if ok else 1)

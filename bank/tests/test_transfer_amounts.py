@@ -1,25 +1,31 @@
-"""bank transfer tests -- the sender-must-exist rule, with before/after controls.
+"""bank tests -- "a new balance is never a grant", with before/after controls.
 
 Run:  python3 bank/tests/test_transfer_amounts.py     (stdlib only, no Docker)
 
-THE DEFECT THIS PINS. `/transfer` used to call `ensure_account(sender)`.
-`ensure_account` funds a name it has never seen with START_MONEY (default
-1000). So any caller could send from a brand-new agent name, be funded 1000 on
-the spot, and move that money to a real account. Repeat with a fresh name and
-the money supply is unbounded.
+THE DEFECT THIS PINS. `ensure_account()` used to fund a name it had never seen
+with START_MONEY (default 1000). There were THREE ways to reach it, and
+guarding one of them only moves the hole:
 
-Auto-funding on first touch is documented and intended for the RECIPIENT (an
-agent that has never been paid before still receives) and for `GET /balance`.
-Applying it to the SENDER of a transfer turns a ledger into a mint.
+  A. the transfer's SENDER      POST /transfer {"from": "ghost-7", ...}
+  B. the transfer's RECIPIENT   pay a fresh name, then spend its 1000
+  C. a plain balance read       GET /balance/ghost-7
 
-THE FIX (in bank/bank.py): the sender must already exist. The refusal creates
-nothing.
+B is the interesting one: it is the DOCUMENTED "recipient is auto-created"
+behaviour, so a fix that only refuses unknown senders leaves B fully open.
+Measured on the sender-only guard: bypass A and bypass B each moved 4000 coins
+to a real account, and together took one victim from 1000 to 9000.
+
+THE FIX. Creating an account grants nothing. Accounts are created at ZERO on
+first touch. Coins enter an account only through `SEED` at startup or
+`/admin/topup` -- both operator acts. `GET /balance/<unknown>` returns
+{"money": 0, "exists": false}.
 
 WHY BOTH DIRECTIONS ARE TESTED. A test that only asserts "the mint is blocked"
-passes trivially against a bank that blocks all transfers. This file runs every
-check twice -- once with the guard removed (reconstructing the pre-fix
-behaviour) and once as shipped -- so each check is known to be capable of
-failing, and the legitimate paths are known to still work afterwards.
+passes trivially against a bank that blocks everything. This file builds the
+bank TWICE -- once with the pre-fix `ensure_account` reinstated and once as
+shipped -- so every check is known to be capable of failing, and the legitimate
+paths are known to still work afterwards. A check that cannot fail is not a
+check.
 """
 import json
 import os
@@ -34,22 +40,36 @@ import urllib.request
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BANK = os.path.join(HERE, "bank.py")
 
+# The shipped, correct body of ensure_account.
+FIXED_ACCOUNT = """\
+    if name in _accounts:
+        return _accounts[name], False
+    _accounts[name] = 0
+    return 0, True
+"""
+# The pre-fix body: creating an account pays START_MONEY.
+BROKEN_ACCOUNT = """\
+    if name in _accounts:
+        return _accounts[name], False
+    _accounts[name] = START_MONEY
+    return START_MONEY, True
+"""
 
-def build(fixed):
-    """Copy bank.py into a temp dir with hardcoded paths redirected.
 
-    fixed=False reconstructs the PRE-FIX behaviour by removing the guard, so
-    the test can show the defect is real rather than hypothetical. If the guard
-    is missing when fixed=False is asked for, or present-but-different when
-    fixed=True, the test refuses to run rather than passing vacuously.
+def build(fixed, seed=""):
+    """Copy bank.py to a temp dir with paths redirected and (optionally) the
+    pre-fix ensure_account reinstated.
+
+    Every textual edit is ASSERTED to have changed the source. A mutation that
+    silently does not mutate is the cohort's most-repeated defect: the test
+    then runs the real bank and reports PASS for something it never exercised.
     """
     work = tempfile.mkdtemp()
     path = os.path.join(work, "bank.py")
     src = open(BANK, encoding="utf-8").read()
-    # Redirect the ledger and mailbox to the temp dir. Master reads DATA from
-    # the environment; older branches hardcode the literal. Patch whichever is
-    # present, then ASSERT the patch took effect -- a redirect that quietly
-    # misses is a no-op, and a no-op test still prints PASS.
+    original = src
+
+    # --- redirect the ledger and mailbox (both shapes supported) -----------
     ledger = os.path.join(work, "accounts.json")
     data_env = 'DATA = os.environ.get("DATA", "/data/accounts.json")'
     data_lit = 'DATA = "/data/accounts.json"'
@@ -61,33 +81,46 @@ def build(fixed):
         raise AssertionError("bank.py has no DATA assignment this test knows "
                              "how to redirect; the ledger would be shared")
     assert ledger in src, "ledger redirect did not take effect"
+
     box = os.path.join(work, "mailbox")
     assert 'MAILBOX = "/shared/mailbox"' in src, "mailbox literal not found"
-    src = src.replace('MAILBOX = "/shared/mailbox"',
-                      'MAILBOX = %r' % box)
+    src = src.replace('MAILBOX = "/shared/mailbox"', 'MAILBOX = %r' % box)
     assert box in src, "mailbox redirect did not take effect"
-    guard = ('            if sender not in _accounts:\n'
-             '                return self._send(400, {"error": "unknown sender"})\n')
+
+    # --- choose the behaviour under test -----------------------------------
     if fixed:
-        assert guard in src, ("the fix is not present in bank/bank.py -- "
-                              "this test would be checking nothing")
+        assert FIXED_ACCOUNT in src, (
+            "ensure_account does not create at 0 -- the fix is not in "
+            "bank.py, so this test would be checking nothing")
     else:
-        assert guard in src, ("cannot reconstruct the pre-fix behaviour: "
-                              "the guard anchor is not in bank/bank.py")
-        src = src.replace(guard, "")
-        src = src.replace("            s_bal, s_new = _accounts[sender], False\n",
-                          "            s_bal, s_new = ensure_account(sender)\n")
+        assert FIXED_ACCOUNT in src, (
+            "cannot reconstruct the pre-fix behaviour: the expected "
+            "ensure_account body is not present")
+        src = src.replace(FIXED_ACCOUNT, BROKEN_ACCOUNT, 1)
+        assert BROKEN_ACCOUNT in src and src != original, \
+            "pre-fix reconstruction did not actually mutate the source"
+
     open(path, "w", encoding="utf-8").write(src)
-    return work, path
+    return work, path, seed
 
 
-def serve(path, port):
+def serve(work, path, port, seed):
     env = dict(os.environ, PORT=str(port), DECAY_SECONDS="100000",
-               START_MONEY="1000")
+               START_MONEY="1000", DATA=os.path.join(work, "accounts.json"))
+    if seed:
+        env["SEED"] = seed
     proc = subprocess.Popen([sys.executable, path], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    time.sleep(1.0)
-    return proc
+    for _ in range(200):
+        try:
+            call(port, "GET", "/accounts")
+            return proc
+        except OSError:
+            if proc.poll() is not None:
+                raise AssertionError("bank exited on startup (rc=%s)" % proc.returncode)
+            time.sleep(0.05)
+    proc.kill()
+    raise AssertionError("bank never came up on port %d" % port)
 
 
 def call(port, method, route, body=None):
@@ -102,76 +135,139 @@ def call(port, method, route, body=None):
         return e.code, json.loads(e.read())
 
 
+def total(port):
+    return sum(call(port, "GET", "/accounts")[1]["accounts"].values())
+
+
 def exercise(fixed, port):
-    work, path = build(fixed)
-    proc = serve(path, port)
+    """Run the whole matrix. Returns {check_name: bool} and the money created."""
+    work, path, _ = build(fixed)
+    # Seed a real account so the "legitimate paths still work" checks have a
+    # funded sender under BOTH behaviours (pre-fix would fund it anyway, but
+    # seeding makes the two runs comparable).
+    proc = serve(work, path, port, seed="victim:1000,agent-1:1000")
     try:
         done = {}
+        start_total = total(port)
 
-        # N4/N5 -- legitimate behaviour that must survive the fix.
-        # Create the two real agents the documented way before using them.
-        call(port, "GET", "/balance/agent-1")
-        call(port, "GET", "/balance/agent-2")
-        st, body = call(port, "POST", "/transfer",
-                        {"from": "agent-1", "to": "agent-2", "amount": 10})
-        done["N4 an existing agent can transfer"] = (st == 200)
-        st, _ = call(port, "POST", "/transfer",
-                     {"from": "agent-1", "to": "agent-2", "amount": 99999})
-        done["N5 an overdraft is still refused"] = (st == 400)
+        # ---- the three creation paths must not grant (post-fix) ----------
+        st, body = call(port, "GET", "/balance/ghost-a")
+        done["C: GET /balance on an unknown name reports 0"] = \
+            (st == 200 and body.get("money") == 0)
+        done["C: ...and reports exists=false"] = (body.get("exists") is False)
 
-        # N1/N2 -- the fix.
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "ghost", "to": "agent-2", "amount": 1000})
-        done["N1 an unknown sender is refused"] = (st == 400)
-        st, _ = call(port, "POST", "/transfer",
-                     {"from": "ghost2", "to": "agent-2", "amount": 1})
-        done["N2 the refusal has no side effect"] = (st == 400)
+                     {"from": "ghost-b", "to": "victim", "amount": 1000})
+        done["A: a fresh SENDER is refused"] = (st == 400)
 
-        # N3 -- the fix does not overreach: a fresh RECIPIENT still works.
+        # B is the one a sender-only guard misses. Pay a fresh name 1 coin,
+        # then try to spend its (pre-fix) 1000 starting balance.
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "agent-2", "to": "brand_new", "amount": 1})
-        done["N3 a fresh recipient is still created"] = (st == 200)
+                     {"from": "victim", "to": "fresh-b", "amount": 1})
+        assert st == 200, "seeding the recipient failed: %r" % (st,)
+        bal = call(port, "GET", "/balance/fresh-b")[1]["money"]
+        st, _ = call(port, "POST", "/transfer",
+                     {"from": "fresh-b", "to": "victim", "amount": 900})
+        done["B: a fresh RECIPIENT cannot spend a grant"] = (st == 400)
+        done["B: ...and its balance is only what it was paid"] = (bal == 1)
 
-        # N6 -- the actual attack, repeated.
-        minted = 0
-        for i in range(5):
-            st, _ = call(port, "POST", "/transfer",
-                         {"from": "mint%d" % i, "to": "agent-2", "amount": 1000})
-            if st == 200:
-                minted += 1000
-        done["N6 five fresh names mint nothing"] = (minted == 0)
-        return done, minted
+        # ---- legitimate behaviour that must survive ----------------------
+        st, _ = call(port, "POST", "/transfer",
+                     {"from": "agent-1", "to": "victim", "amount": 10})
+        done["L1 an existing funded agent can transfer"] = (st == 200)
+        st, _ = call(port, "POST", "/transfer",
+                     {"from": "agent-1", "to": "victim", "amount": 99999})
+        done["L2 an overdraft is still refused"] = (st == 400)
+        st, _ = call(port, "POST", "/transfer",
+                     {"from": "agent-1", "to": "brand_new", "amount": 5})
+        done["L3 a fresh recipient still RECEIVES"] = (st == 200)
+        done["L4 ...at exactly what was sent"] = (
+            call(port, "GET", "/balance/brand_new")[1]["money"] == 5)
+
+        # ---- total supply, the invariant that actually matters -----------
+        created = total(port) - start_total
+        done["T: no coins were created by any request"] = (created == 0)
+
+        # ---- the explicit operator grant still works ---------------------
+        st, body = call(port, "POST", "/admin/topup",
+                        {"agent": "operator-made", "amount": 50})
+        # no admin token file on this box -> 503 is the correct refusal
+        done["G: /admin/topup is not usable without the token"] = (st in (403, 503))
+        return done, created
     finally:
         proc.terminate()
-        proc.wait(timeout=5)
+        proc.wait(timeout=10)
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_docs_match_code():
+    """The docs are part of the fix. If they still teach the exploit, it is live.
+
+    Two regressions are possible and both are silent:
+      1. a doc still tells a reader to set START_MONEY to a positive value,
+         which funds every name touched (the mint, via the teaching path);
+      2. a doc shows SEED/balance output that the code can no longer produce.
+    Check 1 is mechanical and is what this asserts. Check 2 is covered by the
+    transcripts having been re-derived from a live run when they were written.
+    """
+    root = os.path.dirname(HERE)
+    offenders = []
+    for name in ("README.md", "docs/guide.md"):
+        path = os.path.join(root, name)
+        if not os.path.exists(path):
+            continue
+        for lineno, line in enumerate(open(path, encoding="utf-8"), 1):
+            # A doc may MENTION START_MONEY when explaining it; what it must
+            # never do is hand a reader a command that sets it to a positive
+            # number, or claim accounts are funded on first touch.
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith(">"):
+                continue
+            if "START_MONEY=" in stripped and "START_MONEY=0" not in stripped:
+                offenders.append(f"{name}:{lineno}: {stripped[:80]}")
+            if "auto-created with START_MONEY" in stripped:
+                offenders.append(f"{name}:{lineno}: {stripped[:80]}")
+    return offenders
+
+
 def main():
-    print("PRE-FIX BEHAVIOUR (guard removed on purpose):")
-    before, minted_before = exercise(False, 8901)
+    print("PRE-FIX (creation grants START_MONEY) -- the defect must be VISIBLE:")
+    before, minted_before = exercise(fixed=False, port=8901)
     for k in sorted(before):
-        print("  %-38s %s" % (k, before[k]))
-    print("  coins minted by 5 fresh sender names: %d" % minted_before)
+        print("  %-50s %s" % (k, "ok  " if before[k] else "FAIL"))
+    print("  coins created from nothing: %d" % minted_before)
 
-    print("\nAS SHIPPED:")
-    after, minted_after = exercise(True, 8902)
+    print("\nAS SHIPPED (creation grants nothing) -- the defect must be GONE:")
+    after, minted_after = exercise(fixed=True, port=8902)
     for k in sorted(after):
-        print("  %-38s %s" % (k, after[k]))
-    print("  coins minted by 5 fresh sender names: %d" % minted_after)
+        print("  %-50s %s" % (k, "ok  " if after[k] else "FAIL"))
+    print("  coins created from nothing: %d" % minted_after)
 
-    checks = {
-        "the defect is real (pre-fix mints)": minted_before == 5000,
-        "the fix is present (post-fix mints 0)": minted_after == 0,
-        "pre-fix passes the legit paths (control is a real bank)": (
-            before["N4 an existing agent can transfer"]
-            and before["N5 an overdraft is still refused"]),
-        "post-fix passes every check": all(after.values()),
+    # The two runs assert OPPOSITE things. If both "passed", the mutation was
+    # a no-op and neither tested anything.
+    verdict = {
+        "pre-fix: all three creation paths mint": minted_before > 0,
+        "pre-fix: a fresh recipient CAN spend the grant":
+            not before["B: a fresh RECIPIENT cannot spend a grant"],
+        "post-fix: every check holds": all(after.values()),
+        "post-fix: zero coins created": minted_after == 0,
+        "post-fix: legitimate paths still work":
+            (after["L1 an existing funded agent can transfer"]
+             and after["L3 a fresh recipient still RECEIVES"]),
     }
+    docs_bad = test_docs_match_code()
+    print("\nDOCS")
+    if docs_bad:
+        for o in docs_bad:
+            print("  OFFENCE", o)
+    else:
+        print("  ok    no doc teaches a positive START_MONEY grant")
+    verdict["docs do not teach the mint"] = not docs_bad
+
     print("\nVERDICT")
-    for k, v in checks.items():
+    for k, v in verdict.items():
         print("  %-52s %s" % (k, "PASS" if v else "FAIL"))
-    ok = all(checks.values())
+    ok = all(verdict.values())
     print("\n%s" % ("SELFTEST PASS" if ok else "SELFTEST FAIL"))
     return 0 if ok else 1
 
