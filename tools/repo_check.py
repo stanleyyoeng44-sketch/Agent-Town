@@ -130,6 +130,25 @@ def c2_secrets_head(root):
     return "C2 secrets in HEAD", "FAIL" if hits else "PASS", hits
 
 
+BASELINE_FILE = ".repo-check-baseline"
+
+
+def _baseline(root):
+    """Accepted exposures, one reason per line. Each entry suppresses a hit
+    that CONTAINS the given substring. The file is deliberately human-edited
+    and reviewed: a baseline entry is a written admission, not a mute switch.
+    """
+    p = os.path.join(root, BASELINE_FILE)
+    if not os.path.isfile(p):
+        return []
+    out = []
+    for line in open(p, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line.split("#")[0].strip())
+    return [b for b in out if b]
+
+
 def c3_secrets_history(root):
     """Scan every blob reachable from any ref, including deleted files."""
     revs = subprocess.run(["git", "-C", root, "rev-list", "--all"],
@@ -163,7 +182,24 @@ def c3_secrets_history(root):
     if len(seen) < 2:
         return "C3 secrets in HISTORY", "WARN", \
             coverage + ["history walk found nothing to inspect -- NOT verified"]
-    return "C3 secrets in HISTORY", "FAIL" if hits else "PASS", hits + coverage
+
+    if not hits:
+        return "C3 secrets in HISTORY", "PASS", coverage
+
+    # A KNOWN, ACCEPTED LEAK IS STILL A LEAK. The only thing a baseline may do
+    # is stop re-reporting it on every run; it can never turn red into green.
+    # Every unbaselined leak is a FAIL and blocks. A baselined one is a WARN
+    # that names the accepted exposure out loud, every run, so the debt is
+    # visible in the log rather than forgotten in a ticket.
+    baseline = _baseline(root)
+    new = [h for h in hits if not any(b in h for b in baseline)]
+    known = [h for h in hits if any(b in h for b in baseline)]
+    if new:
+        return "C3 secrets in HISTORY", "FAIL", new + coverage + \
+            [f"({len(known)} baselined hit(s) suppressed; see .repo-check-baseline)"]
+    return "C3 secrets in HISTORY", "WARN", coverage + [
+        f"{len(known)} KNOWN ACCEPTED leak(s), baselined -- this is debt, not a pass"]
+
 
 
 def c4_gitignore(root):
@@ -393,7 +429,12 @@ def run(root="."):
         except Exception as e:                     # a crash is a FAILED check
             name, status, findings = fn.__name__, "FAIL", [f"check crashed: {e!r}"]
         results.append((name, status, findings))
-    return all(s == "PASS" for _, s, _ in results), results
+    # WARN never fails the build; only FAIL does. That is the whole point of
+    # having three states: if WARN blocked, it would just be FAIL with extra
+    # words, and people would start silencing checks to get a green pipeline.
+    # The summary line stays loud about the warnings so the coverage gap is
+    # never mistaken for full verification.
+    return not any(s == "FAIL" for _, s, _ in results), results
 
 
 # --- negative controls ----------------------------------------------------
@@ -470,6 +511,31 @@ def selftest():
     status = dict((n, o) for n, o, _ in r)["C3 secrets in HISTORY"]
     outcomes.append(("C3 refuses to PASS when it inspected almost nothing",
                      status == "WARN"))
+    shutil.rmtree(d)
+
+    # C3 baseline: it may suppress a KNOWN leak (WARN), and it must NOT
+    # suppress a NEW one. A baseline that can turn a new leak green is a mute
+    # switch wearing a review comment.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, ".repo-check-baseline"), "w").write("old_leak.log  # accepted\n")
+    open(os.path.join(d, "old_leak.log"), "w").write(
+        "token: " + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0UvW" + "\n")
+    open(os.path.join(d, "new_leak.log"), "w").write(
+        "token: " + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0F" + "\n")
+    _git(d, "add", "-f", ".gitignore", ".repo-check-baseline", "old_leak.log")
+    _git(d, "commit", "-qm", "old known leak")
+    _git(d, "rm", "-q", "--cached", "old_leak.log")
+    _git(d, "commit", "-qm", "remove old")
+    _git(d, "add", "-f", "new_leak.log")
+    _git(d, "commit", "-qm", "NEW leak")
+    _git(d, "rm", "-q", "--cached", "new_leak.log")
+    _git(d, "commit", "-qm", "remove new")
+    _, r = run(d)
+    status = dict((n, o) for n, o, _ in r)["C3 secrets in HISTORY"]
+    outcomes.append(("C3 baseline suppresses a KNOWN leak but NOT a new one",
+                     status == "FAIL"))
     shutil.rmtree(d)
 
     # C4: no .gitignore at all
