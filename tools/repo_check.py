@@ -1279,26 +1279,39 @@ def _registry_orphans(source):
     # dead is the output that gets a gate DELETED rather than fixed
     # (agent-7's second finding, reproduced before this fix).
     registered, checks_values = [], []
+
+    def names_in(value):
+        """The ast.Name elements of a list/tuple literal, or of either side
+        of a `+`. BOTH sides matter: `CHECKS = [a] + [b]` is two
+        registrations, and reading only the first reports b as a dead check."""
+        if isinstance(value, (ast.List, ast.Tuple)):
+            return [e.id for e in value.elts if isinstance(e, ast.Name)]
+        if isinstance(value, ast.BinOp):
+            return names_in(value.left) + names_in(value.right)
+        return []
+
     for node in tree.body:
-        target = None
+        target, value, augmented = None, None, False
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
+            target, value = node.targets[0], node.value
         elif isinstance(node, ast.AnnAssign):
-            target = node.target
+            target, value = node.target, node.value
+        elif isinstance(node, ast.AugAssign):
+            target, value, augmented = node.target, node.value, True
         if not (isinstance(target, ast.Name) and target.id == "CHECKS"):
             continue
-        checks_values.append(node.value)
-        elts = []
-        if isinstance(node.value, (ast.List, ast.Tuple)):
-            elts = node.value.elts
-        elif isinstance(node.value, ast.BinOp):
-            # BOTH sides: `CHECKS = [a] + [b]` is two registrations, and
-            # reading only the first would report b as a dead check.
-            for side in (node.value.left, node.value.right):
-                if isinstance(side, (ast.List, ast.Tuple)):
-                    elts = elts + list(side.elts)
-        if elts is not None:
-            registered = [e.id for e in elts if isinstance(e, ast.Name)]
+        checks_values.append(value)
+        names = names_in(value)
+        # `+=` APPENDS and can never erase, and an append of nothing is a
+        # no-op, not a wipe. `CHECKS = CHECKS + []` and `CHECKS += []` are
+        # both legal and both mean "no change"; the plain-assign branch used
+        # to overwrite registered with [] and then report every check as an
+        # orphan. Two spellings of the same no-op disagreeing is the kind of
+        # thing that gets a gate deleted (agent-7).
+        if augmented or (not names and registered):
+            registered = registered + names
+        else:
+            registered = names
 
     # A NAME IS A CHECK ONLY IF ITS ONLY REFERENCE IS THE CHECKS LITERAL.
     # A module-level helper named c11_parse_flags (called by a real check) is
@@ -1313,12 +1326,39 @@ def _registry_orphans(source):
     # and counting those would exclude the very check that guards the
     # registry. A call -- `c11_parse_flags(...)` -- is the signal that a
     # function is doing work rather than merely being registered.
+    #
+    # BUT LIVENESS IS NOT REGISTRATION (agent-7's second review, reproduced
+    # here before the fix). A check-shaped function that is NOT in CHECKS but
+    # IS called from selftest() passed C14: the call made it "live", so it
+    # was dropped from the candidate set entirely. That is precisely the
+    # defect C14 exists to catch -- a FAIL-returning check that never runs at
+    # the gate -- and the selftest is the most likely place an unregistered
+    # check gets exercised. So calls made from the TEST HARNESS do not earn a
+    # function an exemption; only calls from production code do.
+    HARNESS = {"selftest", "_self_guard", "registry_status",
+               "_registry_orphans", "main"}
     called = set()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Call):
-            f = n.func
-            if isinstance(f, ast.Name):
-                called.add(f.id)
+    harness_called = set()
+
+    def record_calls(node):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name):
+                    called.add(f.id)
+
+    harness_nodes = [n for n in tree.body
+                     if isinstance(n, ast.FunctionDef) and n.name in HARNESS]
+    for node in harness_nodes:
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name):
+                    harness_called.add(f.id)
+    for node in tree.body:
+        if node in harness_nodes:
+            continue
+        record_calls(node)
 
     defined = [n.name for n in tree.body
                if isinstance(n, ast.FunctionDef)
@@ -2649,6 +2689,45 @@ def selftest():
     outcomes.append(("C14 reads both sides of CHECKS = [a] + [b]",
                      st_g == "PASS"
                      and any("2 checks registered" in f for f in fd_g)))
+
+    # Arm H: LIVENESS IS NOT REGISTRATION. A check-shaped function that is
+    # NOT in CHECKS but IS called from selftest() must still be flagged.
+    # agent-7 measured this residual on a full tree: the call made the
+    # function "live", so it was dropped from the candidate set and C14
+    # passed while a FAIL-returning check never ran at the gate. That is
+    # the exact defect C14 exists for, and the selftest is the likeliest
+    # place an unregistered check gets exercised at all.
+    harness_src = ("def c99_unregistered(root):\n"
+                   "    return 'C99', 'FAIL', ['never gated']\n\n\n"
+                   "def selftest():\n"
+                   "    c99_unregistered(None)\n"
+                   "    return True\n\n\n"
+                   "CHECKS = []\n")
+    st_h, fd_h = registry_status(harness_src)
+    outcomes.append(("C14 flags a check called ONLY from the selftest",
+                     st_h == "FAIL"
+                     and any("c99_unregistered" in f for f in fd_h)))
+
+    # Arm I: every legal spelling of CHECKS must agree. `+= []` and
+    # `= CHECKS + []` are the same no-op; the second used to erase the
+    # registration and name every check as an orphan.
+    spell_base = ("def c1_a(r):\n    return 'A', 'PASS', []\n\n\n"
+                  "def c2_b(r):\n    return 'B', 'PASS', []\n\n\n")
+    spellings = {
+        "bare": "CHECKS = [c1_a, c2_b]\n",
+        "augmented no-op": "CHECKS = [c1_a, c2_b]\nCHECKS += []\n",
+        "binop no-op": "CHECKS = [c1_a, c2_b]\nCHECKS = CHECKS + []\n",
+        "augmented append": "CHECKS = [c1_a]\nCHECKS += [c2_b]\n",
+        "two-sided binop": "CHECKS = [c1_a] + [c2_b]\n",
+        "annotated": "CHECKS: list = [c1_a, c2_b]\n",
+    }
+    spell_results = {k: registry_status(spell_base + v)
+                     for k, v in spellings.items()}
+    outcomes.append(("C14: every legal CHECKS spelling registers both names",
+                     all(st == "PASS" and not orph
+                         for st, (_, orph) in
+                         ((r[0], (None, [f for f in r[1] if "ORPHAN" in f]))
+                          for r in spell_results.values()))))
 
     # Arm C: C14's own removal must still be caught. registry_status cannot
     # see this (if C14 is unregistered it never runs), so the guard is
