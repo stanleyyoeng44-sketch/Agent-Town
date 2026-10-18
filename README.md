@@ -87,6 +87,16 @@ python3 demo/town.py        # exit 0 = every check passed
 
 Then `python3 demo/selftest_demo.py` proves the checks can fail.
 
+Everything else this repo claims to verify is one command. It is a runner,
+so the docs checker marks it SKIP rather than invoking it: C5 executes the
+commands it finds in fenced blocks, and running the runner from inside the
+checker would nest the whole suite set inside one 60-second doc check.
+
+```bash
+# SKIP: this is the runner itself; C5 executes doc commands and running it here would nest every suite inside the docs check
+python3 tools/check.py       # every suite, one line each; exit 0 = pass
+```
+
 ## Quickstart
 
 > **Verified status.** The HTTP API of the bank in §"Bank" was run and its
