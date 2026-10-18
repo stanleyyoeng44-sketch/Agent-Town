@@ -389,6 +389,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
 
     options = build_options(cfg, life_id)
     resumed = getattr(options, "resume", None) is not None
+    # The delivery queue is module state. Anything left in it belongs to the
+    # previous life (its consumer is gone); carrying it into this one would
+    # deliver stale text as this life's opening turn. prompt_stream() drains
+    # whatever the poll loops queue from NOW ON.
+    pending_delivery.clear()
 
     restart_requested = False
     notice_sent = False
@@ -399,18 +404,33 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         # wake framing would corrupt it, so the stream starts empty and the
         # CLI replays history on its own.
         async def prompt_stream():
-            if not resumed:
+            # THE STREAM MUST YIELD ONCE AT START-UP, IN EVERY CASE.
+            # A streaming prompt that yields nothing produces no model turn,
+            # and the agent is silent until somebody happens to message it --
+            # Stanley's defect 3. Two ways that used to happen:
+            #   * a resumed session yielded nothing (context is replayed, but
+            #     nothing asks the model to act), and
+            #   * mail queued in `pending_delivery` BEFORE the stream started
+            #     made the old `elif not pending_delivery` skip the kick, while
+            #     the queue is only drained by a "__kick__" marker -- so those
+            #     items waited forever and the first yield never came.
+            # Now: deliver anything already queued, and if there is still
+            # nothing to say, send one harness note. Exactly one turn either
+            # way.
+            prequeued = drain_pending_delivery()
+            if prequeued:
+                yield {"type": "user",
+                       "message": {"role": "user", "content":
+                                   "<system-reminder>\n" + prequeued +
+                                   "\n</system-reminder>"}}
+            elif not resumed:
                 yield {"type": "user",
                        "message": {"role": "user", "content": opening_message(wake_prompt)}}
-            elif not pending_delivery:
-                # RESUMED life: the CLI replays the conversation and then
-                # waits for a user turn. The operator has not sent anything
-                # (a restart is exactly when nobody is talking to it), so the
-                # stream would never yield and the session would emit
-                # nothing until a peer messaged it. Kick once, with a
-                # harness note that is NOT the wake framing (that would
-                # duplicate history). If mail is already queued, the normal
-                # delivery path below carries it instead.
+            else:
+                # RESUMED, nothing queued: the CLI replays the conversation
+                # and then waits for a user turn. Kick once with a harness
+                # note that is NOT the wake framing (that would duplicate
+                # history).
                 yield {"type": "user",
                        "message": {"role": "user", "content":
                                    "<system-reminder>\nYou are resuming the "
