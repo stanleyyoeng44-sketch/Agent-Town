@@ -184,6 +184,33 @@ def exercise(fixed, port):
         done["L4 ...at exactly what was sent"] = (
             call(port, "GET", "/balance/brand_new")[1]["money"] == 5)
 
+        # ---- a refused transfer must not write to the ledger -------------
+        # N2 in an earlier version checked only that the STATUS was 400. A
+        # refused request that still writes state is not refused: it let any
+        # caller grow the ledger without bound by naming fresh recipients in
+        # failing transfers. Compare the WHOLE ledger, not just the balances.
+        # The junk row is created IN MEMORY and only reaches the file on the
+        # next save, so checking the file alone misses it (my first version of
+        # this check did exactly that and passed against the bug). Ask the
+        # server for its own view of the accounts, which is the state that
+        # matters, and then force a save with a legitimate transfer so the
+        # persistence path is exercised too.
+        ledger_path = os.path.join(work, "accounts.json")
+        in_mem_before = dict(call(port, "GET", "/accounts")[1]["accounts"])
+        for i in range(5):
+            call(port, "POST", "/transfer",
+                 {"from": "agent-1", "to": "junk-%d" % i, "amount": 999999})
+        in_mem_after = dict(call(port, "GET", "/accounts")[1]["accounts"])
+        done["R: a refused transfer does not create accounts"] = (
+            set(in_mem_after) == set(in_mem_before))
+        # a legitimate transfer flushes state to disk; the refused names must
+        # not ride along
+        call(port, "POST", "/transfer",
+             {"from": "agent-1", "to": "victim", "amount": 1})
+        on_disk = set(json.load(open(ledger_path))["accounts"])
+        done["R: refused names are not flushed on the next save"] = (
+            not any(n.startswith("junk-") for n in on_disk))
+
         # ---- total supply, the invariant that actually matters -----------
         created = total(port) - start_total
         done["T: no coins were created by any request"] = (created == 0)

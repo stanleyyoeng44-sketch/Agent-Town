@@ -254,21 +254,30 @@ class Handler(BaseHTTPRequestHandler):
 
         with _lock:
             ticks = decay_ticks()
-            # A sender must already exist. Auto-creating the SENDER of a
-            # transfer funds a name that has never been seen, which lets any
-            # caller mint START_MONEY per fresh name and move it out. Accounts
-            # are still created on first touch for the recipient, for
-            # GET /balance, and for the operator paths -- but not for a
-            # transfer's sender.
+            if ticks:
+                # Decay has ALREADY been applied in memory, so it must be
+                # persisted even if this transfer is refused. Dropping it here
+                # would leave the in-memory ledger ahead of the file and the
+                # elapsed time would be re-applied on the next save.
+                save()
+            # A sender must already exist: the bank cannot tell an agent from
+            # someone who can spell its name, so an unknown sender is refused
+            # rather than created. Creating it would let any caller open an
+            # account and spend it in the same request.
             if sender not in _accounts:
                 return self._send(400, {"error": "unknown sender"})
-            s_bal, s_new = _accounts[sender], False
-            r_bal, r_new = ensure_account(recipient)
-            if ticks or s_new or r_new:
-                save()
+            s_bal = _accounts[sender]
+            # Check funds BEFORE creating anything. The recipient used to be
+            # created and saved above this check, so a REFUSED transfer still
+            # wrote a row into the ledger: a caller could grow
+            # /data/accounts.json without bound with failing transfers to fresh
+            # names, and a 400 still mutated state. Creating the recipient is
+            # part of committing the transfer, so it happens only after the
+            # transfer is known to be legal.
             if s_bal < amount:
                 return self._send(400, {"error": "insufficient funds",
                                         "money": s_bal})
+            r_bal, _ = ensure_account(recipient)
             s_bal -= amount
             r_bal += amount
             _accounts[sender] = s_bal
