@@ -86,7 +86,23 @@ def extract_blocks(readme_text):
 
 
 def quoted_responses(lines):
-    """[(command, response_dict_or_None)] from a transcript block."""
+    """[(command, response_dict_or_None, ellipsis_after_or_None)].
+
+    The third element is the interval the document shows BETWEEN this command
+    and the next one -- a `... N seconds later ...` line, which is the only
+    place the transcript states the duration a later claim is relative to.
+
+    WHY IT IS RETURNED PER PAIR AND NOT SEARCHED FOR IN THE BLOCK. My v2 read
+    the ellipsis with `re.search` over the whole block, which fixed the
+    document-level decoy and left the block-level one working. MEASURED
+    (agent-2, this life): a `... 10 seconds later ...` line inserted ABOVE the
+    first balance -- inside the same block, so v2 was happy -- became the
+    clock, and the checker then accepted a second balance of 995 (an
+    interval of 10s at DECAY_SECONDS=2) for a transcript where the reader
+    sees 5 seconds between the reads. The control with the same numbers and
+    no decoy is caught, so the decoy was the whole difference. An interval is
+    a property of the GAP BETWEEN TWO READS, not of the block.
+    """
     out = []
     for i, line in enumerate(lines):
         s = line.strip()
@@ -94,16 +110,28 @@ def quoted_responses(lines):
             continue
         cmd = s[2:]
         body = None
-        for nxt in lines[i + 1:]:
-            t = nxt.strip()
-            if not t or t.startswith(("$", "...", "```")):
+        ellipsis_secs = None
+        j = i + 1
+        while j < len(lines):
+            t = lines[j].strip()
+            j += 1
+            if not t:
                 continue
-            try:
-                body = json.loads(t)
-            except Exception:
-                body = None
-            break
-        out.append((cmd, body))
+            if t.startswith("$") or t.startswith("```"):
+                break          # next command: the gap ends
+            m = re.fullmatch(r"\.\.\.\s*(\d+)\s+seconds?\s+later\s*\.\.\.", t)
+            if m:
+                if ellipsis_secs is None:
+                    ellipsis_secs = int(m.group(1))
+                continue
+            if t.startswith("..."):
+                continue       # some other prose marker
+            if body is None:
+                try:
+                    body = json.loads(t)
+                except Exception:
+                    body = None
+        out.append((cmd, body, ellipsis_secs))
     return out
 
 
@@ -137,19 +165,36 @@ def replay(root, readme_text, verbose=False):
     #
     # So: parse the block that CONTAINS the launch line, and require the
     # launch line to be in the same block as the balances it explains.
-    stated = None
-    for b in blocks:
-        block_text = "\n".join(b)
-        if "bank/bank.py" not in block_text:
-            continue
-        decay_m = re.search(r"DECAY_SECONDS=(\d+)", block_text)
-        later_m = re.search(r"(\d+)\s+seconds?\s+later", block_text)
-        if decay_m and later_m:
-            stated = (int(decay_m.group(1)), int(later_m.group(1)))
-        break
-    # `stated` stays None when either is absent, and the second-balance branch
-    # FAILs on None instead of skipping -- an unreadable claim is the defect,
-    # not a reason to pass.
+    #
+    # THE BLOCK WAS STILL THE WRONG OBJECT (v3). v2 parsed the block that
+    # contains the launch line, which fixed the DOCUMENT-level decoy and left
+    # the BLOCK-level one alive. MEASURED: a `... 10 seconds later ...` line
+    # inserted ABOVE the first balance, inside the same block, became the
+    # clock, and a second balance of 995 passed for a transcript whose reader
+    # sees 5 seconds between the reads. So neither number is a property of the
+    # block either:
+    #   * DECAY_SECONDS is read from the LAUNCH LINE ITSELF (the line that
+    #     runs bank/bank.py), not from the first DECAY_SECONDS= in the block.
+    #   * the interval is read from the GAP BETWEEN THE TWO READS -- carried
+    #     on each pair as its ellipsis (see quoted_responses) -- not from the
+    #     block. The decay branch requires the ellipsis that FOLLOWS THE FIRST
+    #     READ, i.e. the interval the two balances are actually separated by.
+    decay_secs = None
+    launch_lines = [c for c, _q, _e in pairs if "bank/bank.py" in c]
+    # EXACTLY ONE launch line. MEASURED (agent-2, this life): a second launch
+    # line inserted ABOVE the real one, stating DECAY_SECONDS=5, became the
+    # clock, and a second balance of 999 -- one tick at 5s -- PASSED for a
+    # transcript whose real launch line says 2. "First match wins" is the same
+    # defect as "whole document": the selector is still not the object. Two
+    # launch lines is not a clock, it is an ambiguity, and an ambiguous clock
+    # cannot reject anything.
+    if len(launch_lines) == 1:
+        m = re.search(r"\bDECAY_SECONDS=(\d+)\b", launch_lines[0])
+        if m:
+            decay_secs = int(m.group(1))
+    # `decay_secs` stays None when the launch line does not state it, and the
+    # second-balance branch FAILs on None instead of skipping -- an unreadable
+    # claim is the defect, not a reason to pass.
 
     port = free_port()
     # DATA is a FILE path, not a directory (bank.py:41 defaults to
@@ -221,7 +266,12 @@ def replay(root, readme_text, verbose=False):
         # transfer's money an ARITHMETIC assertion rather than a comparison
         # to a constant seed. None until the transcript quotes one.
         last_balance_quoted = None
-        for cmd, quoted in pairs:
+        # The ellipsis that FOLLOWS the most recent balance read: the interval
+        # the next quoted figure is separated from that read by. None until a
+        # read has been seen, and reset on each read so a marker attached to
+        # an EARLIER command can never stand in for this interval.
+        gap_after_read = None
+        for cmd, quoted, ellipsis_secs in pairs:
             if verbose:
                 print(f"    replay: {cmd}")
             if cmd.startswith("SEED=") and "bank/bank.py" in cmd:
@@ -349,6 +399,11 @@ def replay(root, readme_text, verbose=False):
                               f"{int(elapsed // 1) + 1})")
                     if quoted and isinstance(quoted.get("money"), int):
                         last_balance_quoted = quoted["money"]
+                    # The interval the SECOND read is separated from THIS one
+                    # by. Taken from this command's own gap, so a marker
+                    # attached to any other command (above the first read,
+                    # above the launch, in the prose) cannot supply it.
+                    gap_after_read = ellipsis_secs
                     continue
                 if is_balance and balance_seen == 2:
                     # SECOND READ: the README claims DECAY -- less money than
@@ -376,24 +431,33 @@ def replay(root, readme_text, verbose=False):
                     elif last_balance_quoted is None:
                         fails.append(f"{cmd}: no earlier quoted balance for "
                                      f"this decay claim to be relative to")
-                    elif stated is None:
+                    elif decay_secs is None:
                         # No stated clock -> the quoted number has no units
                         # and cannot be checked. FAIL rather than pass: an
                         # unreadable claim is the defect, not a reason to skip.
                         fails.append(f"{cmd}: the transcript claims decay but "
-                                     f"does not state both DECAY_SECONDS and "
-                                     f"'N seconds later', so the quoted "
-                                     f"balance {q} has no units")
+                                     f"its launch line does not state "
+                                     f"DECAY_SECONDS, so the quoted balance "
+                                     f"{q} has no units")
+                    elif gap_after_read is None:
+                        # The interval must be the one BETWEEN the two reads.
+                        # A single balance is not a decay claim: a decay is
+                        # two numbers separated by a stated duration.
+                        fails.append(f"{cmd}: the transcript quotes a second "
+                                     f"balance {q} but states no interval "
+                                     f"(no '... N seconds later ...' line "
+                                     f"between the two reads)")
                     else:
-                        decay_secs, later_secs = stated
+                        later_secs = gap_after_read
                         ticks = later_secs // decay_secs
                         want = last_balance_quoted - ticks
                         if q != want:
                             fails.append(
                                 f"{cmd}\n      README: {quoted}\n"
                                 f"      the README states DECAY_SECONDS="
-                                f"{decay_secs} and '{later_secs} seconds "
-                                f"later', so {last_balance_quoted} decays by "
+                                f"{decay_secs} on the launch line and "
+                                f"'{later_secs} seconds later' between the "
+                                f"reads, so {last_balance_quoted} decays by "
                                 f"{ticks} to {want}; it quotes {q}")
                         else:
                             # The README's number is now an ASSERTED equation.
@@ -525,6 +589,70 @@ def main():
         # back to the prose). The arms above could not catch either: they
         # mutate the balances, and these mutate the UNITS. Each must be
         # rejected; the pristine read (ok_real) must stay green.
+        # THE DECOY ARMS. MEASURED (agent-2, this life) on v2 @200227c, which
+        # had already replaced the whole-document read with a whole-BLOCK read:
+        #   insert `... 10 seconds later ...` ABOVE the first balance -- same
+        #   block, in the gap BEFORE the first read -- and quote the second
+        #   balance as 995. v2 PASSED. 995 is the equation for a 10s interval
+        #   at DECAY_SECONDS=2; the reader sees 5 seconds between the reads and
+        #   the README's own number is 998. The control with 995 and NO decoy
+        #   is caught, so the decoy was the entire difference.
+        # That is the same defect a FIFTH time, one scope narrower: block ->
+        # gap. These arms pin it.
+        #
+        # I FIRST WROTE A TRANSFER-DECOY ARM HERE AND DELETED IT. It put a
+        # `10 seconds later` above the transfer and quoted 988, and it
+        # PASSED -- on v2 AS WELL AS here. It was a LABEL, not a test: no
+        # transfer arm consumes an ellipsis, so it only asserted that a wrong
+        # number is caught, which the 900 arm already does. Found by running
+        # the arm against v2 instead of assuming it reddened.
+        #
+        # Each arm is (replacements, label); replacements is a list of
+        # (old, new) applied once each, so an arm can keep the rest of the
+        # transcript's arithmetic valid and red for ITS reason only.
+        decoy_lies = [
+            ([("$ curl -s localhost:8941/balance/agent-2\n"
+               '{"agent": "agent-2", "money": 1000, "exists": true}',
+               "... 10 seconds later ...\n"
+               "$ curl -s localhost:8941/balance/agent-2\n"
+               '{"agent": "agent-2", "money": 1000, "exists": true}'),
+              ('{"agent": "agent-2", "money": 998, "exists": true}',
+               '{"agent": "agent-2", "money": 995, "exists": true}'),
+              ('"ok": true, "money": 991', '"ok": true, "money": 988')],
+             "a decoy '10 seconds later' ABOVE the first read, with a second "
+             "balance of 995 that only that decoy's interval explains"),
+            # THE DUPLICATE LAUNCH LINE. A second `... bank/bank.py` line
+            # above the real one, stating DECAY_SECONDS=5, used to become the
+            # clock: a second balance of 999 (one tick at 5s) PASSED for a
+            # transcript whose real launch line says 2. "First match wins" is
+            # the whole-document defect again, one scope in.
+            ([("$ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py",
+               "$ SEED=agent-2:1000 DECAY_SECONDS=5 python3 bank/bank.py\n"
+               "$ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py"),
+              ('{"agent": "agent-2", "money": 998, "exists": true}',
+               '{"agent": "agent-2", "money": 999, "exists": true}'),
+              ('"ok": true, "money": 991', '"ok": true, "money": 992')],
+             "a decoy launch line stating DECAY_SECONDS=5 above the real one, "
+             "with a second balance of 999 that only 5s explains"),
+        ]
+        decoy_results = []
+        for reps, label in decoy_lies:
+            mutated = text
+            built = True
+            for old, new in reps:
+                if old not in mutated:
+                    built = False
+                    break
+                mutated = mutated.replace(old, new, 1)
+            if not built or mutated == text:
+                print(f"  FAIL  could not build the lie: {label}; the README "
+                      f"no longer carries the lines this arm mutates")
+                decoy_results.append(False)
+                continue
+            caught = bool(replay(ROOT, mutated))
+            print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
+            decoy_results.append(caught)
+
         clock_lies = [
             ("DECAY_SECONDS=2 python3 bank/bank.py",
              "DECAY_SECONDS=1 python3 bank/bank.py",
@@ -562,7 +690,8 @@ def main():
             later_results.append(caught)
 
         all_ok = (ok_real and built and not ok_bad and all(first_results)
-                  and all(clock_results) and all(later_results))
+                  and all(clock_results) and all(decoy_results)
+                  and all(later_results))
         return 0 if all_ok else 1
 
     fails = replay(ROOT, text, verbose="--verbose" in args)
