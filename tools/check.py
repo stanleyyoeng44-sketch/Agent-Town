@@ -77,7 +77,7 @@ EXCLUDE = {
 SUITE_GLOBS = ["demo/town.py", "demo/selftest_demo.py",
                "bank/tests/*.py", "agent/tests/*.py",
                "tools/test_*.py", "docs/claimgraph/build.py"]
-# Files that exist on master and are NOT the thing their name suggests.
+
 
 NO_DOCKER = "NO DOCKER DAEMON"
 A5 = "/shared/artifacts/agent-5/repo_audit"
