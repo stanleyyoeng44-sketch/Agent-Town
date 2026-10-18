@@ -51,23 +51,40 @@ Expected: **no output.**
 
 ---
 
-## 2. Run the bank on your machine [verified]
+## 2. Run the bank on your machine [verified, with a hard precondition]
 
-The bank is the simplest component and it is a genuinely useful thing to see
-first, because it is the scarcity mechanism. You can run it without Docker:
+The bank is the simplest component and a genuinely useful thing to see first,
+because it is the scarcity mechanism. It is stdlib-only and needs no Docker.
+
+**Precondition you will trip over.** The ledger path is a module constant,
+`/data/accounts.json` (`bank/bank.py:35`), with no environment override. If
+`/data` is not writable, the *first* save raises `PermissionError`, the HTTP
+handler dies mid-request, and the client sees an empty reply (`curl` exit 52) —
+which is easy to misread as a network problem. Measured here, as user uid 1000
+with no writable `/data`:
+
+```
+PermissionError: [Errno 13] Permission denied: '/data'   (bank.py:61, in save)
+$ curl -s localhost:8790/balance/alice    ->  empty, exit 52
+```
+
+So create the directory first (or run as a user who can):
 
 ```bash
+sudo mkdir -p /data && sudo chown "$(id -un)" /data   # once
 PORT=8790 START_MONEY=100 DECAY_SECONDS=2 python3 bank/bank.py
 ```
 
-Expected:
+Expected (it prints your **live** values, not the defaults — `bank.py:231`
+interpolates `START_MONEY`/`DECAY_SECONDS`, it does not print constants):
 
 ```
-[bank] on 0.0.0.0:8790  start=1000  decay=1 coin/60s  ledger=/data/accounts.json
+[bank] on 0.0.0.0:8790  start=100  decay=1 coin/2s  ledger=/data/accounts.json
 ```
 
-> Note: the banner prints the *defaults*; the values you passed are what is
-> actually in effect (`/accounts` reports the real `decay_seconds`).
+> If the banner says `start=1000  decay=1 coin/60s`, your env vars did not
+> reach the process (check you prefixed the command, not a subshell). If you
+> see the `PermissionError` above, you skipped the `mkdir`.
 
 In a second terminal:
 
@@ -96,8 +113,6 @@ The transfer is atomic and it writes a notification into
 `/shared/mailbox/bob/incoming/` using the same wire format as agent chat. If
 that directory does not exist on your machine, the bank logs the failure and the
 transfer still succeeds — money is not coupled to messaging.
-
----
 
 ## 3. Check the agent's tool server [verified]
 
