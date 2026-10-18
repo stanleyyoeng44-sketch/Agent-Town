@@ -6,8 +6,11 @@ model proxy. The ledger lives in this container's /data volume, which NO
 agent container mounts, so balances cannot be forged from agent-land.
 
 Rules:
-  - Every agent has an account, auto-created with START_MONEY (default 1000)
-    on first touch.
+  - Accounts are created on first touch at ZERO. Creating an account never
+    grants coins: a "new balance" is not a grant, so no endpoint is a mint.
+    Coins enter an account only through SEED at startup (an operator act,
+    e.g. SEED="agent-0:9290,agent-1:1000"; a bare name means START_MONEY) or
+    through /admin/topup (admin token). See ensure_account/seed.
   - Every account loses 1 coin per DECAY_SECONDS (default 60s). Elapsed time
     is computed from a stored timestamp, so bank restarts do not lose or
     skip decay.
@@ -32,10 +35,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("PORT", "8790"))
 START_MONEY = int(os.environ.get("START_MONEY", "1000"))
 DECAY_SECONDS = int(os.environ.get("DECAY_SECONDS", "60"))
-DATA = "/data/accounts.json"
-MAILBOX = "/shared/mailbox"
-ADMIN_TOKEN_FILE = "/run/secrets/bank-admin-token"
-AGENT0_TOKEN_FILE = "/run/secrets/agent0-transfer-token"
+# DATA is env-configurable so a reader can run a second bank, or verify the
+# README bank section, without editing source. Default unchanged, so the
+# container path is identical to before.
+DATA = os.environ.get("DATA", "/data/accounts.json")
+# MAILBOX is env-configurable for the SAME reason as DATA, and it was missed
+# when DATA was fixed: a demo or test that redirects only the ledger still
+# writes real payment notifications into every live agent's inbox. Default
+# unchanged, so the container path is identical to before.
+MAILBOX = os.environ.get("MAILBOX", "/shared/mailbox")
+# The operator token is looked for wherever it may have been mounted: the
+# documented /run/secrets path, and the path the control UI generates and can
+# mount (/app). First existing file wins; with neither, the gated route
+# answers 503 (refused), it does not crash.
+def _token_file(*candidates: str) -> str:
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+ADMIN_TOKEN_FILE = _token_file("/run/secrets/bank-admin-token",
+                               "/app/bank-admin-token")
+AGENT0_TOKEN_FILE = _token_file("/run/secrets/agent0-transfer-token",
+                                "/app/agent0-transfer-token")
 EXEMPT_ACCOUNTS = frozenset({"agent-0"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$")
 
@@ -78,11 +101,60 @@ def decay_ticks() -> int:
 
 
 def ensure_account(name) -> tuple[int, bool]:
-    """Return (balance, created) for an agent, creating it if needed."""
+    """Return (balance, created) for an agent, creating it at ZERO if needed.
+
+    A NEW account starts at 0 and NOTHING is granted by creating it. Funding a
+    name the first time it is touched is a mint: any caller who can reach this
+    API can name a fresh account, be granted START_MONEY, and move it to a real
+    account. Guarding only the transfer's sender is not enough -- the RECIPIENT
+    path and `GET /balance/<name>` are the same hole. Coins enter an account
+    only through seed() (a startup operator act) or /admin/topup (an operator
+    act with the admin token).
+
+    The `created` flag is kept so a read may materialise an account at 0
+    without granting it anything.
+    """
     if name in _accounts:
         return _accounts[name], False
-    _accounts[name] = START_MONEY
-    return START_MONEY, True
+    _accounts[name] = 0
+    return 0, True
+
+
+def seed(name, amount) -> int:
+    """Grant `amount` coins to `name`. An OPERATOR act, never a side effect.
+
+    Called at startup for the SEED list and by /admin/topup. This is the only
+    code path that increases the total money supply.
+    """
+    balance = _accounts.get(name, 0) + int(amount)
+    _accounts[name] = balance
+    return balance
+
+
+def parse_seed(spec):
+    """Parse 'agent-0:9290,agent-1:1000' -> [('agent-0', 9290), ...].
+
+    A bare name with no ':' gets START_MONEY, so SEED="agent-1,agent-2" is the
+    short form for the common case. Malformed entries raise rather than being
+    skipped: a typo in a seed list must fail loudly, because a silently-skipped
+    seed is a town full of broke agents.
+    """
+    out = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            name, _, amt = item.partition(":")
+            name, amt = name.strip(), amt.strip()
+            if not NAME_RE.match(name):
+                raise ValueError(f"bad name in SEED: {name!r}")
+            out.append((name, int(amt)))
+        else:
+            if not NAME_RE.match(item):
+                raise ValueError(f"bad name in SEED: {item!r}")
+            out.append((item, START_MONEY))
+    return out
 
 
 def notify(recipient, sender, amount, recipient_balance):
@@ -132,10 +204,21 @@ class Handler(BaseHTTPRequestHandler):
             name = m.group(1)
             with _lock:
                 ticks = decay_ticks()
-                balance, created = ensure_account(name)
-                if ticks or created:
+                # A READ MUST NOT WRITE. This used to call ensure_account(),
+                # which CREATED the row and saved the ledger, so 2,000 reads
+                # of fresh names grew /data/accounts.json without bound while
+                # honestly answering exists=false. Stopping creation from
+                # FUNDING the account did not stop it creating one. Decay is
+                # still persisted when it advanced; the account row is not.
+                existed = name in _accounts
+                balance = _accounts.get(name, 0)
+                if ticks:
                     save()
-            return self._send(200, {"agent": name, "money": balance})
+            # `exists` distinguishes "this agent has an account" from "you
+            # asked about a name". 200-with-0 is friendlier to the MCP client
+            # than 404 and it is honest about what the number means.
+            return self._send(200, {"agent": name, "money": balance,
+                                    "exists": existed})
         return self._send(404, {"error": f"unknown path {path}"})
 
     def do_POST(self):
@@ -162,16 +245,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad JSON body"})
         if path == "/admin/topup":
             amount = body.get("amount")
+            target = body.get("agent", "agent-0")
+            if not isinstance(target, str) or not NAME_RE.match(target):
+                return self._send(400, {"error": "invalid agent name"})
             if type(amount) is not int or not 0 < amount <= 1_000_000:
                 return self._send(400, {"error": "amount must be 1..1000000"})
             with _lock:
                 decay_ticks()
-                balance, _ = ensure_account("agent-0")
-                balance += amount
-                _accounts["agent-0"] = balance
+                balance = seed(target, amount)
                 save()
-            print(f"[bank] operator topped up agent-0 by {amount}", flush=True)
-            return self._send(200, {"agent": "agent-0", "money": balance})
+            print(f"[bank] operator topped up {target} by {amount}", flush=True)
+            return self._send(200, {"agent": target, "money": balance})
         sender = body.get("from")
         recipient = body.get("to")
         amount = body.get("amount")
@@ -194,13 +278,30 @@ class Handler(BaseHTTPRequestHandler):
 
         with _lock:
             ticks = decay_ticks()
-            s_bal, s_new = ensure_account(sender)
-            r_bal, r_new = ensure_account(recipient)
-            if ticks or s_new or r_new:
+            if ticks:
+                # Decay has ALREADY been applied in memory, so it must be
+                # persisted even if this transfer is refused. Dropping it here
+                # would leave the in-memory ledger ahead of the file and the
+                # elapsed time would be re-applied on the next save.
                 save()
+            # A sender must already exist: the bank cannot tell an agent from
+            # someone who can spell its name, so an unknown sender is refused
+            # rather than created. Creating it would let any caller open an
+            # account and spend it in the same request.
+            if sender not in _accounts:
+                return self._send(400, {"error": "unknown sender"})
+            s_bal = _accounts[sender]
+            # Check funds BEFORE creating anything. The recipient used to be
+            # created and saved above this check, so a REFUSED transfer still
+            # wrote a row into the ledger: a caller could grow
+            # /data/accounts.json without bound with failing transfers to fresh
+            # names, and a 400 still mutated state. Creating the recipient is
+            # part of committing the transfer, so it happens only after the
+            # transfer is known to be legal.
             if s_bal < amount:
                 return self._send(400, {"error": "insufficient funds",
                                         "money": s_bal})
+            r_bal, _ = ensure_account(recipient)
             s_bal -= amount
             r_bal += amount
             _accounts[sender] = s_bal
@@ -227,7 +328,17 @@ def decay_loop():
 
 if __name__ == "__main__":
     load()
+    seed_spec = os.environ.get("SEED", "")
+    with _lock:
+        seeded = [(name, amt) for name, amt in parse_seed(seed_spec)
+                  if name not in _accounts]
+        for name, amt in seeded:
+            seed(name, amt)
+        if seeded:
+            save()
+            print(f"[bank] seeded {len(seeded)} account(s): "
+                  + ", ".join(f"{n}={a}" for n, a in seeded), flush=True)
     threading.Thread(target=decay_loop, daemon=True).start()
-    print(f"[bank] on 0.0.0.0:{PORT}  start={START_MONEY}  "
+    print(f"[bank] on 0.0.0.0:{PORT}  seed={seed_spec or '(none)'}  "
           f"decay=1 coin/{DECAY_SECONDS}s  ledger={DATA}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

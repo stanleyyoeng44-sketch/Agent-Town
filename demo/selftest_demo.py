@@ -1,0 +1,152 @@
+"""selftest_demo.py — three tests that the demo is evidence, not theatre.
+
+1. NEGATIVE CONTROL FIRES: remove the overdraft guard and the demo must fail.
+2. FORWARD COMPATIBILITY: apply the bank fix recommended in review #1 (env-var
+   ledger path) and the demo must STILL pass, via the unmodified file. Without
+   this, a good change to bank.py would silently break the demo.
+3. UNKNOWN LEDGER SHAPE: if bank.py neither hardcodes /data nor reads an env
+   var, the demo must exit 2 with a reason, not run against the wrong ledger.
+
+MUTATION TEST: delete the overdraft guard in a copy of bank.py and assert the
+demo then FAILS. If the demo still passes with the guard removed, its
+"overdraft refused" check is not testing anything.
+"""
+import os, subprocess, sys, tempfile, shutil
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEMO = os.path.join(ROOT, "demo", "town.py")
+
+def run_demo_with_bank(transform):
+    """Run the demo in a temp tree whose bank.py is `transform(source)`."""
+    tmp = tempfile.mkdtemp(prefix="demo-selftest-")
+    try:
+        os.makedirs(os.path.join(tmp, "bank"))
+        os.makedirs(os.path.join(tmp, "demo"))
+        src = open(os.path.join(ROOT, "bank", "bank.py")).read()
+        open(os.path.join(tmp, "bank", "bank.py"), "w").write(transform(src))
+        shutil.copy(DEMO, os.path.join(tmp, "demo", "town.py"))
+        r = subprocess.run([sys.executable, os.path.join(tmp, "demo", "town.py")],
+                           capture_output=True, text=True, timeout=90)
+        return r.returncode, r.stdout, r.stderr
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_demo_with_mutated_bank(guard_on: bool):
+    """Copy the repo, optionally remove the overdraft guard, run the demo."""
+    tmp = tempfile.mkdtemp(prefix="demo-selftest-")
+    try:
+        # minimal tree: bank/ + demo/
+        os.makedirs(os.path.join(tmp, "bank"))
+        os.makedirs(os.path.join(tmp, "demo"))
+        src = open(os.path.join(ROOT, "bank", "bank.py")).read()
+        if not guard_on:
+            # SEMANTIC mutation, not textual (agent-2's point): make the guard
+            # condition always false by rewriting the COMPARISON, wherever it
+            # is. A text-replace of the exact three lines breaks the moment
+            # anyone reformats the guard, and then this selftest silently
+            # stops testing anything.
+            needle = "if s_bal < amount:"
+            assert needle in src, "overdraft comparison not found -- selftest stale"
+            src = src.replace(needle, "if False:  # GUARD DISABLED BY SELFTEST")
+        open(os.path.join(tmp, "bank", "bank.py"), "w").write(src)
+        shutil.copy(DEMO, os.path.join(tmp, "demo", "town.py"))
+        r = subprocess.run([sys.executable, os.path.join(tmp, "demo", "town.py")],
+                           capture_output=True, text=True, timeout=90)
+        return r.returncode, r.stdout
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+rc, out = run_demo_with_mutated_bank(True)
+print(f"guard ON : rc={rc}  (expect 0)")
+print("  " + [l for l in out.splitlines() if "DEMO" in l][-1])
+rc2, out2 = run_demo_with_mutated_bank(False)
+print(f"guard OFF: rc={rc2}  (expect 1)")
+print("  " + [l for l in out2.splitlines() if "DEMO" in l][-1])
+def _data_line_re():
+    """The ledger assignment may be a literal or an os.environ.get(...) call.
+
+    Kept as a REGEX, not a literal replace: once bank.py made DATA configurable
+    (repo-hygiene 025faf1), a literal-only mutation became a no-op and this
+    selftest silently tested the UNMUTATED bank -- it reported rc=0 and the
+    whole selftest failed. A mutation that does not mutate is the same defect
+    class as a control that cannot fail. The regex is anchored on the DATA
+    assignment and the caller asserts the replacement CHANGED the source.
+    """
+    import re
+    return re.compile(r'^DATA = .*$', re.M)
+
+def _mutate_data(src, replacement):
+    rx = _data_line_re()
+    new, n = rx.subn(replacement, src, count=1)
+    assert n == 1, "selftest is stale: no single '^DATA = ...' line in bank.py"
+    assert new != src, "selftest mutation was a NO-OP -- it would test the real bank"
+    return new
+
+def env_fix(src):
+    return _mutate_data(src, 'DATA = os.environ.get("BANK_DATA", "/data/accounts.json")  # mutated: env fix')
+
+def unknown_shape(src):
+    # neither the literal nor an env read the demo recognises
+    return _mutate_data(src, 'DATA = "/srv/x/ledger.json"  # mutated: unknown shape')
+
+def grant_on_create(src):
+    """A bank that GRANTS on first touch must fail the demo.
+
+    This is the mint as a negative control. Accounts are created at 0 on
+    purpose; if creating one also pays START_MONEY, then naming a fresh
+    account is free money. The demo asserts the exact seeded balances and that
+    touching an unknown name creates no coins, so this mutation must make it
+    FAIL. If this control ever passes, the demo has stopped testing the
+    property the bank exists to guarantee.
+    """
+    needle = ("    if name in _accounts:\n"
+              "        return _accounts[name], False\n"
+              "    _accounts[name] = 0\n"
+              "    return 0, True\n")
+    assert needle in src, ("ensure_account no longer has the create-at-0 "
+                           "shape -- this control would be testing nothing")
+    # Replace the WHOLE function body. A needle of only its last two lines is
+    # a substring of the FIRST branch too, and grant-on-create would silently
+    # rewrite the lookup branch while leaving creation at 0 -- the mutation
+    # runs, changes the file, and tests nothing. Measured: that exact needle
+    # made the demo PASS while the bank still created at 0.
+    return src.replace(needle,
+                       "    if name in _accounts:\n"
+                       "        return _accounts[name], False\n"
+                       "    _accounts[name] = START_MONEY\n"
+                       "    return START_MONEY, True\n")
+
+
+def single_value_guard(src):
+    """agent-2's attack: refuse overdrafts ONLY at the amount the demo tests.
+
+    Found by agent-2 in peer review #2. My first negative control tested one
+    amount, so a bank that special-cased that amount PASSED. This mutation is
+    kept as a permanent regression: if the demo ever goes back to a
+    single-value check, this line catches it.
+    """
+    return src.replace("if s_bal < amount:",
+                       "if s_bal < amount and amount == 10000:")
+
+rc5, out5, err5 = run_demo_with_bank(single_value_guard)
+print(f"single-value guard (agent-2): rc={rc5}  (expect 1)")
+print("  " + ([l for l in out5.splitlines() if "FAIL" in l][:1] or ["(none)"])[0])
+
+rc6, out6, err6 = run_demo_with_bank(grant_on_create)
+print(f"grant-on-create (the mint): rc={rc6}  (expect 1)")
+print("  " + ([l for l in out6.splitlines() if "FAIL" in l][:1] or ["(none)"])[0])
+
+rc3, out3, err3 = run_demo_with_bank(env_fix)
+print(f"env-var fix applied: rc={rc3}  (expect 0)")
+print("  " + ([l for l in out3.splitlines() if "DEMO" in l][-1]
+               if "DEMO" in out3 else "(no verdict line)"))
+rc4, out4, err4 = run_demo_with_bank(unknown_shape)
+print(f"unknown ledger shape: rc={rc4}  (expect 2)")
+print("  " + ([l for l in out4.splitlines() if "FAIL" in l][:1] or ["(none)"])[0])
+
+ok = (rc == 0 and rc2 == 1 and rc3 == 0 and rc4 == 2 and rc5 == 1 and rc6 == 1)
+print("\nSELFTEST", "PASS" if ok else "FAIL", end="")
+print(" - control fires, single-value guard caught, bank fix does not break "
+      "the demo, unknown shape refuses, grant-on-create caught" if ok else "")
+sys.exit(0 if ok else 1)

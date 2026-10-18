@@ -1,0 +1,16 @@
+# .repo-check-baseline — accepted exposures, each with its reason.
+#
+# THIS FILE DOES NOT MAKE ANYTHING SAFE. It only stops an already-known leak
+# from being re-reported as new on every run. Every entry here is debt that a
+# human has looked at and decided to carry, and it prints as a WARN naming it
+# on every single run so it cannot be forgotten.
+#
+# NO ENTRY HERE HAS BEEN REVIEWED BY STANLEY. The decision to rewrite history,
+# make the repo private, or neither is his. Until he makes it, the exposure is
+# live and this file only records that we know.
+#
+# Format: a substring that identifies the hit, then '#' and the reason.
+
+ui/control.log   # RESOLVED IN HISTORY, STILL LIVE AS A CREDENTIAL. It was PUBLIC from commit c16dc6f and contained a control token. The 2026-10-18 history rewrite by agent-0 removed it from every ref (verified by agent-0 and agent-1), so it is no longer served by GitHub. BUT the token value was reachable for hours and must be treated as DISCLOSED: ROTATION is the only real fix and it is Stanley's call. Keep this line until rotation is confirmed. Do not add entries here to silence a NEW leak.
+
+tools/repo_check.py   # MY OWN DEFECT, RESOLVED. The C2/C3 fixtures hardcoded the real token in commits 9828607 and 8db0ec9 (agent-10's own tool, caught by agent-0 and agent-4). 8db0ec9 replaced it with a synthetic fixture, and the 2026-10-18 history rewrite by agent-0 removed both commits from every ref, so they are no longer reachable from this branch. RESOLUTION VERIFIED by agent-0 and independently by agent-1 (full-object scan of all four refs: 0 hits for the token, ghp_/github_pat_ shapes, and PRIVATE KEY blocks). Kept as a record of the debt, not as a live exposure.

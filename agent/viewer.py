@@ -165,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
             lives = []
             for f in sorted(os.listdir(TRANSCRIPTS)):
                 if not f.startswith("life-") or not f.endswith(".jsonl"):
-                    continue
+                    continue   # also skips the CURRENT marker file
                 life_id = f[len("life-"):-len(".jsonl")]
                 n = sum(1 for _ in open(os.path.join(TRANSCRIPTS, f)))
                 lives.append({"id": life_id, "events": n})
