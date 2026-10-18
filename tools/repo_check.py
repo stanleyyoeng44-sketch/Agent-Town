@@ -1184,10 +1184,25 @@ def selftest():
     _git(d, "add", "-f", ".")
     _git(d, "commit", "-qm", "paragraph removed")
     _, r_gone = run(d)
+    # ARM 3 (agent-10's finding): the check has TWO limbs -- "the README
+    # mentions the target" and "the target ships". Only the first was
+    # controlled, so a refactor dropping the os.path.exists branch would keep
+    # this suite green. A control must cover every limb of the check it
+    # controls, or it certifies the half it happens to exercise.
+    os.remove(os.path.join(d, "docs/claimgraph/index.html"))
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\nSee [the graph](docs/claimgraph/index.html).\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "links a file that does not ship")
+    _, r_dangling = run(d)
     outcomes.append((
         "C10 passes when the README links the graph, fails when it does not",
         dict((n, o) for n, o, _ in r_has)["C10 readme links the graph"] == "PASS"
         and dict((n, o) for n, o, _ in r_gone)["C10 readme links the graph"] == "FAIL"))
+    outcomes.append((
+        "C10 fails when the README links a file that is not in the tree",
+        dict((n, o) for n, o, _ in r_dangling)
+        ["C10 readme links the graph"] == "FAIL"))
     shutil.rmtree(d)
 
     # C9: a README that quotes a response the bank does not give must FAIL.
