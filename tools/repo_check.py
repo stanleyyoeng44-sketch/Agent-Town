@@ -1337,25 +1337,50 @@ def _registry_orphans(source):
     # function an exemption; only calls from production code do.
     HARNESS = {"selftest", "_self_guard", "registry_status",
                "_registry_orphans", "main"}
-    called = set()
-
-    def record_calls(node):
+    # A CALL EARNS A FUNCTION A HELPER EXEMPTION ONLY IF IT RUNS AS PART OF A
+    # CHECK. Two ways a call used to launder a dead check past C14, both
+    # measured by agent-2 on the merged predicate:
+    #   A3  `_C99 = c99_probe('.')` at MODULE LEVEL -- runs once at import,
+    #       its result is a constant, it is not "production code" by any
+    #       reading, but a walk of every tree.body node counted it.
+    #   A2  `def _helper(): return c99_probe('.')` called from selftest() --
+    #       one helper of indirection, and the call sat outside the harness
+    #       nodes so it counted.
+    # So: only calls INSIDE a FunctionDef count (A3 gone), and the harness
+    # exclusion follows the CALL SUBGRAPH, not just the harness bodies (A2
+    # gone) -- a helper reachable from selftest is still the harness.
+    def calls_in(node):
+        """Names called inside `node`."""
+        out = set()
         for n in ast.walk(node):
-            if isinstance(n, ast.Call):
-                f = n.func
-                if isinstance(f, ast.Name):
-                    called.add(f.id)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                out.add(n.func.id)
+        return out
 
-    # Calls made from the HARNESS do not mark a function as a live helper, so
-    # the harness nodes are simply not walked. (An earlier revision built a
-    # separate `harness_called` set that nothing ever read -- a field no one
-    # reads is telemetry, not an alarm.)
-    harness_nodes = [n for n in tree.body
-                     if isinstance(n, ast.FunctionDef) and n.name in HARNESS]
-    for node in tree.body:
-        if node in harness_nodes:
+    fdefs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    by_name = {n.name: n for n in fdefs}
+    # Functions reachable (transitively) from a harness function via calls.
+    harness_reach = set(HARNESS)
+    frontier = set(HARNESS)
+    while frontier:
+        nxt = set()
+        for hname in frontier:
+            node = by_name.get(hname)
+            if node is None:
+                continue
+            for callee in calls_in(node):
+                if callee not in harness_reach and callee in by_name:
+                    harness_reach.add(callee)
+                    nxt.add(callee)
+        frontier = nxt
+
+    # `called` = check-shaped names called from a FunctionDef that is NOT in
+    # the harness subgraph. Module-level statements are deliberately excluded.
+    called = set()
+    for node in fdefs:
+        if node.name in harness_reach:
             continue
-        record_calls(node)
+        called |= calls_in(node)
 
     # TWO SETS, because the two verdicts ask different questions.
     #
@@ -1412,12 +1437,22 @@ def c14_check_registry(root):
     SCOPE, and it is narrower than it looks: this compares NAMES. A check
     whose body is gutted to `return ("x", "PASS", [])` is still registered and
     still named, and C14 passes. Second limit, added after agent-7 asked for
-    the sentence to match the predicate: a check-shaped function that is
-    CALLED FROM PRODUCTION CODE is treated as a helper and is not reported as
-    an orphan, so the ORPHAN verdict means every check-shaped function is
-    either registered or called by production code. A check called only from
-    the selftest IS reported as an orphan; that distinction is agent-7's fix,
-    because liveness is not registration.
+    the sentence to match the predicate: an unregistered check-shaped function
+    that is CALLED FROM PRODUCTION CODE is treated as a live helper and is not
+    reported as an orphan, so the ORPHAN verdict means every check-shaped
+    function is either registered or called from a function body that is not
+    part of the test harness. The exemption is mechanical and deliberately
+    narrow, because it is the only thing that keeps a legitimate helper from
+    being named dead (the false positive that gets a gate deleted):
+
+      * the call must be INSIDE a FunctionDef. A module-level call such as
+        `_X = c99_probe('.')` runs once at import and is not production code
+        -- it does NOT earn the exemption (agent-2's A3).
+      * the call must not be reachable from the harness. A helper called only
+        by selftest() -- directly or through one level of indirection -- is
+        still the harness, so it does NOT earn the exemption (agent-2's A2,
+        and agent-7's original case). Reachability is followed transitively,
+        so a chain of helpers cannot launder a selftest call.
 
     BUT THAT EXEMPTION APPLIES ONLY TO THE ORPHAN VERDICT. A registered check
     that production code also calls is still DEFINED, so the PHANTOM verdict
@@ -2771,6 +2806,30 @@ def selftest():
     st_j, fd_j = registry_status(row4_src)
     outcomes.append(("C14: a registered check CALLED from production is not a phantom",
                      st_j == "PASS" and not any("NOT DEFINED" in f for f in fd_j)))
+
+    # Arm K: a MODULE-LEVEL call must not launder a dead check. agent-2's A3:
+    # `_C99 = c99_probe('.')` runs once at import; its result is a constant,
+    # not production work. Before the fix this counted as a live call and C14
+    # passed. Now only calls inside a FunctionDef count.
+    a3_src = ("def c99_probe(root):\n    return 'x', 'FAIL', []\n\n\n"
+              "_C99 = c99_probe('.')\n\n\n"
+              "CHECKS = []\n")
+    st_k, fd_k = registry_status(a3_src)
+    outcomes.append(("C14: a check called only at MODULE level is still an orphan",
+                     st_k == "FAIL" and any("c99_probe" in f for f in fd_k)))
+
+    # Arm L: ONE helper of indirection must not launder a selftest call.
+    # agent-2's A2: `def _helper(): return c99_probe('.')` called from
+    # selftest() put the call outside the named harness bodies, so a
+    # non-subgraph walk counted it. The harness exclusion now follows the call
+    # subgraph transitively.
+    a2_src = ("def c99_probe(root):\n    return 'x', 'FAIL', []\n\n\n"
+              "def _helper():\n    return c99_probe('.')\n\n\n"
+              "def selftest():\n    _helper()\n    return True\n\n\n"
+              "CHECKS = []\n")
+    st_l, fd_l = registry_status(a2_src)
+    outcomes.append(("C14: a check called through a helper FROM the selftest is an orphan",
+                     st_l == "FAIL" and any("c99_probe" in f for f in fd_l)))
 
     # Arm C: C14's own removal must still be caught. registry_status cannot
     # see this (if C14 is unregistered it never runs), so the guard is
