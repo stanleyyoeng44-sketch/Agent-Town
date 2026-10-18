@@ -552,7 +552,35 @@ README_COUNT_CLAIMS = [
      lambda r: _selftest_control_lines(r)),
     (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
      lambda r: len([x for x in sh_ls(r) if x.strip()])),
+    # The correction-graph sentence. agent-8 attacked C8 and measured that
+    # these four were OUTSIDE its list: mutating the sentence to "899 claims"
+    # or deleting the paragraph entirely both left repo_check green. They are
+    # generated numbers about a committed artifact, which is exactly the class
+    # that drifted four times tonight, so they belong here and not in prose.
+    (r"holds\s+(\d+)\s+claims", lambda r: _graph_numbers(r)["claims"]),
+    (r"(\d+)\s+typed\s+edges", lambda r: _graph_numbers(r)["edges"]),
+    (r"(\d+)\s+of them\s+supersessions",
+     lambda r: _graph_numbers(r)["supersessions"]),
+    (r"plus\s+(\d+)\s+retractions",
+     lambda r: _graph_numbers(r)["retractions"]),
 ]
+
+
+def _graph_numbers(root):
+    """Read the numbers out of the artifact the README describes.
+
+    The COMMITTED graph.json, not the live store: a reader who clones gets
+    this file, and a check pinned to the store would be red on every clone
+    but the author's. build.py already WARNs when the artifact is behind the
+    store; that signal belongs there, not here.
+    """
+    import json as _json
+    path = os.path.join(root, "docs/claimgraph/graph.json")
+    g = _json.load(open(path, encoding="utf-8"))
+    st = g["stats"]
+    return {"claims": len(g["nodes"]), "edges": len(g["edges"]),
+            "supersessions": st["supersede_edges"],
+            "retractions": st["status"].get("retracted", 0)}
 _WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
           "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
@@ -629,14 +657,46 @@ def c8_readme_numbers(root):
 
 # (text in README.md, its lie, label). Lives beside the check so the two
 # cannot drift apart.
-C8_CONTROLS = [
-    ("— 28 checks", "— 27 checks", "demo caption"),
-    ("`python3 demo/town.py`, 28 checks", "`python3 demo/town.py`, 27 checks",
-     "verification table"),
-    ("mutates the bank six ways", "mutates the bank five ways",
-     "selftest mutations"),
-    ("(20 files)", "(12 files)", "tracked modules"),
-]
+def _c8_controls():
+    """Build the control pairs FROM the README, so they do not go stale.
+
+    Hardcoded literals were the first version and they rotted within the hour:
+    the module count moved 17 -> 20 -> 22 and the control stopped being
+    buildable, which the selftest reports as a FAILURE ("claim is still
+    checkable") rather than a skip. Deriving them is the same rule as the
+    check itself -- a number typed beside the thing it describes is a courier.
+    """
+    import re as _re
+    text = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+
+    def find(rx):
+        m = _re.search(rx, text)
+        return m.group(1) if m else None
+
+    pairs = []
+    for rx, label, bump in (
+            (r"—\s*(\d+)\s+checks", "demo caption", 1),
+            (r"`python3 demo/town\.py`,\s*(\d+)\s+checks",
+             "verification table", 1),
+            (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
+             "tracked modules", 5),
+            (r"holds\s+(\d+)\s+claims", "claimgraph claims", 786),
+            (r"(\d+)\s+typed\s+edges", "claimgraph edges", 59)):
+        v = find(rx)
+        if v is None:
+            continue
+        pairs.append((v, str(int(v) + bump), label))
+    w = find(r"mutates the bank\s+(\w+)\s+ways")
+    if w:
+        back = {"six": "five", "five": "four", "four": "three",
+                "seven": "six", "eight": "seven"}
+        pairs.append((f"mutates the bank {w} ways",
+                      f"mutates the bank {back.get(w, w)} ways",
+                      "selftest mutations"))
+    return pairs
+
+
+C8_CONTROLS = _c8_controls()
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
@@ -948,7 +1008,8 @@ def selftest():
         d = farm()
         open(os.path.join(d, ".gitignore"), "w").write(
             "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
-        for rel in ("demo/town.py", "demo/selftest_demo.py"):
+        for rel in ("demo/town.py", "demo/selftest_demo.py",
+                    "docs/claimgraph/graph.json"):
             os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
             shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
         shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
