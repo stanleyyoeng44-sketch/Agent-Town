@@ -389,12 +389,23 @@ def ensure_fixture_store(root=None):
             pass
     except OSError:
         names = None
+    # ONE classification pass, and every shape that is not a usable record
+    # lands in `bad`. agent-2's review found the hole this replaces: the
+    # first version wrote `except Exception: continue`, so a claim file that
+    # does not PARSE was skipped, `bad` stayed empty, and the store was
+    # declared READABLE. load() then dropped all of them, live == [], and the
+    # run died at `a, b = live[0], live[1]` with IndexError -- on the runner
+    # path this function exists to protect. A measurement that could not be
+    # taken (json.load raised) was being treated as a measurement that came
+    # back clean. Missing is not clean. Measured on 3 unparseable files:
+    # ce5497b -> IndexError at :370; this version -> fixture + note.
     bad = []
     if names is not None:
         for nm in names:
             try:
                 d = json.load(open(os.path.join(root, "claims", nm)))
             except Exception:
+                bad.append(nm)       # UNPARSEABLE is a defect, not a skip
                 continue
             if not isinstance(d.get("statement", ""), str):
                 bad.append(nm)
@@ -402,7 +413,8 @@ def ensure_fixture_store(root=None):
         return root, None
     why = ("no claim store at %s" % root if names is None
            else ("no claims in %s" % root if not names
-                 else "%d claim(s) in %s have a non-string statement (%s)"
+                 else "%d claim(s) in %s are unusable (unparseable or "
+                      "non-string statement: %s)"
                       % (len(bad), root, ", ".join(sorted(bad)[:3]))))
     d = tempfile.mkdtemp(prefix="claimgraph-fixture-")
     for sub in ("claims", "events"):
@@ -532,16 +544,49 @@ def selftest():
     # runner has, and the arm above would be green there only by accident if
     # nobody asserted it. Assert that the fixture path ENGAGES for an absent
     # store -- a note -- and that it does NOT engage for a readable one.
-    absent = tempfile.mkdtemp()
+    scrape = tempfile.mkdtemp(prefix="claimgraph-m5-")
+    absent = os.path.join(scrape, "nope")
     try:
-        _r, note_absent = ensure_fixture_store(os.path.join(absent, "nope"))
-        _r2, note_present = ensure_fixture_store(store)
+        # A GOOD store built HERE, not the one the run happened to start with.
+        # agent-2's second finding: the first version passed `store`, which is
+        # the RESULT of the first call -- so when the live store is malformed
+        # (today) that result IS the fixture and the arm asserted fixture
+        # IDEMPOTENCE under the label "a readable store is used as-is". It
+        # passed and measured something else. The control must be
+        # constructed, not inherited.
+        good = os.path.join(scrape, "good")
+        for sub in ("claims", "events"):
+            os.makedirs(os.path.join(good, sub))
+        for nm in ("g1", "g2"):
+            json.dump({"id": nm, "statement": nm, "author": "selftest"},
+                      open(os.path.join(good, "claims", nm + ".json"), "w"))
+        _ra, note_absent = ensure_fixture_store(absent)
+        _rg, note_good = ensure_fixture_store(good)
         checks.append(("M5 absent store falls back to a fixture and SAYS so",
                        note_absent is not None and "no claim store" in note_absent))
-        checks.append(("M5 a readable store is used as-is (no fixture)",
-                       note_present is None))
+        checks.append(("M5 a known-good store is used as-is (no fixture)",
+                       note_good is None and _rg == good))
+        # M6: agent-2's hole. Unparseable claim files are a DEFECT, not a
+        # skip; without this arm the bug is a code path nobody exercises.
+        broken = os.path.join(scrape, "broken")
+        os.makedirs(os.path.join(broken, "claims"))
+        os.makedirs(os.path.join(broken, "events"))
+        for nm in ("x1", "x2", "x3"):
+            open(os.path.join(broken, "claims", nm + ".json"), "w").write(
+                "{ not json")
+        _rb, note_broken = ensure_fixture_store(broken)
+        checks.append(("M6 unparseable claims fall back to a fixture and SAY so",
+                       note_broken is not None and "unusable" in note_broken))
+        _rb2, note_broken2 = ensure_fixture_store(_rb)
+        checks.append(("M6 the fixture itself is readable (no cascade)",
+                       note_broken2 is None))
     finally:
-        shutil.rmtree(absent, ignore_errors=True)
+        # Everything M5/M6 made, including the scratch root and the fixtures
+        # the calls returned. agent-2 measured one leaked fixture dir per run
+        # in the first version; a runner accumulates them.
+        shutil.rmtree(scrape, ignore_errors=True)
+        for _maybe in (_ra, _rb):
+            shutil.rmtree(_maybe, ignore_errors=True)
 
     ok = True
     for name, cond in checks:
