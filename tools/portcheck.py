@@ -316,7 +316,14 @@ def evaluate(root):
         else:
             findings.append("no document publishes :%s, called from %s"
                             % (port, "; ".join(callers)))
-    return (checked, findings, gaps), None
+    # WHICH DOCS WERE ACTUALLY READ. See _publisher_docs_read() in
+    # repo_check.py for the attack this makes visible: narrowing
+    # PUBLISHER_DOCS and padding the publish count back leaves the pair count
+    # constant while a third of the supply side is unread. A DOC count cannot
+    # be padded by editing a doc you already read.
+    docs_read = sorted(publishers)
+    docs_absent = [d for d in PUBLISHER_DOCS if d not in publishers]
+    return (checked, findings, gaps, docs_read, docs_absent), None
 
 
 def run(root="."):
@@ -324,16 +331,18 @@ def run(root="."):
     if err:
         print("PORTCHECK: CANNOT MEASURE --", err)
         return 2
-    checked, findings, gaps = result
+    checked, findings, gaps, docs_read, docs_absent = result
     for g in gaps:
         print("  GAP (not measured):", g)
     if findings:
-        print("PORTCHECK: DIFFER (%d publish site(s) checked)" % checked)
+        print("PORTCHECK: DIFFER (%d publish site(s) checked; %d doc(s) read)"
+              % (checked, len(docs_read)))
         for f in findings:
             print("  -", f)
         return 1
-    print("PORTCHECK: MATCH (%d publish site(s) serve every code consumer)"
-          % checked)
+    print("PORTCHECK: MATCH (%d publish site(s) serve every code consumer; "
+          "%d doc(s) read: %s)"
+          % (checked, len(docs_read), ", ".join(docs_read)))
     if gaps:
         print("  NOTE: MATCH covers -p publishes only; %d port(s) rest on an "
               "unattributable --bind (see GAP above)." % len(gaps))
@@ -396,6 +405,22 @@ def selftest():
     ok &= named
     print("  %-44s %s" % ("F the FAIL names the cut-off caller",
                           "PASS" if named else "FAIL"))
+    # G: the supply-side DOC count must move when a publisher is dropped.
+    d_full = fixture(["0.0.0.0:8790:8790"])
+    r_full, _e = evaluate(d_full)
+    full_n = len(r_full[3]) if r_full else -1
+    saved = PUBLISHER_DOCS
+    try:
+        globals()["PUBLISHER_DOCS"] = tuple(saved[:-1])
+        r_narrow, _e2 = evaluate(d_full)
+        narrow_n = len(r_narrow[3]) if r_narrow else -1
+    finally:
+        globals()["PUBLISHER_DOCS"] = saved
+    g_ok = (full_n == len(saved)) and (narrow_n < full_n)
+    ok &= g_ok
+    print("  %-44s %s  (%d -> %d doc(s) read)"
+          % ("G docs read shrinks when a publisher doc is dropped",
+             "PASS" if g_ok else "FAIL", full_n, narrow_n))
     print("PORTCHECK SELFTEST:", "PASS" if ok else "FAILED")
     return 0 if ok else 1
 

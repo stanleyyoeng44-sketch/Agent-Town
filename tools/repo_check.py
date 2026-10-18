@@ -1403,6 +1403,42 @@ def _publisher_docs(root):
     return sites
 
 
+def _publisher_docs_read(root):
+    """How many DOCS publish a docker -p for the bank, counted from the TREE.
+
+    agent-8's attack on C15, measured on ce5497b: narrow PUBLISHER_DOCS to
+    drop docs/guide.md, then add ONE inline "-p 8787:8787" to a doc that is
+    still listed. portcheck's `checked` is a count of (doc, port) PAIRS a
+    consumer needs, so a new publish in a listed doc returns it to 3 while a
+    third of the SUPPLY side is unread -- and because re.match requires the
+    line to START with -p, the inline publish is invisible to the tree-side
+    SITE counter too. Both numbers the gate had were padable.
+
+    A DOC count is not: you cannot add coverage by editing a doc you already
+    read. Counted as "distinct tracked .md files containing a bank docker run
+    block with at least one -p", which is the supply side stated in the terms
+    the tool claims to read.
+    """
+    import subprocess
+    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
+                           capture_output=True, text=True).stdout.split("\0")
+    n = 0
+    for f in filter(None, files):
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        for m in re.finditer(r"```[a-z]*\n(.*?)```", text, re.S):
+            body = m.group(1)
+            if re.search(r"^\s*docker run\b", body, re.M) and \
+               re.search(r"\bagent-bank\b", body) and \
+               re.search(r"(?:^|\s)-p\s+\S+:\d+", body):
+                n += 1
+                break
+    return n
+
+
 def _required_tokens(root):
     """How many secrets bank.py requires, read from ITS _token_file calls."""
     path = os.path.join(root, "bank", "bank.py")
@@ -1598,8 +1634,9 @@ def c15_portcheck(root):
                       # which is portcheck's owner's call, not a mutant I can
                       # write here.
                       ],
-                     reach=(r"MATCH \((\d+) publish site", _publisher_docs,
-                            "publish site"))
+                     reach=(r"(?:publish site|publish site\(s\))[^\n]*?"
+                            r"(\d+) doc\(s\) read", _publisher_docs_read,
+                            "doc read"))
 
 
 def c16_tokencheck(root):
@@ -2566,6 +2603,35 @@ def selftest():
         CHECKS[:] = _saved
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
+
+    # C15 arms. The attack agent-8 measured on ce5497b: narrow PUBLISHER_DOCS
+    # to drop a doc, then add an INLINE "-p" to a doc that is still listed.
+    # portcheck's pair count returns to its old value, so the tool alone still
+    # says MATCH; the DOC count is the number that moves. Both directions are
+    # asserted: the reach value must equal the tree's doc count on a clean
+    # tree, and must NOT equal it when the constant is narrowed.
+    _c15_clean = _publisher_docs_read(ROOT)
+    outcomes.append(("C15 reach reads the tree's publisher-doc count",
+                     isinstance(_c15_clean, int) and _c15_clean >= 1))
+    try:
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location(
+            "_pc_probe", os.path.join(ROOT, "tools", "portcheck.py"))
+        _pc = _iu.module_from_spec(_spec)
+        _spec.loader.exec_module(_pc)
+        _full = _pc.PUBLISHER_DOCS
+        _res_full, _ = _pc.evaluate(ROOT)
+        _n_full = len(_res_full[3]) if _res_full else -1
+        _pc.PUBLISHER_DOCS = tuple(_full[:-1])
+        _res_n, _ = _pc.evaluate(ROOT)
+        _n_narrow = len(_res_n[3]) if _res_n else -1
+        _pc.PUBLISHER_DOCS = _full
+        outcomes.append((
+            "C15 docs-read FALLS when a publisher doc is dropped from the list",
+            _n_full == len(_full) and _n_narrow < _n_full))
+    except Exception as _exc:
+        outcomes.append(("C15 docs-read FALLS when a publisher doc is dropped",
+                         False))
 
     bad = 0
     for label, passed in outcomes:
