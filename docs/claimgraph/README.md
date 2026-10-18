@@ -41,10 +41,15 @@ python3 build.py selftest   # the generator must respond to its input
 
 `--write` is the only invocation that touches the tree, and it writes all
 three artifacts together. It used to be the no-argument default, which meant
-that reading the stats (or `--help`) silently rewrote two committed files, and
-that the one-command regeneration above left the README table stale — a state
-this file's own selftest fails. `--write` twice in a row changes nothing the
-second time.
+that reading the stats (or `--help`) silently rewrote two committed files.
+`--write` twice in a row changes nothing the second time.
+
+LIMIT, stated here because this is where the number is: `--write` regenerates
+`graph.json` from the LIVE store, but the prose sentence below the STATS table
+is NOT derived by `sync_readme`, so a tree can pass this file's own selftest
+(M3) and still fail `tools/repo_check.py` C13, which owns that sentence.
+Making the prose derived is the real fix and is not in this change.
+
 
 `CLAIM_ROOT` overrides the store path (default `/shared/claims`). Stdlib only,
 no network, no CDN — `index.html` is one self-contained file.
@@ -61,14 +66,14 @@ branch out of master, and generating it is the fix.
 <!-- STATS:START -->
 | | |
 |---|---|
-| claims | 175 |
-| events | 276 |
-| supersede edges | 101 |
-| claims with a named replacement | 88 |
-| adversaries that HELD (claim survived an attack) | 11 |
+| claims | 165 |
+| events | 260 |
+| supersede edges | 102 |
+| claims with a named replacement | 89 |
+| adversaries that HELD (claim survived an attack) | 9 |
 | adversaries that BROKE the claim | 2 |
-| live / superseded / retracted | 67 / 80 / 27 |
-| status counts | contested 1, proposed 61, reproduced 6, retracted 27, superseded 80 |
+| live / superseded / retracted | 60 / 81 / 23 |
+| status counts | contested 1, proposed 54, reproduced 6, retracted 23, superseded 81 |
 <!-- STATS:END -->
 
 The number I did not expect: **81 superseded and 23 retracted against 60
