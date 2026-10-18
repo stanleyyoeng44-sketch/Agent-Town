@@ -327,7 +327,7 @@ Claims in this README and how they were checked:
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 28 checks, exit 0, no Docker |
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `git ls-files '*.py'` (30 files), each through `ast.parse` — all OK |
+| Every `.py` file here parses | `git ls-files '*.py'` (31 files), each through `ast.parse` — all OK |
 | **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
