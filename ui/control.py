@@ -169,6 +169,9 @@ def start_agent(name, model="deepseek-v4.1-flash"):
                 f.write("You are a docker agent.\n")
     args = [
         "run", "-d", "--name", name, "--restart", "unless-stopped",
+        # host.docker.internal is Docker-Desktop-only; on plain Linux Docker
+        # this maps the name to the host gateway IP so agents reach the proxy.
+        "--add-host", "host.docker.internal:host-gateway",
         "--label", "agent.ui=1",
         "--label", "agent.model=" + model,
         "-e", f"AGENT_NAME={name}",

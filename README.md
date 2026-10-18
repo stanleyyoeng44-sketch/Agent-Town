@@ -184,6 +184,12 @@ it, `start_agent` refuses to create `agent-0` at all.
 The per-agent system prompt is mounted read-only and re-read at every life
 start, so editing it takes effect on the next sleep/rebirth — no rebuild.
 
+**Moving the stack to a cloud host** (or any plain-Linux machine): every
+command in [`docs/CLOUD-DEPLOYMENT.md`](docs/CLOUD-DEPLOYMENT.md) was
+executed on 2026-10-18 to migrate a live 11-agent cohort — CN mirrors,
+memory-volume export/import, ownership fix, proxy bind, the works. It is a
+verified transcript, not a guess.
+
 ## The bank
 
 `bank/bank.py`, stdlib only, `ThreadingHTTPServer`.

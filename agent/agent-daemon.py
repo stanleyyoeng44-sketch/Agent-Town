@@ -67,6 +67,9 @@ TRANSCRIPTS = os.path.join(WORKSPACE, "transcripts")
 CURRENT_LIFE_FILE = os.path.join(TRANSCRIPTS, "CURRENT")
 MCP_CONFIG = "/app/mcp.json"
 
+# Context-usage threshold that triggers the sleepiness notice (tokens).
+WAKE_NOTICE_TOKENS = int(os.environ.get("WAKE_NOTICE_TOKENS", "500000"))
+
 # The CLI keeps its session records (and therefore the ONE place a resumed
 # context can come from) under ~/.claude. If that stays in the container's
 # writable layer, `docker stop/start` wipes it along with /workspace, so
@@ -602,30 +605,26 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 yield {"type": "user",
                        "message": {"role": "user", "content": opening_message(wake_prompt)}}
             else:
-                # RESUMED, nothing queued: the CLI replays the conversation
-                # and then waits for a user turn. Kick once with a harness
-                # note that is NOT the wake framing (that would duplicate
-                # history).
-                # STATE ONLY WHAT IS KNOWN. The daemon knows a stored session
-                # id was found and resumed. It does NOT know why the previous
-                # life ended: a crash, a docker stop, a completed session, and
-                # a resume of an already-finished session are indistinguishable
-                # here (verified live: an old image resumed a session that had
-                # returned result=success and told the model 'the container
-                # restarted' when PID 1 proved it had not). A note that names
-                # a cause it never checked is the same defect class as a
-                # comment that claims behaviour the code lacks.
+                # RESUMED, nothing queued: the operator wants every start to
+                # ACTIVATE the agent, not let it idle until mail arrives. So
+                # the kick re-sends the wake-up prompt as the plan for NOW
+                # (the same content a fresh life gets), with a resume header
+                # instead of the first-boot framing. It is a harness note,
+                # not a user message; the history above is the same identity.
                 yield {"type": "user",
                        "message": {"role": "user", "content":
-                                   "<system-reminder>\nA previous session "
-                                   "was resumed and its conversation is "
-                                   "restored above. The reason the previous "
-                                   "life ended is not recorded, so none is "
-                                   "claimed. Continue from where the "
-                                   "conversation left off, or write "
-                                   "/workspace/self/diary.md if you are "
-                                   "ending this life.\n"
-                                   "</system-reminder>"}}
+                                   "<system-reminder>\n"
+                                   "This session was resumed from a previous "
+                                   "life; its conversation is restored above. "
+                                   "You have just been woken up. Act on your "
+                                   "wake-up prompt now as your plan for this "
+                                   "session: read /workspace/self/diary.md if "
+                                   "you need more context, check your inbox "
+                                   "and money, do the work, then settle your "
+                                   "diary and sleep when done.\n"
+                                   "</system-reminder>\n\n"
+                                   "Your wake-up prompt to yourself:\n\n"
+                                   f"{wake_prompt}"}}
             while True:
                 item = await inbox_next.get()
                 if item is None:

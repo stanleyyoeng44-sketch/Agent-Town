@@ -1,22 +1,35 @@
 FROM python:3.12-slim
 
+# Tencent-cloud friendly: use the in-country Debian mirror (mirrors.tencentyun.com
+# is on the VM's internal network; deb.debian.org stalls from this region).
+RUN sed -i "s|deb.debian.org|mirrors.tencentyun.com|g" /etc/apt/sources.list.d/debian.sources
+
 # Tools the Claude Code CLI and the agent's Bash tool will want.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git ripgrep \
+      ca-certificates curl git ripgrep xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 — the Claude Code CLI is a Node program.
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/*
+# nodesource.com is throttled to ~4KB/s from CN clouds, so install from the
+# npmmirror (Alibaba) Node binary mirror instead — pure domestic traffic.
+ARG NODE_VERSION=22.14.0
+# nodejs-release filenames use x64/arm64, Debian calls them amd64/arm64.
+RUN ARCH=$(dpkg --print-architecture | sed 's/amd64/x64/') \
+ && curl -fsSL https://mirrors.aliyun.com/nodejs-release/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz \
+    -o /tmp/node.tar.xz \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+ && rm /tmp/node.tar.xz \
+ && node --version && npm --version
 
-# The Claude Code CLI itself.
-RUN npm install -g @anthropic-ai/claude-code
+# The Claude Code CLI itself. npmjs.org is slow from CN; use the npmmirror
+# registry (domestic CDN) and disable the CLI's auto-updater.
+RUN npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com
 
 # The Python SDK that drives the CLI.
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+      --index-url https://mirrors.aliyun.com/pypi/simple/
 
 # The daemon, the one-shot runner, the task-submission helper, and the
 # operator config. All owned by root in /app; the agent runs as the
