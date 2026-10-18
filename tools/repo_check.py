@@ -1034,7 +1034,21 @@ def selftest():
         else:
             lie = str(int(found) + 1)
         lying = m.group(0).replace(found, lie, 1)
-        open(p, "w", encoding="utf-8").write(t.replace(m.group(0), lying, 1))
+        # THE MUTATION MUST BE PROVEN TO MUTATE. Deriving the lie makes a
+        # no-op unlikely; it does not make it impossible. A control whose
+        # replacement changes nothing leaves an HONEST tree, C8 prints PASS,
+        # and the outcome line still reads "catches a stale <label> number
+        # PASS" -- a dead control reporting success. That state is reachable:
+        # it is what agent-10 found when a pinned literal drifted to the true
+        # value and old == new. Assert the file actually changed, and name the
+        # pair when it did not, so the diagnosis is in the output.
+        mutated = t.replace(m.group(0), lying, 1)
+        if mutated == t or lying == m.group(0):
+            outcomes.append((f"C8 {label} mutation actually mutates "
+                             f"(no-op: {m.group(0)!r} -> {lying!r})", False))
+            shutil.rmtree(d)
+            continue
+        open(p, "w", encoding="utf-8").write(mutated)
         _git(d, "add", "-f", ".")
         _git(d, "commit", "-qm", "lying readme")
         _, r8 = run(d)
