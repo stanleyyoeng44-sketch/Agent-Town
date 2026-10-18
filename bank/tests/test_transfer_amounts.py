@@ -239,6 +239,70 @@ def exercise(fixed, port):
         shutil.rmtree(work, ignore_errors=True)
 
 
+READ_MUST_NOT_WRITE_NEW = (
+    "                exists = name in _accounts\n"
+    "                balance = _accounts.get(name, 0)\n"
+    "                if ticks:\n"
+    "                    save()"
+)
+
+READ_MUST_NOT_WRITE_OLD = (
+    "                exists = False\n"
+    "                balance, created = ensure_account(name)  # MUTANT\n"
+    "                exists = not created\n"
+    "                if ticks or created:\n"
+    "                    save()"
+)
+
+
+def check_read_does_not_write(fixed=True, port=8911):
+    """GET /balance on an unknown name must not create it.
+
+    This is a DIFFERENT invariant from "a refused transfer writes nothing",
+    and the earlier one passing made this one invisible -- to my own tests and
+    to agent-7's tool, which was correctly silent about a 200. Measured on
+    master before this fix: 2,000 reads of fresh names grew the ledger from 65
+    bytes to ~23 KB with 2,002 accounts, and `exists` was true on every second
+    read of the same name because the first read had created it.
+
+    fixed=False re-injects create-on-read into the source, so the check is
+    known to be able to fail. A check for a write that cannot observe a write
+    is the defect it is meant to catch.
+    """
+    work, path, _ = build(True)
+    src = open(path, encoding="utf-8").read()
+    if fixed:
+        assert READ_MUST_NOT_WRITE_NEW in src, (
+            "do_GET does not match the read-only shape -- this check would "
+            "be testing a bank it does not know")
+    else:
+        assert READ_MUST_NOT_WRITE_NEW in src, (
+            "cannot re-inject create-on-read: the read-only shape is absent")
+        src = src.replace(READ_MUST_NOT_WRITE_NEW, READ_MUST_NOT_WRITE_OLD, 1)
+        open(path, "w", encoding="utf-8").write(src)
+        assert READ_MUST_NOT_WRITE_OLD in open(path).read(), "mutation no-op"
+    proc = serve(work, path, port, seed="real:1000")
+    ledger = os.path.join(work, "accounts.json")
+    try:
+        first = call(port, "GET", "/balance/ghost-x")[1]
+        on_disk = json.load(open(ledger))["accounts"]
+        second = call(port, "GET", "/balance/ghost-x")[1]
+        for i in range(200):
+            call(port, "GET", "/balance/fresh-%d" % i)
+        grown = json.load(open(ledger))["accounts"]
+        return {
+            "read does not put the name on disk": "ghost-x" not in on_disk,
+            "exists is stable across two reads": first["exists"] == second["exists"],
+            "200 reads create no accounts": len(grown) == len(on_disk),
+            "exists is false for a name that never existed":
+                first["exists"] is False and second["exists"] is False,
+        }
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_docs_match_code():
     """The docs are part of the fix. If they still teach the exploit, it is live.
 
@@ -294,6 +358,16 @@ def main():
             (after["L1 an existing funded agent can transfer"]
              and after["L3 a fresh recipient still RECEIVES"]),
     }
+    print("\nREAD/ WRITE SEPARATION")
+    read_before = check_read_does_not_write(fixed=False, port=8911)
+    read_after = check_read_does_not_write(fixed=True, port=8912)
+    for k in sorted(read_after):
+        print("  %-46s after=%s before=%s"
+              % (k, "ok " if read_after[k] else "FAIL",
+                 "ok " if read_before[k] else "FAIL(mint visible)"))
+    verdict["create-on-read is caught when re-injected"] = not all(read_before.values())
+    verdict["a read creates no accounts"] = all(read_after.values())
+
     docs_bad = test_docs_match_code()
     print("\nDOCS")
     if docs_bad:
