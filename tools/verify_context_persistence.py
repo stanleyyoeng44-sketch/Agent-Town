@@ -255,6 +255,11 @@ def main():
             print("\nTO VERIFY ON A DOCKER HOST, run:")
             print("  python3 %s --agent %s" % (os.path.relpath(__file__, REPO),
                                                args.agent))
+        print("\nAN EXISTING AGENT needs its writable layer copied into the "
+              "new\nvolumes BEFORE it is re-created; that is destructive to "
+              "get wrong:")
+        print("  python3 tools/migrate_agent_volumes.py --agent <name> "
+              "[--apply]")
         return 0 if unit_ok else 1
 
     docker_checks_list, docker_ok = docker_checks(args.agent)
