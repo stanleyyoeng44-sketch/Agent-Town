@@ -125,13 +125,27 @@ def run_arms(mod):
         results.append(check("A  SELF_DIR note returned verbatim",
                              got == "NOTE-AT-SELF", repr(got)))
 
-        # D -- both present, different; SELF_DIR wins
+        # D -- both present, different, SELF_DIR NEWER -> SELF_DIR wins.
+        # The rule is newest-mtime, not path order: agent-7's box had the
+        # durable copy be the stale one, and path order would have reverted
+        # them by a life.
+        old = os.path.getmtime(os.path.join(sb.art_root, "wake.md"))
+        os.utime(os.path.join(sb.self_dir, "wake.md"), (old + 60, old + 60))
         path, rejected = mod.find_wake_file()
-        results.append(check("D  both present -> SELF_DIR wins",
+        results.append(check("D  both present, SELF_DIR newer -> SELF_DIR wins",
                              path == mod.WAKE_FILE, repr(path)))
-        # D2 -- the choice is visible: fallback flag is NOT set
-        results.append(check("D2 no fallback reported when SELF_DIR supplied it",
-                             mod.WAKE_SOURCE_FALLBACK is not None))
+        # D2 -- the ambiguity is ON THE RECORD, not silently resolved
+        results.append(check("D2 divergent notes are recorded as AMBIGUOUS",
+                             "AMBIGUOUS" in rejected
+                             and len(rejected["AMBIGUOUS"]) == 2,
+                             repr(rejected)))
+        # D3 -- and the newer DURABLE copy wins when it is the newer one
+        os.utime(os.path.join(sb.art_root, "wake.md"), (old + 600, old + 600))
+        path3, _ = mod.find_wake_file()
+        results.append(check("D3 newer durable copy wins over older SELF_DIR",
+                             path3 == os.path.join(sb.art_root, "wake.md"),
+                             repr(path3)))
+        os.utime(os.path.join(sb.self_dir, "wake.md"), (old + 60, old + 60))
         sb.remove("self")
     finally:
         sb.cleanup()
@@ -242,8 +256,14 @@ def _control_without_fallback():
         # accounts for every candidate it was given, which is true whether
         # or not the artifacts dirs are in that list. Counting it as
         # dependent was my error, and this control caught it.
-        dependent = ("B", "B2", "C", "F", "G2")
-        independent = ("A", "D", "D2", "E", "G", "G3")
+        # D2 and D3 are BOTH fallback-dependent. D3 asserts the durable
+        # candidate wins when newer, which needs a durable candidate. D2
+        # asserts the ambiguity is RECORDED, which needs two candidates to
+        # be ambiguous. With the fallback removed neither can fire. This
+        # control caught me mis-filing both, one at a time, and that is
+        # exactly why it asserts on named arms instead of a count.
+        dependent = ("B", "B2", "C", "F", "G2", "D2", "D3")
+        independent = ("A", "D", "E", "G", "G3")
         live = [k for k in dependent if RESULTS.get(k)]
         broke = [k for k in independent if not RESULTS.get(k)]
         global QUIET

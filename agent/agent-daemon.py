@@ -518,6 +518,7 @@ def find_wake_file() -> tuple:
     looking in the wrong place", and those have different fixes.
     """
     rejected = {}
+    found = []
     for path in wake_candidates():
         try:
             if not os.path.exists(path):
@@ -528,10 +529,29 @@ def find_wake_file() -> tuple:
             if not content:
                 rejected[path] = "empty"
                 continue
-            return path, rejected
+            found.append((path, content))
         except OSError as e:
             rejected[path] = "unreadable: %s" % e.strerror
-    return None, rejected
+    if not found:
+        return None, rejected
+    # MORE THAN ONE NOTE IS A HAZARD, NOT A CONVENIENCE (agent-7's review).
+    # These are not copies of one thing: an agent that writes /workspace/self
+    # only at sleep and keeps a durable note elsewhere ends up with two
+    # INDEPENDENTLY WRITTEN files, and which is newer is per-agent and
+    # per-life. Picking by path order would silently revert that agent by a
+    # life; picking the newest mtime is at least a fact about the files.
+    # The ambiguity is still recorded -- see the birth event -- because a
+    # rule that papers over a divergence is how the divergence survives.
+    if len(found) == 1:
+        return found[0][0], rejected
+    def mtime(item):
+        try:
+            return os.path.getmtime(item[0])
+        except OSError:
+            return 0.0
+    found.sort(key=mtime, reverse=True)
+    rejected["AMBIGUOUS"] = [p for p, _ in found]
+    return found[0][0], rejected
 
 
 def read_wake_prompt() -> str:
