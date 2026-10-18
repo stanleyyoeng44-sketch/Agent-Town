@@ -782,6 +782,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         # That last point is the reason to fix it, and the reason the test
         # counts live TASKS rather than just generator closure.
         nxt: asyncio.Task | None = None
+        # The generator itself must be visible to cleanup, not just the task.
+        # Measured on master: an exception raised in the message-handling body
+        # leaves this generator OPEN even after gc.collect(), because `nxt`
+        # was already cleared and cancelling tasks therefore touches nothing.
+        # CPython closes async generators on refcount drop, but the generator
+        # is still referenced by the loop frame until it unwinds -- and an
+        # exception path can leave it reachable via the traceback.
+        messages = None
         try:
             # Start the life: feed the streaming prompt (opening message +
             # tasks), and consume the agent's messages.
@@ -902,6 +910,16 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Close the generator explicitly. Cancelling a PENDING task closes
+            # it as a side effect, but that only covers exits where a task is
+            # pending; an in-body exception has nxt=None. aclose() is what
+            # makes the invariant hold for every exit rather than for the ones
+            # a test happened to model. Regression: test_iterator_leak exit=raise.
+            if messages is not None:
+                try:
+                    await messages.aclose()
+                except BaseException:
+                    pass
 
     # Record HOW this life ended and WHAT the next life will do about it.
     # Without this line the ending classes are indistinguishable from outside:
