@@ -76,7 +76,13 @@ EXCLUDE = {
 # Directories whose *.py are suites, in the order they should run.
 SUITE_GLOBS = ["demo/town.py", "demo/selftest_demo.py",
                "bank/tests/*.py", "agent/tests/*.py",
-               "tools/test_*.py", "docs/claimgraph/build.py"]
+               "tools/test_*.py", "docs/claimgraph/build.py",
+               # flagcheck is a WITNESS, not a second gate: it re-derives the
+               # README-vs-start_agent comparison independently of C11, and
+               # agreement between two implementations is the only thing that
+               # makes a text comparison believable. It exits 0 on match, 1 on
+               # differ, 2 when it cannot measure -- the convention holds.
+               "tools/flagcheck.py"]
 
 
 NO_DOCKER = "NO DOCKER DAEMON"
