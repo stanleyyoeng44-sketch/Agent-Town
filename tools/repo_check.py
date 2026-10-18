@@ -1624,6 +1624,29 @@ def run(root="."):
                          f"is not a defect in the tree's contents: run inside a "
                          f"clone, or `git init && git add -A && git commit -qm x` "
                          f"to make an export checkable."])]
+    # THE SAME FACT, ONE STEP LATER, AND IT WAS STILL BEING REPORTED AS A
+    # DEFECT IN THE TREE. MEASURED (agent-1's review, reproduced by agent-2):
+    # a `git archive` export on which someone has run `git init` IS a work
+    # tree, so the guard above passes -- but the index is EMPTY, `git ls-files`
+    # returns nothing, and C8 reports
+    #     README says 34 for the module count, measured 0
+    # as a FAIL. Every check that reads the index silently sees a tree with no
+    # files, and the one that compares a COUNT is the one that speaks up -- so
+    # the message accuses the README of a wrong number when the truth is that
+    # the checker cannot see the tree. A reviewer on another box hits this with
+    # no warning and nearly files a false FAIL against a correct branch.
+    # Same rule as above and as C5's skip split: a check must not report its
+    # own blindness as a property of the object.
+    n_indexed = _tracked(root)
+    if not n_indexed:
+        return False, [("check", "FAIL",
+                        [f"{root} is a git work tree with an EMPTY INDEX, so "
+                         f"`git ls-files` returns no files and every check "
+                         f"that reads the index is blind -- C8 then reports a "
+                         f"README number as wrong when the count it measured "
+                         f"is the checker's own zero. This is not a defect in "
+                         f"the tree's contents: run `git add -A` (and commit) "
+                         f"in an export, or run inside a clone."])]
     results = []
     # The registry check cannot report its own absence (see _self_guard).
     # Report it here, first, so unticking C14 cannot turn it off. A crash here
@@ -1997,6 +2020,42 @@ def selftest():
                      (not ok0) and len(r0) == 1
                      and "not inside a git work tree" in r0[0][2][0]
                      and "git ls-files exit 128" not in str(r0)))
+    shutil.rmtree(d)
+
+    # C0b: a git work tree with an EMPTY INDEX. This is the shape a `git
+    # archive` export has after someone runs `git init` to make it checkable,
+    # and MEASURED (agent-1, reproduced here) it used to report
+    #     C8 readme numbers FAIL: README says 34, measured 0
+    # pointing at the README when the checker could see no files at all. The
+    # control is TWO trees that differ only in whether the index is populated:
+    # the empty one must name ITSELF as the cause, and the populated one must
+    # not carry that message. A single fixture could be satisfied by a banner
+    # printed unconditionally.
+    d = farm()   # this one has no files added yet
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n`git ls-files '*.py'` (34 files)\n")
+    open(os.path.join(d, "a.py"), "w").write("x = 1\n")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    ok_empty, r_empty = run(d)
+    empty_msg = str(r_empty)
+    # The assertion is the SHAPE of the report, not the absence of a word:
+    # one row, the empty-index cause, and NO per-check row that reads the
+    # index. My first version also required the string "C8" to be absent --
+    # it is present on purpose, because the message explains that C8 is the
+    # check that would have spoken up; the arm was testing the label instead
+    # of the behaviour and failed against a correct fix.
+    outcomes.append(("C0 names an EMPTY INDEX instead of blaming the README",
+                     (not ok_empty) and len(r_empty) == 1
+                     and "EMPTY INDEX" in empty_msg
+                     and "README says" not in empty_msg))
+    # now populate the index: the same tree must get past C0 (whatever else
+    # it says about the README's number is not this arm's subject)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "indexed")
+    _ok_full, r_full = run(d)
+    outcomes.append(("C0 does NOT claim an empty index on a populated tree",
+                     "EMPTY INDEX" not in str(r_full)))
     shutil.rmtree(d)
 
     # C6: a .py that does not parse
