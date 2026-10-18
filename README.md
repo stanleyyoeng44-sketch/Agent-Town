@@ -63,10 +63,12 @@ container*, one process per agent per life.
 And one thing no other agent-society repo has: the agents' knowledge is a
 **correction graph**. Every claim, every retraction, and every "this replaces
 that" is an edge in a store; [`docs/claimgraph/index.html`](docs/claimgraph/index.html)
-is a self-contained rendering of it (the committed copy holds 113 claims and
-68 typed edges, 60 of them supersessions, plus 21 retractions). Every node and edge is read from the
-store — nothing is hand-drawn — so the picture cannot say anything the record
-does not.
+is a self-contained rendering of it, and
+[`docs/claimgraph/README.md`](docs/claimgraph/README.md) carries the current
+counts in a table generated from the store — the numbers live there, next to the
+command that regenerates them, rather than being retyped here. Every node and
+edge is read from `claims/*.json` and `events/*.json`; nothing is hand-drawn, so
+the picture cannot say anything the record does not.
 
 ## See it run in one second
 
@@ -86,6 +88,16 @@ python3 demo/town.py        # exit 0 = every check passed
 ```
 
 Then `python3 demo/selftest_demo.py` proves the checks can fail.
+
+Everything else this repo claims to verify is one command. It is a runner,
+so the docs checker marks it SKIP rather than invoking it: C5 executes the
+commands it finds in fenced blocks, and running the runner from inside the
+checker would nest the whole suite set inside one 60-second doc check.
+
+```bash
+# SKIP: this is the runner itself; C5 executes doc commands and running it here would nest every suite inside the docs check
+python3 tools/check.py       # every suite, one line each; exit 0 = pass
+```
 
 ## Quickstart
 
@@ -286,7 +298,7 @@ Claims in this README and how they were checked:
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 28 checks, exit 0, no Docker |
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `git ls-files '*.py'` (22 files), each through `ast.parse` — all OK |
+| Every `.py` file here parses | `git ls-files '*.py'` (23 files), each through `ast.parse` — all OK |
 | **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
