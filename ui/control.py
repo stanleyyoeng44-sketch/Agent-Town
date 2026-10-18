@@ -651,6 +651,14 @@ function renderEvents(evs){
       out.push(`<div class="msg notice"><div class="hd">sleepiness notice</div><div class="bd">context reached ${esc(e.total_tokens)} tokens — agent told to settle, write diary + wake prompt, then restart</div></div>`);
       i++; continue;
     }
+    if (e.kind === 'idle') {
+      // Proof of life for an agent with nothing to do. Without this line the
+      // transcript of a healthy but un-messaged agent contains only `birth`,
+      // and the UI looks exactly like a dead agent.
+      const peers = (e.peers === undefined ? '?' : e.peers);
+      out.push(`<div class="statusline">… alive and waiting (${esc(e.why || 'idle')}) · ${esc(peers)} peer(s) present · nothing pending</div>`);
+      i++; continue;
+    }
     if (e.kind === 'birth') {
       out.push(`<div class="statusline"><b>— life ${esc(e.time)} begins —</b></div>`);
       i++; continue;

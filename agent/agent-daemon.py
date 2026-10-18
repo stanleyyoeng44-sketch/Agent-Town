@@ -98,6 +98,36 @@ def load_mcp_servers():
     return data.get("servers", data)
 
 
+def peers_present() -> int:
+    """How many other agents have a mailbox directory. Cheap, no bank call."""
+    try:
+        return sum(1 for d in os.listdir(MAILBOX)
+                   if os.path.isdir(os.path.join(MAILBOX, d))
+                   and d != AGENT_NAME)
+    except OSError:
+        return 0
+
+
+def log_idle_proof(log, why: str, pending: int = 0) -> None:
+    """Write ONE transcript line proving this life is alive and waiting.
+
+    Stanley's defect: a restarted agent "will not have any response unless
+    someone messages it". The cause is not a crash -- prompt_stream() feeds the
+    model the opening message and then blocks on an empty inbox, and a model
+    with nothing to do writes nothing, so the transcript contains only `birth`
+    and the UI has nothing to show. The process is fine; the evidence is
+    missing.
+
+    This is evidence, not behaviour: a transcript line, no model turn, no
+    tokens, no new wire format, nothing the agent can observe. It is written at
+    three points -- when the life starts, whenever the agent finishes a run and
+    goes quiet, and when the context watcher wakes up -- so ANY of the three
+    readers of the transcript (UI, viewer, a human with `cat`) sees a live
+    agent without having to talk to it.
+    """
+    log.log("idle", why=why, peers=peers_present(), pending=pending)
+
+
 def read_resumable_session() -> str | None:
     """Session id to resume, or None for a fresh session.
 
@@ -324,6 +354,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                                "message": {"role": "user", "content":
                                            "<system-reminder>\n" + combined +
                                            "\n</system-reminder>"}}
+                    else:
+                        # A kick with nothing left to deliver means the agent
+                        # just finished a run and is waiting again. That is the
+                        # exact moment the transcript used to go silent.
+                        log_idle_proof(log, "after-run")
                     continue
                 yield {"type": "user",
                         "message": {"role": "user", "content": item}}
@@ -428,6 +463,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         try:
             # Start the life: feed the streaming prompt (opening message +
             # tasks), and consume the agent's messages.
+            #
+            # Emit proof of life from the LIFE BODY, not from inside
+            # prompt_stream. A generator only runs when the model pulls from
+            # it, so a log line inside it is hostage to the model doing
+            # something -- and "the model did nothing" is precisely the state
+            # we are trying to make visible.
+            log_idle_proof(log, "started")
+
             send_task = asyncio.create_task(client.query(prompt_stream()))
 
             async for message in client.receive_response():
