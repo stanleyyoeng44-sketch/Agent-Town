@@ -64,9 +64,11 @@ ROOT = os.path.dirname(HERE)
 EXCLUDE = {
     # path -> (label, special, why)
     "tools/verify_context_persistence.py": (
-        "deploy: memory survives restart", "warn-if-no-docker",
-        "exits 0 with NO DOCKER while printing that the volume property is "
-        "unproven; PASS would be a green tick over evidence nobody gathered"),
+        "deploy: memory survives restart", "exit2-is-warn",
+        "exits 2 with NO DOCKER (its docstring always said so; the code used "
+        "to return 0, which read as verified). 2 = could not verify, which is "
+        "the honest third state -- PASS would be a green tick over evidence "
+        "nobody gathered, FAIL would red a good tree on a box with no daemon"),
     "tools/migrate_agent_volumes.py": (
         None, "skip",
         "a TOOL, not a test: exits 2 with no arguments by design"),

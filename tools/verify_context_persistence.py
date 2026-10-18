@@ -18,8 +18,17 @@ simulation (which needs only this repository) and prints the exact docker
 commands to run by hand, then exits 2 so a caller can tell the difference
 between "verified" and "could not verify here".
 
+    python3 tools/verify_context_persistence.py --births <transcripts-dir>
+
+alone needs no Docker: it reads every life-*.jsonl birth event and prints
+wake_file / wake_source per birth. This is the series that was missing when a
+cohort of agents woke amnesiac -- the daemon emitted `wake_file=false` on
+every life while the note sat at a path it never read, and nothing compared
+one birth to the next. A birth whose note exists ELSEWHERE (outside the
+daemon's read path) is printed as MISROUTED and makes the exit code 2.
+
 Exit codes: 0 all checks passed, 1 a check failed, 2 could not run (no
-docker / no such agent).
+docker / no such agent / births show a misrouted note).
 
 Why not just mock docker: the defect is that the WRITABLE LAYER is wiped.
 A mock of `docker run` cannot be shown to have the property that the real
@@ -54,6 +63,72 @@ def docker(*args, timeout=120):
 
 def docker_exec(agent, *args, timeout=60):
     return docker("exec", agent, *args, timeout=timeout)
+
+
+def parse_births(transcript_dir):
+    """Read life-*.jsonl birth events and return one row per birth.
+
+    WHY THIS EXISTS (agent-0's assignment, agent-4). The daemon has always
+    emitted `wake_file=<bool>` at every birth, and for a cohort of agents it
+    emitted `false` on EVERY life while the agent's real note sat at a path
+    the daemon never read. The witness was there the whole time and nothing
+    compared it to the next birth, so a session that began amnesiac looked
+    exactly like a healthy first boot. This function turns those rows into a
+    per-birth series a reader can SEE, and separates the two states that a
+    bare boolean conflates:
+
+      wake_file=True   the daemon's WAKE_FILE existed at birth
+      wake_file=False  it did not -- but that is BOTH "this is genuinely the
+                       first boot" and "the note was written somewhere the
+                       daemon does not read". The second is a silent defect.
+
+    So the report does not stop at the boolean. When the daemon's own path is
+    empty it looks for a note in the two layouts the census found
+    (/shared/artifacts/<agent>/wake.md and .../self/wake.md) and, if one
+    exists, says so: "the note exists at X, which is not the path the daemon
+    reads". That single sentence is what was missing from the birth log.
+
+    Returns (rows, sources):
+      rows    list of dicts: life, wake_file, wake_source, note_elsewhere
+      sources set of wake_source values seen ("absent" folds the legacy rows
+              that predate the field)
+    """
+    import glob
+
+    rows, sources = [], set()
+    for path in sorted(glob.glob(os.path.join(transcript_dir, "life-*.jsonl"))):
+        life = os.path.basename(path)[len("life-"):-len(".jsonl")]
+        birth = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("kind") == "birth":
+                        birth = rec
+                        break
+        except OSError:
+            continue
+        if birth is None:
+            continue
+        source = birth.get("wake_source")
+        # A birth event written before wake_source existed has no field at
+        # all. That is not the same as wake_source="none"; folding the two
+        # would hide exactly the gap this report is for.
+        sources.add("absent" if source is None else source)
+        rows.append({
+            "life": life,
+            "wake_file": bool(birth.get("wake_file")),
+            "wake_source": "absent" if source is None else source,
+            "wake_fallback": birth.get("wake_fallback"),
+            "note_elsewhere": birth.get("note_elsewhere"),
+        })
+    return rows, sources
 
 
 def unit_simulation():
@@ -266,8 +341,94 @@ def unit_simulation():
           kind="WIRING")
     os.makedirs(os.path.join(records), exist_ok=True)
 
+    # --- parse_births: the wake-series report (no Docker) ------------------
+    # These exercise the SHIPPED parse_births() on synthetic transcripts whose
+    # content is asserted to be what we wrote, so an arm cannot pass because
+    # the fixture was empty.
+    bt = tempfile.mkdtemp(prefix="ctx-births-")
+
+    def birth_life(life, wake_file, source=None, elsewhere=None):
+        rec = {"time": "00:00:00", "kind": "birth", "wake_file": wake_file}
+        if source is not None:
+            rec["wake_source"] = source
+        if elsewhere is not None:
+            rec["note_elsewhere"] = elsewhere
+        with open(os.path.join(bt, "life-%s.jsonl" % life), "w") as f:
+            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps({"time": "00:00:01", "kind": "result"}) + "\n")
+
+    birth_life("1-a", True, "self_dir")
+    birth_life("2-b", False)                       # legacy: no wake_source
+    rows, sources = parse_births(bt)
+    # Index defensively: a parser that returns fewer rows must FAIL these
+    # arms BY NAME, not raise IndexError and take the whole report down. An
+    # arm that crashes the harness is not a red arm; a reader cannot tell
+    # "detected" from "broken".
+    row1 = rows[1] if len(rows) > 1 else {}
+    row0 = rows[0] if rows else {}
+    check("parse_births reads EVERY life's birth event, not the newest only",
+          [r["life"] for r in rows] == ["1-a", "2-b"],
+          "rows=%r" % ([r["life"] for r in rows],))
+    check("parse_births reports wake_file per birth",
+          [r["wake_file"] for r in rows] == [True, False],
+          "flags=%r" % ([r["wake_file"] for r in rows],))
+    check("a birth with no wake_source reads as 'absent', not as a value",
+          row1.get("wake_source") == "absent" and "absent" in sources,
+          "sources=%r" % (sorted(sources),))
+    check("parse_births ignores non-birth events",
+          len(rows) == 2, "it counted a result line as a birth")
+
+    # A misrouted note is the silent defect: the daemon had no note, AND a
+    # note existed elsewhere. It must be surfaced, not folded into plain
+    # wake_file=False.
+    os.remove(os.path.join(bt, "life-2-b.jsonl"))
+    birth_life("3-c", False, elsewhere="/shared/artifacts/agent-4/wake.md")
+    rows, _ = parse_births(bt)
+    row0 = rows[0] if rows else {}
+    misrouted = [r for r in rows if not r["wake_file"] and r["note_elsewhere"]]
+    check("a note OUTSIDE the daemon's path is reported as MISROUTED",
+          len(misrouted) == 1 and misrouted[0]["life"] == "3-c",
+          "misrouted=%r" % ([r["life"] for r in misrouted],))
+    check("a healthy birth is NOT reported as misrouted",
+          row0.get("wake_file") is True and not row0.get("note_elsewhere"),
+          "the report cries wolf on a correct birth")
+    shutil.rmtree(bt, ignore_errors=True)
+
+    if not os.environ.get("_VCP_EXIT_PROBE"):
+        check("the no-docker path exits 2, so 0 means 'verified on a container'",
+              _no_docker_exit_is_2(),
+              "the tool returns 0 with no daemon: a green tick over evidence "
+              "nobody gathered", kind="BEHAVIOUR")
+
     shutil.rmtree(tmp, ignore_errors=True)
     return checks, verdict["ok"]
+
+
+def _no_docker_exit_is_2():
+    """Run THIS tool with docker forced unavailable and demand exit 2.
+
+    Why a subprocess: the property under test is the process's EXIT CODE, and
+    an in-process call would have to fake have_docker() and then still prove
+    main() consulted it. Faking the prediction is not the same as observing
+    the result. Docker is hidden by prepending a PATH entry that cannot
+    contain it, so the real have_docker() runs and answers False.
+    """
+    empty = tempfile.mkdtemp(prefix="ctx-nodocker-")
+    try:
+        env = dict(os.environ)
+        env["PATH"] = empty           # no docker, no anything
+        # The child re-runs main() -> unit_simulation() -> this arm. Without a
+        # guard that is infinite recursion, not a measurement. The child is
+        # only being asked for its EXIT CODE, so it skips the exit-code arm.
+        env["_VCP_EXIT_PROBE"] = "1"
+        p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__)],
+                           capture_output=True, text=True, timeout=600,
+                           env=env, cwd=REPO)
+        return p.returncode == 2 and "NO DOCKER DAEMON" in p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
 
 
 def docker_checks(agent):
@@ -342,8 +503,52 @@ def docker_checks(agent):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", help="an existing agent container to test")
+    ap.add_argument("--births", metavar="DIR",
+                    help="report wake_file/wake_source per birth from a "
+                         "transcripts dir (no Docker needed). Exit 2 when a "
+                         "note exists outside the daemon's read path.")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    # --- births report: needs only files, never Docker ---------------------
+    if args.births is not None:
+        rows, sources = parse_births(args.births)
+        if args.json:
+            print(json.dumps({"births": rows,
+                              "wake_sources": sorted(sources)}, indent=2))
+        else:
+            if not rows:
+                print("NO BIRTH EVENTS in %s -- nothing to report, and that "
+                      "is NOT a pass." % args.births)
+            else:
+                print("BIRTHS in %s (%d)" % (args.births, len(rows)))
+                for r in rows:
+                    flag = "note" if r["wake_file"] else "NO NOTE"
+                    print("  life %-16s wake_file=%-5s source=%-8s %s"
+                          % (r["life"], r["wake_file"], r["wake_source"], flag))
+                    if r["note_elsewhere"]:
+                        print("      NOTE ELSEWHERE: %s (the daemon does NOT "
+                              "read this path)" % r["note_elsewhere"])
+                n_note = sum(1 for r in rows if r["wake_file"])
+                print("\n%d of %d births had the daemon's note; sources: %s"
+                      % (n_note, len(rows), ", ".join(sorted(sources))))
+                # A birth with wake_file=False where a note exists elsewhere
+                # is the exact silent defect this report exists for. Say it,
+                # and make the exit code carry it so a caller cannot read
+                # amnesia as health.
+                misrouted = [r for r in rows
+                             if not r["wake_file"] and r["note_elsewhere"]]
+                if misrouted:
+                    print("\nMISROUTED: %d birth(s) had a note the daemon "
+                          "never opened:" % len(misrouted))
+                    for r in misrouted:
+                        print("  life %s -> %s" % (r["life"],
+                                                   r["note_elsewhere"]))
+        misrouted = [r for r in rows
+                     if not r["wake_file"] and r["note_elsewhere"]]
+        if misrouted:
+            return 2
+        return 0 if rows else 2
 
     unit, unit_ok = unit_simulation()
 
@@ -367,7 +572,16 @@ def main():
               "get wrong:")
         print("  python3 tools/migrate_agent_volumes.py --agent <name> "
               "[--apply]")
-        return 0 if unit_ok else 1
+        # EXIT 2, NOT 0 (agent-4, life 17). The docstring and the README have
+        # always said "exit 2 when there is no daemon", and the code returned
+        # 0 whenever the unit simulation passed. That made a caller -- CI, a
+        # human, tools/check.py -- unable to tell "verified on a real
+        # container" from "ran a simulation and never touched a container".
+        # A green tick over evidence nobody gathered is the defect this whole
+        # tool exists to prevent, so the tool must not commit it itself.
+        # A FAILING unit simulation is still a failure (exit 1); a PASSING one
+        # with no daemon is "could not verify" (exit 2).
+        return 1 if not unit_ok else 2
 
     docker_checks_list, docker_ok = docker_checks(args.agent)
     all_checks = unit + docker_checks_list
