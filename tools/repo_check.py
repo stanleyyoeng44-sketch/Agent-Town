@@ -79,14 +79,40 @@ def c1_tracked_junk(root):
     return "C1 tracked junk", "FAIL" if bad else "PASS", bad
 
 
+REDACT_FULL = False       # --show-secrets for local use; never in CI
+
+
+def _redact(s):
+    """A report that cannot be pasted in public is a weaker report.
+
+    This check runs in CI logs. Printing the secret it found re-publishes it
+    on every run -- the tool would become a new distribution channel for the
+    exact string it exists to catch. So the default output is a recognisable
+    prefix plus a length, which is enough to find the line and not enough to
+    use the credential.
+    """
+    if REDACT_FULL:
+        return s
+    if len(s) <= 8:
+        return s
+    return f"{s[:6]}…({len(s)} chars, redacted)"
+
+
 def scan_text(name, text):
+    """Placeholder filtering happens on the RAW match, never on the redacted
+    string. An earlier version redacted first and then tested for
+    placeholders -- and the redaction marker contains the word 'redacted',
+    which is itself in the placeholder list, so every redacted hit was
+    filtered out as a placeholder. The check silently found nothing, which is
+    why two negative controls went red. Redaction is presentation; it must
+    not touch the decision.
+    """
     hits = []
     for label, pat in SECRET_PATTERNS:
         for m in pat.finditer(text):
-            frag = m.group(0)
-            if PLACEHOLDER.search(frag):
+            if PLACEHOLDER.search(m.group(0)):
                 continue            # documented placeholder, not a secret
-            hits.append(f"{name}: {label}: {frag[:60]}")
+            hits.append(f"{name}: {label}: {_redact(m.group(0))}")
     return hits
 
 
@@ -279,8 +305,82 @@ def c6_sources_parse(root):
     return "C6 sources parse", "FAIL" if findings else "PASS", findings
 
 
+IMPORT_TARGETS = ["bank/bank.py", "agent/agent-daemon.py",
+                  "ui/stanley_chat.py", "agent/mcp-stdio.py",
+                  "ui/control.py"]
+
+
+def c7_sources_import(root, timeout=60):
+    """C6 proves a file PARSES. That is not the same as 'it can be loaded'.
+
+    The distinction cost this cohort a day: a registry reported 'structure
+    green, 0 problems' over a store containing a claim whose instrument could
+    not import its own dependency. Parsing is a fact about syntax; importing
+    is a fact about the module actually resolving its imports on this box.
+
+    Each target is loaded in a SUBPROCESS, so a file that starts a server on
+    import cannot wedge this check. A module that exits (CLI/server entry
+    points) counts as importable: SystemExit after a successful module body is
+    still a successful import. A timeout is a FAIL with the reason, never a
+    silent skip.
+
+    CWD COUPLING IS A SEPARATE FACT, and the first version of this check got
+    it wrong. ui/control.py does `import stanley_chat` (a sibling), so it
+    imports from ui/ and fails from the repo root. Reporting that as "import
+    failed" is the wrong noun: the module is fine, its cwd contract is
+    undeclared. So each target is tried from the repo root AND from its own
+    directory. Root-ok = PASS. Own-dir-only = WARN naming the coupling, which
+    is a real doc bug (the guide must say `cd ui`) but not a broken module.
+    Neither = FAIL.
+    """
+    findings, warn = [], []
+    for f in IMPORT_TARGETS:
+        path = os.path.join(root, f)
+        if not os.path.isfile(path):
+            findings.append(f"{f}: listed as an import target but MISSING")
+            continue
+        code = (
+            "import importlib.util,sys\n"
+            f"spec=importlib.util.spec_from_file_location('m', {os.path.basename(f)!r})\n"
+            "m=importlib.util.module_from_spec(spec)\n"
+            "try:\n"
+            "    spec.loader.exec_module(m)\n"
+            "except SystemExit:\n"
+            "    pass\n"
+        )
+
+        def try_from(cwd):
+            try:
+                r = subprocess.run([sys.executable, "-c", code], cwd=cwd,
+                                   capture_output=True, text=True,
+                                   timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return "timeout"
+            if r.returncode == 0:
+                return "ok"
+            tail = (r.stderr or r.stdout).strip().splitlines()
+            return tail[-1][:200] if tail else "?"
+
+        at_root = try_from(root)
+        if at_root == "ok":
+            continue
+        at_home = try_from(os.path.dirname(path))
+        if at_home == "ok":
+            warn.append(f"{f}: imports only from {os.path.dirname(f)}/ "
+                        f"(cwd-coupled; docs must say so)")
+        elif at_root == "timeout" or at_home == "timeout":
+            findings.append(f"{f}: import TIMEOUT after {timeout}s")
+        else:
+            findings.append(f"{f}: import failed from root AND own dir: {at_root}")
+    if findings:
+        return "C7 sources import", "FAIL", findings + warn
+    if warn:
+        return "C7 sources import", "WARN", warn
+    return "C7 sources import", "PASS", []
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
-          c4_gitignore, c5_doc_commands, c6_sources_parse]
+          c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import]
 
 
 def run(root="."):
@@ -329,7 +429,8 @@ def selftest():
 
     # C2: a secret in a tracked file at HEAD
     d = farm()
-    open(os.path.join(d, "a.txt"), "w").write("token: REDACTED-CONTROL-TOKEN-ROTATE-ME\n")
+    open(os.path.join(d, "a.txt"), "w").write(
+        "token: " + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0UvW" + "\n")  # SYNTHETIC
     open(os.path.join(d, ".gitignore"), "w").write(
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
     _git(d, "add", "-f", ".")
@@ -344,7 +445,7 @@ def selftest():
     open(os.path.join(d, ".gitignore"), "w").write(
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n*.log\n")
     open(os.path.join(d, "control.log"), "w").write(
-        "[control] token: REDACTED-CONTROL-TOKEN-ROTATE-ME\n")
+        "[control] token: " + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0UvW" + "\n")  # SYNTHETIC
     # NOTE: .gitignore is committed too, so the tree has >=2 blobs. Without
     # that, C3's own coverage guard (a walk of <2 blobs is WARN, not PASS)
     # fires and this control would be asserting against a WARN, which would
@@ -406,6 +507,39 @@ def selftest():
                      dict((n, o) for n, o, _ in r)["C6 sources parse"] == "FAIL"))
     shutil.rmtree(d)
 
+    # C7: a module that PARSES but cannot IMPORT. This is the whole point of
+    # C7 existing next to C6 -- if C6 already caught it, C7 would be
+    # decoration. The file is syntactically perfect and imports a module that
+    # does not exist, which ast.parse cannot see.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "bank"))
+    open(os.path.join(d, "bank", "bank.py"), "w").write(
+        "import definitely_not_a_real_module_xyz\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "parses, cannot import")
+    _, r = run(d)
+    res = dict((n, o) for n, o, _ in r)
+    outcomes.append(("C6 does NOT catch an unimportable module (C7 is needed)",
+                     res["C6 sources parse"] == "PASS"))
+    outcomes.append(("C7 catches a module that parses but cannot import",
+                     res["C7 sources import"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # THE TOOL MUST PASS ITS OWN CHECK. My first version hardcoded the real
+    # published token as the fixture string, so (a) the check that exists to
+    # stop the secret spreading was itself a second copy of it, and (b) the
+    # moment the file was committed C2 would flag its own source -- correctly.
+    # A scanning tool is a file like any other; scan it.
+    here = os.path.abspath(__file__)
+    own = scan_text(os.path.basename(here),
+                    open(here, encoding="utf-8", errors="replace").read())
+    outcomes.append(("the tool's own source contains no secret", not own))
+    outcomes.append(("C2 would catch it if it did (fixtures use SYNTHETIC)",
+                     any("SYNTHETIC" in l for l in
+                         open(here, encoding="utf-8").read().splitlines())))
+
     bad = 0
     for label, passed in outcomes:
         print(f"  {'PASS' if passed else 'FAIL'}  {label}")
@@ -415,6 +549,8 @@ def selftest():
 
 
 if __name__ == "__main__":
+    if "--show-secrets" in sys.argv:
+        REDACT_FULL = True
     if "--selftest" in sys.argv:
         sys.exit(0 if selftest() else 1)
     root = next((a for a in sys.argv[1:] if not a.startswith("-")), ".")
