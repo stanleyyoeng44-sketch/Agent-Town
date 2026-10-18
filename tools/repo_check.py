@@ -260,33 +260,47 @@ _SHELL_COMPOUND = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "\n")
 def _probe_safe(cmd: str) -> bool:
     """Is `cmd` safe to execute twice, for the SKIP probe?
 
-    Deliberately narrow, and it must be: the probe runs a command a document
-    asked NOT to run. Allowed:
+    ALLOWED, and nothing else:
       * `bash -n` / `sh -n`        -- parse only, by definition side-effect free
-      * `python3 -c "..."`         -- only a single snippet, no imports, no
-                                      open/exec/system/remove/rmtree/subprocess
-      * `test ...` / `[ ... ]`     -- pure predicate
+      * `test ...` / `[ ... ]`     -- pure predicate, once compounds are out
     Everything else is declined and reported as an honoured SKIP, which is
-    visible: silence is what this change removed.
+    VISIBLE: silence is what this change removed.
 
-    THE BUG THIS GUARD FIXES (found by agent-2 reviewing the first version):
-    the check inspected only the leading command. With shell=True the rest of
-    the line still ran, so `python3 -c "print(1)" && rm -rf victim` passed the
-    allowlist on its first token and then deleted the directory. Demonstrated
-    end to end before the fix. A prefix test is not a statement about a shell
-    line; any compound operator disqualifies the line outright.
+    WHY `python3 -c` IS NO LONGER PROBED AT ALL. Two rounds of review found
+    two different ways past a substring list, and the second one is decisive:
+
+      1. `python3 -c "print(1)" && rm -rf victim` -- the allowlist judged the
+         first command and shell=True ran the rest. (agent-2; the line deleted
+         a directory during a probe.)
+      2. `python3 -c "__builtins__.__dict__['op'+'en'](path,'w')..."` --
+         string concatenation spells 'open' without the substring 'open'.
+         (agent-10; the file was written on both this branch and its parent.)
+
+    A substring list answers "does this text look dangerous", and the question
+    that matters is "what will this program do". Those are different questions
+    and the first will keep losing to the next spelling. Rather than blocklist
+    a third time, the probe gives up on this shape: a SKIP-marked python line
+    becomes an honoured, reported SKIP. The cost is that a doc hiding a
+    WORKING python one-liner behind SKIP is no longer caught -- accepted, and
+    named here, because the alternative is a checker that executes code it
+    cannot reason about.
+
+    This is policy, not a remaining probe bug: C5 already executes UNMARKED
+    blocks whose first word is runnable, so any tracked document is executable
+    by design. The probe only owes an answer for lines a doc marked NOT to run.
     """
     c = cmd.strip()
     if any(tok in c for tok in _SHELL_COMPOUND):
         return False
-    if c.startswith(("bash -n ", "sh -n ", "test ", "[ ")):
+    if c.startswith(("bash -n ", "sh -n ")):
         return True
-    if c.startswith(("python3 -c", "python -c")):
-        body = c.split("-c", 1)[1].strip().strip("'\"")
-        banned = ("import ", "open(", "exec(", "eval(", "system(", "remove(",
-                  "rmtree(", "subprocess", "socket", "unlink(", "rename(",
-                  "chmod(", "chown(", "shutil", "os.")
-        return not any(b in body for b in banned)
+    if c.startswith(("test ", "[ ")):
+        # `-a`/`-o` are test's own operators, and `test -f a -a rm -rf x` is a
+        # syntactically odd expression whose safety depends on the shell's
+        # argument handling, so a line mentioning a command word is declined.
+        return not any(w in c.split() for w in ("rm", "mv", "cp", "dd", "sh",
+                                                "bash", "python", "curl",
+                                                "wget", "chmod", "chown"))
     return False
 
 
@@ -691,11 +705,15 @@ def selftest():
     # "SKIP" used to be a universal silencer: any doc could disable its own
     # check by writing it. Now a marked command is PROBED -- exit 0 means it
     # was runnable all along and the SKIP hid a working check (WARN).
+    #
+    # The probe uses `test`, NOT `python3 -c`: python lines are no longer
+    # probed at all (two bypasses, see _probe_safe). The control follows the
+    # policy -- if the probe ever stops covering `test`, this goes red.
     d = farm()
     open(os.path.join(d, ".gitignore"), "w").write(
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
     open(os.path.join(d, "README.md"), "w").write(
-        "# x\n\n```sh\n# SKIP: no reason at all\npython3 -c \"print(1)\"\n```\n")
+        "# x\n\n```sh\n# SKIP: no reason at all\ntest -d .\n```\n")
     _git(d, "add", "-f", ".")
     _git(d, "commit", "-qm", "skipper")
     _, r = run(d)
@@ -711,9 +729,13 @@ def selftest():
     d = farm()
     open(os.path.join(d, ".gitignore"), "w").write(
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    # Uses `test` (still probed) rather than python3 -c (no longer probed):
+    # the command genuinely fails here, so the SKIP is honoured with its exit
+    # code. This is the control that stops "probe everything" from turning a
+    # legitimate docker-era SKIP into a red build.
     open(os.path.join(d, "README.md"), "w").write(
         "# x\n\n```sh\n# SKIP: needs a docker daemon\n"
-        "python3 -c \"print(1/0)\"\n```\n")
+        "test -f /nonexistent-artifact\n```\n")
     _git(d, "add", "-f", ".")
     _git(d, "commit", "-qm", "env skipper")
     _, r = run(d)
@@ -774,6 +796,33 @@ def selftest():
                      os.path.isdir(victim)
                      and os.path.exists(os.path.join(victim, "important"))
                      and any("probe declined" in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C5f: agent-10's bypass -- string concatenation spells 'open' without
+    # the substring 'open'. The right response was not a third blocklist
+    # entry; python lines are no longer probed at all. The control asserts the
+    # FILE IS NOT WRITTEN, which is the property that matters, rather than
+    # that a particular word was or was not found.
+    d = farm()
+    victim = os.path.join(d, "victim")
+    os.makedirs(victim)
+    open(os.path.join(victim, "important"), "w").write("original")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs docker\n"
+        "python3 -c \"__builtins__.__dict__['op'+'en']"
+        "('victim/important','w').write('pwned')\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "concatenated opcode")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    kept = open(os.path.join(victim, "important"), encoding="utf-8").read()
+    outcomes.append(("C5 does not probe a python line that spells open() "
+                     "around the blocklist",
+                     kept == "original"
+                     and any("not probed" in str(x) or "probe declined"
+                             in str(x) for x in c5[1])))
     shutil.rmtree(d)
 
     # C0: a tree with NO .git must be named as such, ONCE.
