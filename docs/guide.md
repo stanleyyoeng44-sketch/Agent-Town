@@ -45,10 +45,14 @@ Expected:
 
 ```
 ledger: /tmp/town-XXXXXXXX/accounts.json
+mailbox: /tmp/town-XXXXXXXX/bank-mailbox  (via MAILBOX env var)
 bank up on http://127.0.0.1:NNNNN
 
 1. bank
-  PASS  agents auto-created with START_MONEY=100
+  PASS  seeded agents start at 100
+  PASS  unknown name is created at 0, not funded
+  PASS  unknown name reports exists=false
+  PASS  touching an unknown name creates no coins
   PASS  transfer 25 moves coins
   PASS  sender debited
   PASS  recipient credited
@@ -65,6 +69,9 @@ bank up on http://127.0.0.1:NNNNN
 
 3. mailbox (a directory of JSON files)
   PASS  empty inbox reads as empty list
+  PASS  bank wrote its payment notice to the DEMO mailbox, not live
+  PASS  exactly one notice for the one successful transfer
+  PASS  the bank's mailbox is not the live one
 
 4. life cycle
   PASS  first life starts with no wake file
@@ -179,30 +186,39 @@ So create the directory first (or run as a user who can):
 
 ```bash
 sudo mkdir -p /data && sudo chown "$(id -un)" /data   # once
-PORT=8790 START_MONEY=100 DECAY_SECONDS=2 python3 bank/bank.py
+PORT=8790 SEED=alice:100 DECAY_SECONDS=2 python3 bank/bank.py
 ```
 
 Expected (it prints your **live** values, not the defaults — `bank.py:231`
 interpolates `START_MONEY`/`DECAY_SECONDS`, it does not print constants):
 
 ```
-[bank] on 0.0.0.0:8790  start=100  decay=1 coin/2s  ledger=/data/accounts.json
+[bank] seeded 1 account(s): alice=100
+[bank] on 0.0.0.0:8790  seed=alice:100  decay=1 coin/2s  ledger=/data/accounts.json
 ```
 
-> If the banner says `start=1000  decay=1 coin/60s`, your env vars did not
-> reach the process (check you prefixed the command, not a subshell). If you
-> see the `PermissionError` above, you skipped the `mkdir`.
+`SEED` is how coins enter the economy. It is an operator act performed once at
+startup; accounts created any other way start at 0. If you omit it the bank
+starts empty and every transfer will be refused for insufficient funds — that
+is the intended behaviour, not a setup failure. (A bare name in the list gets
+`START_MONEY`, so `SEED=alice,bob` funds both at the default.)
+
+> If the banner omits your `SEED`, your env vars did not reach the process
+> (check you prefixed the command, not a subshell). If you see the
+> `PermissionError` above, you skipped the `mkdir`.
 
 In a second terminal:
 
 ```bash
 curl -s localhost:8790/balance/alice
-# {"agent": "alice", "money": 98}
+# {"agent": "alice", "money": 99, "exists": true}
 ```
 
-Alice was auto-created with 100 and immediately lost 2 to one decay tick
-(`DECAY_SECONDS=2`). Accounts decay from the moment they exist — that is the
-point, not a bug.
+Alice was seeded with 100 and lost 1 to a decay tick (`DECAY_SECONDS=2`) in the
+time it took to run the next command. Accounts decay from the moment they
+exist — that is the point, not a bug. `exists` tells you whether the bank has
+seen this name before; asking about an unknown name returns `money: 0,
+exists: false` and funds nothing.
 
 ```bash
 curl -s -X POST localhost:8790/transfer \
@@ -210,7 +226,7 @@ curl -s -X POST localhost:8790/transfer \
   -d '{"from":"alice","to":"bob","amount":10}'
 
 curl -s localhost:8790/accounts
-# {"accounts": {"alice": 90, "bob": 100}, "decay_seconds": 2}
+# {"accounts": {"alice": 89, "bob": 10}, "decay_seconds": 2}
 ```
 
 *(Your exact numbers will differ by a coin or two depending on how long you took

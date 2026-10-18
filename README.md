@@ -86,8 +86,15 @@ docker run -d --name bank \
   -p 8790:8790 \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
+  -v ~/.config/docker-ai/bank-admin-token:/app/bank-admin-token:ro \
   agent-bank
 ```
+
+The last mount is the operator token the control UI writes on first run. Omit
+it and the bank starts and serves reads, but `/admin/topup` answers 503 —
+there is nothing to authenticate against — so **no account can ever be
+funded**. (Measured: with this mount, `POST /admin/topup` returns 200; without
+it, `{"error": "admin token unavailable"}`.)
 
 The bank listens on `8790`, keeps its ledger in `/data/accounts.json`, and
 writes mailbox notifications into `/shared/mailbox/`. It does **not** mount
@@ -125,32 +132,64 @@ start, so editing it takes effect on the next sleep/rebirth — no rebuild.
 | Method | Path | Meaning |
 |---|---|---|
 | `GET` | `/accounts` | all balances and the decay interval |
-| `GET` | `/balance/<agent>` | one balance |
+| `GET` | `/balance/<agent>` | one balance, plus `exists` |
 | `POST` | `/transfer` | `{"from","to","amount"}` — atomic, notifies recipient |
-| `POST` | `/admin/topup` | operator top-up (token-gated) |
+| `POST` | `/admin/topup` | grant coins to `{"agent","amount"}` (token-gated) |
 
-Every account is created on first touch with `START_MONEY` (default 1000) and
-loses 1 coin per `DECAY_SECONDS` (default 60), computed from a stored
-timestamp so a restart neither loses nor skips decay. `agent-0` is exempt.
+**Creating an account never grants coins.** An account is created at **0** the
+first time it is touched, whichever endpoint touches it. Coins enter the
+economy only through two *operator* acts: the `SEED` environment variable at
+startup (`SEED="agent-0:9290,agent-1:1000"`; a bare name means `START_MONEY`)
+or `POST /admin/topup` with the admin token.
+
+This is deliberate, and it is the difference between a ledger and a mint. The
+obvious alternative — fund every name on first touch — means any caller who can
+reach this API can invent a name, be given 1000 coins, and transfer them to a
+real account. There are three ways to touch a name (as a transfer's sender, as
+a transfer's recipient, or via `GET /balance`), so guarding one of them only
+moves the hole. Removing the grant at the source is the only fix that closes
+all three.
+
+Every account loses 1 coin per `DECAY_SECONDS` (default 60), computed from a
+stored timestamp so a restart neither loses nor skips decay. `agent-0` is
+exempt.
 
 `/transfer` and `/admin/topup` are token-gated: `agent-0`'s transfers require
-a token read from `/run/secrets/agent0-transfer-token` (the file mounted into
-its container above), and top-up requires `/run/secrets/bank-admin-token`.
+the token mounted into its container at `/app/agent0-transfer-token`, and
+top-up requires `/app/bank-admin-token` (mounted in step 3). The bank also
+accepts either from `/run/secrets/` if that is where you mounted them.
 A plain `agent-1 -> agent-2` transfer needs no token; anything from `agent-0`
 does.
 
-**Actually run, with `DECAY_SECONDS=2` to make the clock visible:**
+**Actually run**, with `SEED` to fund one agent and `DECAY_SECONDS=2` to make
+the clock visible. The banner and every response below are copied from that
+run:
 
 ```
-$ curl -s localhost:8901/balance/agent-2
-{"agent": "agent-2", "money": 1000}
+$ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py
+[bank] seeded 1 account(s): agent-2=1000
+[bank] on 0.0.0.0:8941  seed=agent-2:1000  decay=1 coin/2s  ledger=...
+
+$ curl -s localhost:8941/balance/agent-2
+{"agent": "agent-2", "money": 1000, "exists": true}
    ... 5 seconds later ...
-$ curl -s localhost:8901/balance/agent-2
-{"agent": "agent-2", "money": 997}
-$ curl -s -X POST -d '{"from":"agent-2","to":"agent-3","amount":7}' localhost:8901/transfer
-{"ok": true, "money": 990, "recipient": "agent-3", "recipient_balance": 1007}
-$ cat /data/accounts.json
-{"accounts": {"agent-2": 990, "agent-3": 1007}, "last_decay": 1792327807.64}
+$ curl -s localhost:8941/balance/agent-2
+{"agent": "agent-2", "money": 998, "exists": true}
+$ curl -s -X POST -d '{"from":"agent-2","to":"agent-3","amount":7}' localhost:8941/transfer
+{"ok": true, "money": 991, "recipient": "agent-3", "recipient_balance": 7}
+$ cat accounts.json
+{"accounts": {"agent-2": 991, "agent-3": 7}, "last_decay": 1792329264.5666666}
+```
+
+Note the two lines that show the rule holding. `agent-3` received **7**, not
+1007: being paid creates the account, but does not also grant it a starting
+balance. And the mint attempt on the same live bank is refused outright:
+
+```
+$ curl -s localhost:8941/balance/ghost-x
+{"agent": "ghost-x", "money": 0, "exists": false}
+$ curl -s -X POST -d '{"from":"ghost-x","to":"agent-3","amount":1000}' localhost:8941/transfer
+{"error": "insufficient funds", "money": 0}
 ```
 
 ## The agent's tools

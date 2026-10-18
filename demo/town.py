@@ -159,8 +159,11 @@ def main():
     # Shape 1 exists so that fixing the bank does not silently break the demo:
     # matching only on the hardcoded literal would turn a GOOD change into an
     # exit-2 failure.
+    # SEED funds exactly the names this demo provisions. Accounts are created
+    # at 0 by design (a new balance must never be a grant -- see bank.py
+    # ensure_account), so without SEED the two agents would start broke.
     env = dict(os.environ, PORT=str(port), START_MONEY="100",
-               DECAY_SECONDS="3600")
+               SEED="agent-1:100,agent-2:100", DECAY_SECONDS="3600")
     src = open(BANK, encoding="utf-8").read()
     env_name = None
     for cand in ("BANK_DATA", "DATA", "LEDGER"):
@@ -168,6 +171,25 @@ def main():
            f"os.environ.get('{cand}'" in src:
             env_name = cand
             break
+
+    # The bank also writes PAYMENT NOTIFICATIONS, and that path is a SECOND
+    # hardcoded absolute (/shared/mailbox) that the ledger fix did not cover.
+    # MEASURED CONSEQUENCE: every demo run wrote real "[bank] You received N
+    # coins" files into the LIVE inboxes of agents in this very box -- 12 per
+    # selftest run, including the guard-disabled limb's 76/10000/1000000
+    # overdraft notifications. A "sandboxed" demo that mutates live state is
+    # not sandboxed; the reader cannot tell the demo's mail from a real
+    # transfer. Redirect it to the demo's own mailbox directory: shape 1 =
+    # env override, shape 2 = patch a copy, else refuse loudly.
+    mailbox_dir = os.path.join(work, "bank-mailbox")
+    os.makedirs(mailbox_dir, exist_ok=True)
+    mailbox_env = None
+    for cand in ("BANK_MAILBOX", "MAILBOX", "MAILBOX_DIR"):
+        if f'os.environ.get("{cand}"' in src or \
+           f"os.environ.get('{cand}'" in src:
+            mailbox_env = cand
+            break
+
     if env_name:
         bank_copy = os.path.join(work, "bank_demo.py")
         with open(bank_copy, "w", encoding="utf-8") as f:
@@ -187,6 +209,29 @@ def main():
         say("      Update demo/town.py to match the new ledger configuration; "
             "do not silently run against /data.")
         return 2
+
+    if mailbox_env:
+        env = dict(env, **{mailbox_env: mailbox_dir})
+    else:
+        # Old bank shape: MAILBOX is a literal. Patch the copy we are about to
+        # run -- and assert the patch actually changed the source, because a
+        # mutation that does not mutate is the defect this repo has hit twice.
+        literal = 'MAILBOX = "/shared/mailbox"'
+        if literal not in src:
+            say("FAIL: bank.py writes notifications to a mailbox path this "
+                "demo cannot redirect, and it is NOT /shared/mailbox.")
+            say("      Refusing to run: the demo would write into live mail.")
+            return 2
+        patched = open(bank_copy, encoding="utf-8").read()
+        new = patched.replace(literal, f"MAILBOX = {mailbox_dir!r}")
+        if new == patched:
+            say("FAIL: mailbox redirect was a no-op; refusing to run.")
+            return 2
+        with open(bank_copy, "w", encoding="utf-8") as f:
+            f.write(new)
+        say(f"mailbox: {mailbox_dir}  (patched copy: MAILBOX literal -> temp)")
+    if mailbox_env:
+        say(f"mailbox: {mailbox_dir}  (via {mailbox_env} env var)")
 
     proc = subprocess.Popen([sys.executable, bank_copy], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -215,10 +260,38 @@ def main():
         say("1. bank")
         a = http("GET", f"{base}/balance/agent-1")
         b = http("GET", f"{base}/balance/agent-2")
-        check("agents auto-created with START_MONEY=100",
+        check("seeded agents start at 100",
               a["money"] == 100 and b["money"] == 100, f"{a} {b}")
         r = http("POST", f"{base}/transfer",
                  {"from": "agent-1", "to": "agent-2", "amount": 25})
+        # -- the MINT INVARIANT: touching an unknown name must not create
+        # wealth. This is the check whose absence let a minting bank pass the
+        # whole demo. It runs BEFORE any transfer that could muddy the books.
+        ghost = http("GET", f"{base}/balance/ghost-not-an-agent")
+        check("unknown name is created at 0, not funded",
+              ghost.get("money") == 0, str(ghost))
+        check("unknown name reports exists=false",
+              ghost.get("exists") is False, str(ghost))
+        total_before = sum(http("GET", f"{base}/accounts")["accounts"].values())
+        check("touching an unknown name creates no coins",
+              total_before == 200,
+              f"total={total_before} expected 200 (2 x 100)")
+        # ...and the GRANT half. The two checks above only prove the READ did
+        # not fund the name; a bank whose ensure_account creates at
+        # START_MONEY but whose GET path was fixed passes both. The mint is
+        # only closed if a name that does get created -- a fresh RECIPIENT --
+        # is created at ZERO. Measured: the grant-on-create negative control
+        # passed the demo until this line existed.
+        r_new = http("POST", f"{base}/transfer",
+                     {"from": "agent-2", "to": "fresh-recipient", "amount": 1})
+        check("a fresh recipient is created at 0 and then paid",
+              r_new.get("recipient_balance") == 1,
+              f"{r_new}")
+        total_after = sum(http("GET", f"{base}/accounts")["accounts"].values())
+        check("creation granted nothing (no new coins)",
+              total_after == total_before,
+              f"total={total_after} expected {total_before}")
+
         check("transfer 25 moves coins", r.get("ok") is True, str(r))
         check("sender debited", r["money"] == 75, str(r))
         check("recipient credited", r["recipient_balance"] == 125, str(r))
@@ -259,6 +332,39 @@ def main():
         box = os.path.join(work, "mailbox")
         drain = read_mail(box, "agent-1")
         check("empty inbox reads as empty list", drain == [], str(drain))
+        # The bank's OWN notification path, which is separate from the
+        # file-protocol helpers above. It must land in the demo's mailbox.
+        bank_inbox = os.path.join(mailbox_dir, "agent-2", "incoming")
+        notes = []
+        if os.path.isdir(bank_inbox):
+            for name in sorted(os.listdir(bank_inbox)):
+                try:
+                    notes.append(json.load(open(os.path.join(bank_inbox, name),
+                                                encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        check("bank wrote its payment notice to the DEMO mailbox, not live",
+              any(n.get("from") == "bank" and "25 coins" in n.get("text", "")
+                  for n in notes), f"{len(notes)} notice(s) in {bank_inbox}")
+        # A COUNT-OF-FILES CHECK HERE WAS VACUOUS AND I CAUGHT IT BY TESTING
+        # THE CHECK: comparing _live_mailbox_count() to a baseline passed
+        # while FIVE real notifications leaked into agent-2's inbox. The
+        # daemon consumes inbox files every 3 seconds, so a write followed by
+        # a consume leaves the count unchanged. A post-hoc count cannot see a
+        # write whose consumer deletes it -- it measures the checker's view.
+        #
+        # The sound check is the POSITIVE one above: our own bank's notice for
+        # a specific transfer is in OUR mailbox directory. If the bank had used
+        # /shared/mailbox, this directory would be empty and that check fails.
+        # So assert the exact count, which also pins that refused transfers
+        # write nothing.
+        notes_25 = [n for n in notes
+                    if n.get("from") == "bank" and "25 coins" in n.get("text", "")]
+        check("exactly one notice for the one successful transfer",
+              len(notes_25) == 1, f"{len(notes_25)} notice(s)")
+        check("the bank's mailbox is not the live one",
+              os.path.realpath(mailbox_dir) != os.path.realpath("/shared/mailbox"),
+              mailbox_dir)
 
         # -- 4. two lives, with memory carried in a file -------------------
         say("")
