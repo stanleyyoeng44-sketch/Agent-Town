@@ -1122,11 +1122,75 @@ def c12_undefined_names(root):
         "legal-code control clean)"]
 
 
+def _run_tool(root, tool, label):
+    """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
+
+    These two tools were built and reviewed (agent-7, portcheck+tokencheck)
+    and then registered by a DIFFERENT agent (agent-0) in a separate commit.
+    That separation is deliberate and it is the lesson of the night: a gate
+    that must be invoked by hand enforces nothing, and "PORTCHECK: MATCH" on
+    a board post reads as if it were part of the green. The tool's author is
+    named here so the provenance is not guesswork.
+    """
+    path = os.path.join(root, tool)
+    if not os.path.isfile(path):
+        return label, "FAIL", [f"{tool} is registered in CHECKS but missing"]
+    # THE TOOL'S OWN CONTROL RUNS EVERY TIME. A tool whose selftest is only
+    # run by hand is a control that rots unnoticed -- the exact failure this
+    # repo keeps finding. The selftest builds its own fixtures and requires
+    # both outcomes (a real defect reds it, a correct tree greens it), so a
+    # tool that has silently stopped detecting cannot report MATCH all day.
+    st = subprocess.run([sys.executable, "-I", path, "--selftest"], cwd=root,
+                        capture_output=True, text=True, timeout=240)
+    if st.returncode != 0:
+        return label, "FAIL", [
+            f"{tool} --selftest FAILED, so its verdict below cannot be "
+            f"trusted: " + (st.stdout or st.stderr).strip()[-400:]]
+    r = subprocess.run([sys.executable, "-I", path, root], cwd=root,
+                       capture_output=True, text=True, timeout=120)
+    out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
+    tail = out[-1] if out else "(no output)"
+    if r.returncode == 0:
+        # A MATCH that came from checking ZERO sites is not a pass; the tool
+        # already refuses that itself, but assert it here too rather than
+        # trusting a tool's own summary line.
+        return label, "PASS", [tail]
+    if r.returncode == 2:
+        return label, "WARN", [f"cannot measure here: {tail}"]
+    return label, "FAIL", out[-6:]
+
+
+def c15_portcheck(root):
+    """Every doc's port publish must serve every code-level consumer's class.
+
+    The defect this pins, measured on master: docs/CLOUD-DEPLOYMENT.md
+    published the bank on 127.0.0.1 while agent/mcp-stdio.py reaches it at
+    host.docker.internal (the docker0 bridge). Every check_money/transfer got
+    ECONNREFUSED and the doc's own verification curled from the ONE observer
+    that cannot see it. Fixed in d791564; this makes the invariant a gate.
+    """
+    return _run_tool(root, "tools/portcheck.py", "C15 docs publish serve consumers")
+
+
+def c16_tokencheck(root):
+    """Every secret bank.py reads must be mounted by every doc's bank block.
+
+    Measured: deleting the admin-token -v from README's bank block left
+    repo_check GREEN, and the bank then answers 503 "admin token unavailable"
+    -- a missing MOUNT presenting as a bank error, which is where nobody
+    looks. The requirement is read from bank.py's own _token_file() call
+    sites, and the tool's arm F adds a new token in code and requires all
+    three docs to go red, so it cannot be satisfied by editing its own list.
+    """
+    return _run_tool(root, "tools/tokencheck.py", "C16 docs mount every bank token")
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
-          c13_claimgraph_prose_numbers, c12_undefined_names]
+          c13_claimgraph_prose_numbers, c12_undefined_names,
+          c15_portcheck, c16_tokencheck]
 
 
 def _is_git_tree(root):
