@@ -205,20 +205,21 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 ticks = decay_ticks()
                 # A READ MUST NOT WRITE. This used to call ensure_account(),
-                # which CREATED the row and saved the ledger, so 2,000 reads
-                # of fresh names grew /data/accounts.json without bound while
-                # honestly answering exists=false. Stopping creation from
-                # FUNDING the account did not stop it creating one. Decay is
-                # still persisted when it advanced; the account row is not.
-                existed = name in _accounts
+                # so asking about a name created it: `exists` said false while
+                # the row landed on disk, a second read then said true, and
+                # 2,000 reads of fresh names grew the ledger from 65 bytes to
+                # ~33 KB with 2,001 accounts. That is a storage mint -- no
+                # coins, but unbounded, unauthenticated, and invisible because
+                # "a refused transfer writes nothing" already passed.
+                # `exists` is now a fact about the ledger, not a report of what
+                # the previous call did. 200-with-0 is friendlier to the MCP
+                # client than 404 and it is honest about what the number means.
+                exists = name in _accounts
                 balance = _accounts.get(name, 0)
                 if ticks:
-                    save()
-            # `exists` distinguishes "this agent has an account" from "you
-            # asked about a name". 200-with-0 is friendlier to the MCP client
-            # than 404 and it is honest about what the number means.
+                    save()          # decay DID happen; that is a real write
             return self._send(200, {"agent": name, "money": balance,
-                                    "exists": existed})
+                                    "exists": exists})
         return self._send(404, {"error": f"unknown path {path}"})
 
     def do_POST(self):
