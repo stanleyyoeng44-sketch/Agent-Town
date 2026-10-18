@@ -87,7 +87,54 @@ def _bound_in(node, out):
         return                                  # class body is its own scope
     if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
                          ast.GeneratorExp)):
+        # The comprehension TARGETS stay inside (they do not leak), but a
+        # WALRUS target binds in the CONTAINING scope in CPython, so it DOES
+        # leak to here. Missing this was a false positive: `if any((n := x) >
+        # 1 for x in data): print(n)` reported `n` undefined on the print.
+        # `_comp_targets` covers the walrus INSIDE the comprehension; this
+        # covers the same binding in the scope that contains it.
+        for n in ast.walk(node):
+            if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
+                out.add(n.target.id)
         return                                  # targets stay inside
+    if isinstance(node, ast.match_case):
+        # A `case` pattern binds captures in the enclosing function scope
+        # (match does not create a scope). Walk the pattern's capture nodes.
+        _bound_in(node.pattern, out)
+        return
+    if isinstance(node, ast.MatchAs):
+        # `x as name`, and the bare capture `case name:` (pattern is None).
+        if node.name:
+            out.add(node.name)
+        if node.pattern is not None:
+            _bound_in(node.pattern, out)
+        return
+    if isinstance(node, ast.MatchStar):
+        if node.name:
+            out.add(node.name)          # `case [*rest]`
+        return
+    if isinstance(node, ast.MatchMapping):
+        # `case {**rest}` -- `rest` captures the remaining items; the VALUES
+        # are themselves patterns (`case {"a": v}` captures v). Missing the
+        # values was the residual false positive after the first match fix.
+        if node.rest:
+            out.add(node.rest)
+        for pat in node.patterns:
+            _bound_in(pat, out)
+        return
+    if isinstance(node, ast.MatchClass):
+        # `case Point(x=a, y=b)` -- keyword-pattern values are sub-patterns.
+        for pat in list(node.patterns) + list(node.kwd_patterns):
+            _bound_in(pat, out)
+        return
+    if isinstance(node, ast.MatchSequence):
+        for pat in node.patterns:
+            _bound_in(pat, out)
+        return
+    if isinstance(node, ast.MatchOr):
+        for pat in node.patterns:
+            _bound_in(pat, out)
+        return
     if isinstance(node, ast.Name):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             out.add(node.id)

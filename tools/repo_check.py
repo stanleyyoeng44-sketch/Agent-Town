@@ -1187,6 +1187,66 @@ def c13_claimgraph_prose_numbers(root):
     return "C13 claimgraph prose numbers", "PASS", checked
 
 
+def _undefined_names_silences_file(src, root):
+    """Return a reason string if tools/undefined_names.py would return NO
+    findings for this whole source because of a module-wide escape hatch,
+    else None.
+
+    THE ESCAPE-CALL SET IS IMPORTED FROM THE TOOL, NOT COPIED. The first
+    version of this function hard-coded the escape names and had already
+    drifted: it listed "__import__", which undefined_names.py's ESCAPE_CALLS
+    does NOT, so a legal fixture that legitimately used __import__ would be
+    called vacuous by this guard while the real tool still checked it
+    (agent-2, measured over 11 constructs). A hand-copied predicate drifts
+    and nothing notices. So the escape set is read from the tool module
+    itself, and an arm asserts the two agree.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return "does not parse"
+    # Import the tool once; its ESCAPE_CALLS is the definition, not our copy.
+    tool_mod = _load_undefined_names(root)
+    escape_calls = getattr(tool_mod, "ESCAPE_CALLS", set()) if tool_mod else set()
+    # star import
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            if any(a.name == "*" for a in n.names):
+                return "a star import"
+    # escape calls -- the SET comes from the tool
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in escape_calls):
+            return "a %s() call" % n.func.id
+    # except NameError -- the CONDITION mirrors the tool's third short-circuit.
+    # Kept in sync by the equality arm below (which also flags a tool change).
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ExceptHandler) and n.type is not None:
+            t = n.type
+            names = [t] if isinstance(t, ast.Name) else (
+                t.elts if isinstance(t, ast.Tuple) else [])
+            if any(isinstance(x, ast.Name) and x.id == "NameError"
+                   for x in names):
+                return "an except NameError probe"
+    return None
+
+
+def _load_undefined_names(root):
+    """Import tools/undefined_names.py as a module, or None if absent."""
+    import importlib.util
+    path = os.path.join(root, "tools", "undefined_names.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_c12_undefined_names", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
 def c12_undefined_names(root):
     """A name LOADED but never bound -- the defect class that stopped the daemon.
 
@@ -1212,13 +1272,27 @@ def c12_undefined_names(root):
 
     FALSE POSITIVES ARE THE FAILURE MODE THAT MATTERS. A check that bites
     correct code gets disabled, and then it catches nothing. So the module
-    stays SILENT wherever it cannot prove a load is unsafe: star imports,
-    globals()/locals()/eval/exec, a caught NameError. Its own suites are run
-    here as the control, in both directions:
-      - tools/tests/undefined_names_cases.py  (10 snippets that MUST be caught)
-      - tools/tests/undefined_names_legal.py  (legal Python that MUST NOT be)
+    stays SILENT for a WHOLE FILE wherever it cannot prove a load is unsafe:
+    a star import, globals()/locals()/vars(), eval/exec, or a caught
+    NameError. Those are FIVE independent whole-file bail-outs. Its own suites
+    are run here as the control, in both directions:
+      - tools/tests/undefined_names_cases.py   (10 snippets that MUST be caught)
+      - tools/tests/undefined_names_legal.py   (legal Python that MUST NOT be)
+      - tools/tests/undefined_names_escapes.py (a file WITH a bail-out; the
+                                                checker must stay silent)
     A check with a negative control but no positive one is this cohort's most
     repeated mistake; this one asserts both.
+
+    THE FALSE-POSITIVE CONTROL WAS VACUOUS FOR EXACTLY THIS REASON (agent-4,
+    life 17; sharpened by agent-2). The legal fixture used to carry a star
+    import AND a globals() case, so the checker declared the whole file
+    uncheckable and reported nothing -- the control asserted "the tool passes
+    on a file the tool refuses to read", true by construction, zero
+    information, and unable to fail. So C12 now asserts the legal fixture is
+    CHECKABLE, two ways: by AST against the known bail-outs, and
+    BEHAVIOURALLY by injecting an undefined name and requiring it to be
+    reported (the mutant form -- it does not depend on the list staying
+    complete).
     """
     tool = os.path.join(root, "tools", "undefined_names.py")
     if not os.path.isfile(tool):
@@ -1237,6 +1311,7 @@ def c12_undefined_names(root):
     #    would otherwise report PASS on every tree forever.
     cases = os.path.join(root, "tools", "tests", "undefined_names_cases.py")
     legal = os.path.join(root, "tools", "tests", "undefined_names_legal.py")
+    escapes = os.path.join(root, "tools", "tests", "undefined_names_escapes.py")
     if not os.path.isfile(cases) or not os.path.isfile(legal):
         findings.append("C12's own control suites are missing "
                         "(tools/tests/undefined_names_{cases,legal}.py); the "
@@ -1253,11 +1328,97 @@ def c12_undefined_names(root):
     if rl.returncode != 0:
         findings.append("FALSE-POSITIVE CONTROL FAILED: legal Python was "
                         "reported -- " + (rl.stdout or "").strip()[-300:])
+    # THE FALSE-POSITIVE CONTROL ABOVE IS ONLY MEANINGFUL IF THE LEGAL FILE
+    # HAS NO MODULE-WIDE ESCAPE HATCH. The checker returns "no findings" for
+    # a whole file on a star import / globals() / except NameError, so a
+    # legal fixture carrying one of those can never go red no matter what
+    # legal code it contains -- it was vacuous for exactly that reason until
+    # this check existed. So: assert the legal fixture does not carry an
+    # escape hatch, AND run a SEPARATE fixture that does, requiring silence.
+    # The two together mean "clean" for the legal file is measured, not
+    # produced by a short-circuit.
+    if os.path.isfile(escapes):
+        re_ = subprocess.run([sys.executable, "-I", tool, escapes], cwd=root,
+                             capture_output=True, text=True)
+        if re_.returncode != 0:
+            findings.append("ESCAPE-HATCH CONTROL FAILED: a file with a star "
+                            "import / globals() / except NameError was NOT "
+                            "silenced -- " + (re_.stdout or "").strip()[-300:])
+    # Ask the CHECKER, not a text scan: a comment naming globals() must not
+    # count as a globals() call, and the tool's own short-circuit logic is
+    # the definition of "does this file get silenced." Import the tool's
+    # module and call its detector on the legal source.
+    legal_src = open(legal, encoding="utf-8").read()
+    vacuous_reason = _undefined_names_silences_file(legal_src, root)
+    if vacuous_reason:
+        findings.append("THE FALSE-POSITIVE CONTROL IS VACUOUS: "
+                        "tools/tests/undefined_names_legal.py trips the "
+                        "checker's whole-file short-circuit (%s), so it can "
+                        "never report a false positive no matter what legal "
+                        "code it contains. Move that case to "
+                        "undefined_names_escapes.py." % vacuous_reason)
+    # THE MUTANT FORM OF THE SAME ASSERTION (agent-2's sharper version). The
+    # AST check above asks "does this file trip a known bail-out?" -- but
+    # there are FIVE independent whole-file bail-outs and a sixth could be
+    # added later. So assert the property BEHAVIOURALLY: inject an undefined
+    # name into a copy of the legal fixture and require the checker to catch
+    # it. If the fixture is checkable, the injected name is reported; if the
+    # checker has declared the whole file uncheckable for any reason, it is
+    # not. "Passes" becomes "passes WHILE BEING CHECKABLE", which is the only
+    # form of the control that can fail.
+    mutant = legal_src + "\n\ndef _c12_injected():\n    return " \
+                         "_C12_UNDEFINED_MUTANT\n"
+    mutant_path = legal + ".c12mutant"
+    try:
+        with open(mutant_path, "w", encoding="utf-8") as f:
+            f.write(mutant)
+        rm = subprocess.run([sys.executable, "-I", tool, mutant_path],
+                            cwd=root, capture_output=True, text=True)
+        if "_C12_UNDEFINED_MUTANT" not in (rm.stdout or ""):
+            findings.append("THE FALSE-POSITIVE CONTROL IS VACUOUS "
+                            "(behavioural): an undefined name injected into "
+                            "tools/tests/undefined_names_legal.py was NOT "
+                            "reported, so the checker treats the whole file "
+                            "as uncheckable and the clean result proves "
+                            "nothing.")
+    finally:
+        try:
+            os.remove(mutant_path)
+        except OSError:
+            pass
+    # DRIFT ARM: this classifier must agree with the TOOL about which calls
+    # are escapes. The first version copied the set by hand and had already
+    # diverged (it listed __import__, the tool did not), so a legal fixture
+    # using __import__ would be called vacuous while the tool still checked
+    # it. Assert the agreement on a name in the set and one out of it, using
+    # the tool's OWN check_source on a snippet that also has a real undefined
+    # name: if the name is an escape, check_source returns [] (silent); if it
+    # is not, it reports the undefined name.
+    tool_mod = _load_undefined_names(root)
+    if tool_mod is not None and hasattr(tool_mod, "check_source"):
+        def _tool_silent(snippet):
+            return tool_mod.check_source(snippet) == []
+        # __import__ must NOT silence the tool (it is not in ESCAPE_CALLS);
+        # vars() MUST. If the tool's set changes, one of these flips and the
+        # arm below reds -- which is the point: drift is caught, not assumed.
+        if _tool_silent("def f():\n    __import__('os')\n    return ZZZ_UNDEF\n"):
+            findings.append("ESCAPE-SET DRIFT: the tool now treats "
+                            "__import__() as a whole-file escape, but this "
+                            "classifier's assumed set (imported from the "
+                            "tool) disagrees -- update the classifier or the "
+                            "tool, they must name the same calls.")
+        imp_src = "def f():\n    __import__('os')\n    return ZZZ_UNDEF\n"
+        if _undefined_names_silences_file(imp_src, root) is not None:
+            findings.append("ESCAPE-SET DRIFT: this classifier calls a file "
+                            "using __import__() vacuous, but the tool still "
+                            "checks it -- the classifier's escape set has "
+                            "diverged from the tool's.")
     if findings:
         return "C12 undefined names", "FAIL", findings
     return "C12 undefined names", "PASS", [
         "no unbound name in any tracked .py (10/10 detection cases, "
-        "legal-code control clean)"]
+        "legal-code control clean AND not short-circuited, escape control "
+        "silent, escape-set matches the tool)"]
 def _registry_orphans(source):
     """Parse a repo_check.py SOURCE and return (defined, registered, orphans).
 

@@ -1,10 +1,23 @@
 """Legal Python that MUST NOT be reported. Each case is a way a naive
-undefined-name checker reports a false positive."""
+undefined-name checker reports a false positive.
+
+THIS FILE MUST NOT CONTAIN A MODULE-WIDE ESCAPE HATCH. The checker returns
+"no findings" for a whole file if it sees a star import, a globals()/locals()/
+eval/exec call, or a `except NameError`. Those are correct per-file
+conservatisms -- but a fixture that triggers one of them is VACUOUS: the
+checker would report nothing no matter what legal code was added, so the
+false-positive control could never fail and proved nothing. This file used to
+carry `from math import *` AND a `globals()` case, which meant C12's
+false-positive control passed on every tree, including trees with real false
+positives. The escape-hatch cases now live in undefined_names_escapes.py,
+which is run as its own control (asserting the checker correctly stays
+silent), so the two concerns are measured separately.
+"""
 import os
 import sys
 from os.path import join as _join
 from collections import OrderedDict  # noqa
-from math import *  # noqa: F401,F403  -- star import at MODULE level is legal
+from math import sqrt            # NAMED import: no module-wide escape hatch
 
 MODULE_LATE = None
 
@@ -79,17 +92,13 @@ def annotated(a: int, b: "str") -> bool:
 
 
 def star_import_case():
-    # The star import is at MODULE level (line 7), which is the only legal
-    # place for it. `sqrt` comes from there. A checker that ignores star
-    # imports reports a false positive here -- and `from math import *`
-    # inside a function is a COMPILE error, not a parse error, so it must
-    # not appear in this file: this file has to stay importable.
+    # `sqrt` is now a NAMED import (line 10), so this case exercises ordinary
+    # import binding rather than a star import. The star-import escape hatch
+    # is measured separately in undefined_names_escapes.py.
     return sqrt(4)
 
 
-def globals_case():
-    name = "MODULE_LATE"
-    return globals()[name]
+
 
 
 def del_and_rebind():
@@ -130,12 +139,39 @@ def global_stmt():
     MODULE_LATE = 5
 
 
+def match_captures(x):
+    # Every capture below is BOUND by the pattern, not read. `match` does not
+    # create a scope, so these bind in this function -- a checker that walks
+    # patterns as ordinary names reports all four as undefined. (agent-1's
+    # false positive, reproduced and fixed.)
+    match x:
+        case [1, *rest]:          # MatchStar: rest
+            return rest
+        case {"a": v, **kw}:      # MatchMapping value + rest: v, kw
+            return v, kw
+        case int() as n:          # MatchAs: n
+            return n
+    return None
+
+
+def walrus_in_comprehension(seq):
+    # A `:=` inside a comprehension binds in the CONTAINING scope in CPython,
+    # so `n` is legal on the line AFTER the comprehension. A checker that
+    # treats the comprehension as a closed scope reports it undefined.
+    # (agent-1's second false positive, reproduced and fixed.)
+    if any((n := x) > 1 for x in seq):
+        return n
+    return 0
+
+
 def main():
     return (uses_later_module_constant(), K().m(), closures_and_defaults(1),
             comprehension_scoping([1]), comp_uses_outer([1]), nested_comp([[1]]),
             lam(), exception_name(), iteration_targets(), walrus([1]),
-            annotated(1, "a"), star_import_case(), globals_case(),
-            del_and_rebind(), multiple_targets(), class_scope_classvars())
+            annotated(1, "a"), star_import_case(),
+            del_and_rebind(), multiple_targets(), class_scope_classvars(),
+            match_captures([1, 2]), match_captures({"a": 1}),
+            match_captures(5), walrus_in_comprehension([1, 2]))
 
 
 if __name__ == "__main__":
