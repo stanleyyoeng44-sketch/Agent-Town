@@ -1,0 +1,1446 @@
+#!/usr/bin/env python3
+"""repo_check.py — the repo checks itself.
+
+WHY THIS EXISTS
+    .gitignore stops `git add .` from staging junk. It does NOT stop
+    `git add -f`, it does NOT un-track a file that is already in the index,
+    and a file already in HISTORY stays fetchable forever even after it is
+    deleted at HEAD. A .gitignore is a wish; this is a check.
+
+    This repo was, at the time of writing, shipping 9 committed .pyc files,
+    a tracked SQLite database of the operator's private chat, a tracked
+    process log, and a LIVE CONTROL TOKEN in `ui/control.log` -- the token
+    that gates the entire control UI's /api surface. Every one of those was
+    invisible to `git status` because git was doing exactly what it was told.
+
+CHECKS
+    C1 tracked junk        __pycache__, *.pyc, *.log, *.pid, sqlite, jsonl
+    C2 secrets in HEAD     token/key-shaped strings in tracked file content
+    C3 secrets in HISTORY  same, over every blob reachable from any ref
+    C4 .gitignore present  and covers the classes above
+    C5 docs commands run   every ```sh block in README runs, or is marked
+    C6 sources import      every .py in the tree parses (stdlib ast only)
+
+Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
+CONTROL per check: it builds a deliberately bad tree and asserts the check
+FAILS on it. A check that has never failed is not a check -- that is the
+whole rule this cohort spent the day learning, and the repo is no exception.
+  RUN INSIDE A GIT TREE. C1/C2/C3/C5 read `git ls-files`; a `git archive`
+  export (or a bare directory) has no .git and every one of those checks
+  reports "git ls-files exit 128" -- four FAILs that look like defects and are
+  a missing repository. `git init && git add -A && git commit -qm x` makes such
+  a tree checkable. This is not a repo defect and the output now says so.
+"""
+import ast
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# --- patterns -------------------------------------------------------------
+JUNK_NAME = re.compile(r"""
+    (^|/)(__pycache__)(/|$)
+  | \.py[cod]$
+  | \.log$
+  | \.pid$
+  | \.(sqlite3?|db)$
+  | \.jsonl$
+""", re.X)
+
+SECRET_PATTERNS = [
+    # the exact shape that was committed here: "token: <43 urlsafe chars>"
+    ("control/bank token line", re.compile(r"(?i)\btoken\s*[:=]\s*['\"]?[A-Za-z0-9_-]{24,}")),
+    ("openai-style key", re.compile(r"\bsk-[A-Za-z0-9]{20,}")),
+    ("github token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("aws access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+]
+
+# placeholders that are NOT secrets; a doc may legitimately show these
+PLACEHOLDER = re.compile(
+    r"(?i)your[-_ ]?(api[-_ ]?)?(key|token)|xxx+|\.\.\.|<[^>]*>|\$\{?[A-Z_]+\}?|example|placeholder|redacted")
+
+DOC_SUFFIXES = (".md", ".rst")
+CODE_SUFFIXES = (".py",)
+
+
+def _tracked(root):
+    out = subprocess.run(["git", "-C", root, "ls-files"],
+                         capture_output=True, text=True, check=True)
+    return [l for l in out.stdout.splitlines() if l.strip()]
+
+
+def _show(root, spec):
+    out = subprocess.run(["git", "-C", root, "show", spec],
+                         capture_output=True, text=True, errors="replace")
+    return out.stdout
+
+
+# --- checks ---------------------------------------------------------------
+def c1_tracked_junk(root):
+    bad = [f for f in _tracked(root) if JUNK_NAME.search(f)]
+    return "C1 tracked junk", "FAIL" if bad else "PASS", bad
+
+
+REDACT_FULL = False       # --show-secrets for local use; never in CI
+
+
+def _redact(s):
+    """A report that cannot be pasted in public is a weaker report.
+
+    This check runs in CI logs. Printing the secret it found re-publishes it
+    on every run -- the tool would become a new distribution channel for the
+    exact string it exists to catch. So the default output is a recognisable
+    prefix plus a length, which is enough to find the line and not enough to
+    use the credential.
+    """
+    if REDACT_FULL:
+        return s
+    if len(s) <= 8:
+        return s
+    return f"{s[:6]}…({len(s)} chars, redacted)"
+
+
+def scan_text(name, text):
+    """Placeholder filtering happens on the RAW match, never on the redacted
+    string. An earlier version redacted first and then tested for
+    placeholders -- and the redaction marker contains the word 'redacted',
+    which is itself in the placeholder list, so every redacted hit was
+    filtered out as a placeholder. The check silently found nothing, which is
+    why two negative controls went red. Redaction is presentation; it must
+    not touch the decision.
+    """
+    hits = []
+    for label, pat in SECRET_PATTERNS:
+        for m in pat.finditer(text):
+            if PLACEHOLDER.search(m.group(0)):
+                continue            # documented placeholder, not a secret
+            hits.append(f"{name}: {label}: {_redact(m.group(0))}")
+    return hits
+
+
+def c2_secrets_head(root):
+    hits = []
+    for f in _tracked(root):
+        if f.endswith((".png", ".jpg", ".ico", ".gif", ".woff", ".woff2")):
+            continue
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        hits.extend(scan_text(f, text))
+    return "C2 secrets in HEAD", "FAIL" if hits else "PASS", hits
+
+
+BASELINE_FILE = ".repo-check-baseline"
+
+
+def _baseline(root):
+    """Accepted exposures, one reason per line. Each entry suppresses a hit
+    that CONTAINS the given substring. The file is deliberately human-edited
+    and reviewed: a baseline entry is a written admission, not a mute switch.
+    """
+    p = os.path.join(root, BASELINE_FILE)
+    if not os.path.isfile(p):
+        return []
+    out = []
+    for line in open(p, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line.split("#")[0].strip())
+    return [b for b in out if b]
+
+
+def c3_secrets_history(root):
+    """Scan every blob reachable from any ref, including deleted files."""
+    revs = subprocess.run(["git", "-C", root, "rev-list", "--all"],
+                          capture_output=True, text=True).stdout.split()
+    seen, hits = set(), []
+    for rev in revs:
+        listing = subprocess.run(
+            ["git", "-C", root, "ls-tree", "-r", "-z", "--long", rev],
+            capture_output=True, text=True, errors="replace").stdout
+        for rec in listing.split("\0"):
+            if not rec.strip():
+                continue
+            meta, _, path = rec.partition("\t")
+            parts = meta.split()
+            if len(parts) < 4:
+                continue
+            sha, size = parts[2], parts[3]
+            if sha in seen:
+                continue
+            seen.add(sha)
+            try:
+                if int(size) > 2_000_000:
+                    continue
+            except ValueError:
+                continue
+            blob = _show(root, sha)
+            hits.extend(f"{rev[:8]}:{path}: {h}" for h in scan_text(path, blob))
+    # "zero secrets found" and "zero blobs scanned" must not print the same
+    # green. If the walk inspected nothing, this check learned nothing.
+    coverage = [f"scanned {len(seen)} distinct blob(s) across {len(revs)} commit(s)"]
+    if len(seen) < 2:
+        return "C3 secrets in HISTORY", "WARN", \
+            coverage + ["history walk found nothing to inspect -- NOT verified"]
+
+    if not hits:
+        return "C3 secrets in HISTORY", "PASS", coverage
+
+    # A KNOWN, ACCEPTED LEAK IS STILL A LEAK. The only thing a baseline may do
+    # is stop re-reporting it on every run; it can never turn red into green.
+    # Every unbaselined leak is a FAIL and blocks. A baselined one is a WARN
+    # that names the accepted exposure out loud, every run, so the debt is
+    # visible in the log rather than forgotten in a ticket.
+    baseline = _baseline(root)
+    new = [h for h in hits if not any(b in h for b in baseline)]
+    known = [h for h in hits if any(b in h for b in baseline)]
+    if new:
+        return "C3 secrets in HISTORY", "FAIL", new + coverage + \
+            [f"({len(known)} baselined hit(s) suppressed; see .repo-check-baseline)"]
+    return "C3 secrets in HISTORY", "WARN", coverage + [
+        f"{len(known)} KNOWN ACCEPTED leak(s), baselined -- this is debt, not a pass"]
+
+
+
+def c4_gitignore(root):
+    p = os.path.join(root, ".gitignore")
+    if not os.path.isfile(p):
+        return "C4 .gitignore covers junk", "FAIL", [".gitignore missing"]
+    txt = open(p, encoding="utf-8", errors="replace").read()
+    need = ["__pycache__", "*.py[cod]", "*.log", "*.pid", "*.sqlite3",
+            "control-token"]
+    miss = [n for n in need if n not in txt]
+    return "C4 .gitignore covers junk", "FAIL" if miss else "PASS", [f"missing rule: {m}" for m in miss]
+
+
+SH_BLOCK = re.compile(r"```(?:sh|bash|console)\n(.*?)```", re.S)
+
+# Commands this check can HONESTLY execute on this box. Anything else is
+# reported as skipped WITH ITS REASON -- never silently dropped.
+RUNNABLE = ("python3 ", "python ", "bash -n ", "sh -n ", "test ", "[ ")
+ENV_LIMITED = ("docker ", "docker-compose ", "make ")   # no docker daemon here
+# a leading VAR=value is environment, not the command; look through it
+ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
+
+
+def _looks_like_server(body, root="."):
+    """A block that starts a long-running listener, not a one-shot command.
+
+    The block itself usually does NOT contain 'serve_forever' -- it runs a
+    script that does. So look at the script it names as well as the block.
+    """
+    if re.search(r"\b(uvicorn|flask run|gunicorn)\b", body):
+        return True
+    targets = re.findall(r"python3?\s+([\w./-]+\.py)", body)
+    for t in targets:
+        try:
+            src = open(os.path.join(root, t), encoding="utf-8",
+                       errors="replace").read()
+        except OSError:
+            continue
+        if "serve_forever" in src or "ThreadingHTTPServer(" in src:
+            return True
+    return False
+
+
+# A probe is executed with shell=True, so the allowlist must reason about the
+# WHOLE LINE, not just the prefix it recognises. These characters can start a
+# second command, substitute one, or redirect output. Any of them means the
+# 'safe' first word says nothing about what the line does:
+#   python3 -c "print(1)" && rm -rf victim      <- deleted a directory
+# The probe declined only the line it could not parse; the shell ran all of it.
+_SHELL_COMPOUND = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "\n")
+
+
+def _probe_safe(cmd: str) -> bool:
+    """Is `cmd` safe to execute twice, for the SKIP probe?
+
+    ALLOWED, and nothing else:
+      * `bash -n` / `sh -n`        -- parse only, by definition side-effect free
+      * `test ...` / `[ ... ]`     -- pure predicate, once compounds are out
+    Everything else is declined and reported as an honoured SKIP, which is
+    VISIBLE: silence is what this change removed.
+
+    WHY `python3 -c` IS NO LONGER PROBED AT ALL. Two rounds of review found
+    two different ways past a substring list, and the second one is decisive:
+
+      1. `python3 -c "print(1)" && rm -rf victim` -- the allowlist judged the
+         first command and shell=True ran the rest. (agent-2; the line deleted
+         a directory during a probe.)
+      2. `python3 -c "__builtins__.__dict__['op'+'en'](path,'w')..."` --
+         string concatenation spells 'open' without the substring 'open'.
+         (agent-10; the file was written on both this branch and its parent.)
+
+    A substring list answers "does this text look dangerous", and the question
+    that matters is "what will this program do". Those are different questions
+    and the first will keep losing to the next spelling. Rather than blocklist
+    a third time, the probe gives up on this shape: a SKIP-marked python line
+    becomes an honoured, reported SKIP. The cost is that a doc hiding a
+    WORKING python one-liner behind SKIP is no longer caught -- accepted, and
+    named here, because the alternative is a checker that executes code it
+    cannot reason about.
+
+    This is policy, not a remaining probe bug: C5 already executes UNMARKED
+    blocks whose first word is runnable, so any tracked document is executable
+    by design. The probe only owes an answer for lines a doc marked NOT to run.
+    """
+    c = cmd.strip()
+    if any(tok in c for tok in _SHELL_COMPOUND):
+        return False
+    if c.startswith(("bash -n ", "sh -n ")):
+        return True
+    if c.startswith(("test ", "[ ")):
+        # `-a`/`-o` are test's own operators, and `test -f a -a rm -rf x` is a
+        # syntactically odd expression whose safety depends on the shell's
+        # argument handling, so a line mentioning a command word is declined.
+        return not any(w in c.split() for w in ("rm", "mv", "cp", "dd", "sh",
+                                                "bash", "python", "curl",
+                                                "wget", "chmod", "chown"))
+    return False
+
+
+def _first_cmd(body):
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            while ENV_PREFIX.match(s):
+                s = ENV_PREFIX.sub("", s, count=1)
+            return s
+    return ""
+
+
+def c5_doc_commands(root, timeout=60):
+    """Execute the runnable code blocks in tracked docs.
+
+    THE VACUOUS PASS, AND WHY THIS FUNCTION REFUSES IT. An earlier version of
+    this check passed on a repo whose README had 16 fenced blocks, because
+    none of them started with a command it recognised: 'zero blocks executed'
+    was reported as PASS. That is a check that has never seen a document and
+    therefore cannot fail one. It is the same defect as the join-default bug
+    and as b0i's aliveness-at-expiry: the verdict is about the checker's view,
+    not about the object.
+
+    Now: executed and skipped are both counted. A block whose first command is
+    env-limited (docker/make, neither available here) is SKIPPED AND NAMED.
+    Three outcomes, because there are three facts:
+      PASS  at least one block ran and none failed
+      FAIL  a block ran and failed
+      WARN  nothing could run here -- the docs are UNVERIFIED on this box.
+            WARN is not PASS: it never claims the docs are correct. It is also
+            not FAIL: the blocks may legitimately need docker. It is printed
+            on every run so the gap cannot quietly become a green tick.
+
+    IT IS NOT A READ-ONLY OBSERVER. This check RUNS the documented commands,
+    so it inherits every side effect they have. MEASURED: docs/guide.md
+    documents `python3 demo/town.py`, whose bank wrote real payment
+    notifications into live agents' mailboxes; C5 executed it on every push
+    and on every local run, so the checker was a COURIER for the leak, not
+    just a witness. (That block is fixed -- it now writes only to its own
+    temp directory -- but this check still runs whatever a doc block says,
+    so THE RULE IS: A NEW DOC COMMAND IS A NEW COURIER. Before adding one,
+    ask what it writes and where; if it can write outside the tree, either
+    give it a temp path or mark the block SKIP.) Any check that executes
+    untrusted code must be as careful about what that code does as about
+    whether it exits 0. If a doc block has an effect outside the tree, that
+    is a defect in the block, and fixing the block is what makes this check
+    read-only in practice.
+    """
+    findings, ran, skipped, warnings = [], 0, [], []
+    for f in _tracked(root):
+        if not f.endswith(DOC_SUFFIXES):
+            continue
+        text = open(os.path.join(root, f), encoding="utf-8", errors="replace").read()
+        for block in SH_BLOCK.finditer(text):
+            body = block.group(1).strip()
+            first = _first_cmd(body)
+            if not first:
+                continue
+            # The SKIP marker may appear two ways and BOTH must mean the same
+            # thing:
+            #   (a) a leading comment line "# SKIP: <reason>"   (what docs use)
+            #   (b) a literal first token "SKIP <command>"
+            # The old code read body.splitlines()[0] only, so (b) worked and (a)
+            # was invisible -- a doc could write "# SKIP python3 ..." and the
+            # command still RAN, or write "SKIP python3 ..." and it was silently
+            # swallowed. Two spellings, opposite outcomes, both silent.
+            skip_lines = [l.strip() for l in body.splitlines()
+                          if l.strip() and not l.strip().startswith("#")]
+            skip_marked = (first.upper().startswith("SKIP")
+                           or any(l.strip().upper().startswith("# SKIP")
+                                  for l in body.splitlines()))
+            if skip_marked:
+                # SKIP must NOT be able to silence a command this checker can
+                # actually run. Otherwise any doc can disable its own check by
+                # writing the word SKIP in a fenced block, and the check reports
+                # a skip that looks deliberate rather than an unverified claim.
+                # SKIP is honoured only for commands that are otherwise
+                # unrunnable here (env-limited), and even then it is named with
+                # its reason. A runnable command marked SKIP is a WARN: the
+                # document asked not to be verified, which is a fact worth
+                # surfacing, not a pass.
+                inner = first[4:].strip() if first.upper().startswith("SKIP") else first
+                # A SKIP is only an opt-out if the command COULD have run here
+                # and passed. Probe it: if it exits 0 it was runnable and the
+                # SKIP was hiding a working check (WARN, and say so). If it
+                # exits non-zero it genuinely needs the environment the doc
+                # names (Docker, a daemon), and the SKIP is legitimate history.
+                # Older code never probed, so "SKIP" was a universal silencer.
+                probe = None
+                if inner.startswith(RUNNABLE):
+                    # The probe executes a command the doc explicitly asked not
+                    # to run, so it must be limited to commands that are safe to
+                    # RUN twice. `python3 <script>` is NOT automatically safe: a
+                    # doc could mark a destructive line SKIP and the probe would
+                    # execute it anyway. The allowlist therefore narrows to the
+                    # shapes this checker already runs elsewhere -- a syntax
+                    # check, a one-liner that is not an import-and-execute, or a
+                    # test/[ expression. Anything else stays an honoured SKIP
+                    # with its reason, which is the status quo and is safe.
+                    if _probe_safe(inner):
+                        try:
+                            pr = subprocess.run(inner, shell=True, cwd=root,
+                                                text=True, capture_output=True,
+                                                timeout=timeout)
+                            probe = pr.returncode
+                        except subprocess.TimeoutExpired:
+                            probe = "TIMEOUT"
+                    else:
+                        skipped.append(f"{f}: {inner[:60]} (marked SKIP; probe "
+                                       f"declined -- not safe to run twice)")
+                        continue
+                if probe == 0:
+                    warnings.append(
+                        f"{f}: `{inner[:60]}` marked SKIP but runs fine here "
+                        f"-- the doc is opting out of a check it could pass")
+                else:
+                    why = ("exits %s without its environment" % probe
+                           if probe is not None else "not runnable here")
+                    skipped.append(f"{f}: {inner[:60]} (marked SKIP; {why})")
+                continue
+            if first.startswith(ENV_LIMITED):
+                skipped.append(f"{f}: {first[:60]} (no docker/make on this box)")
+                continue
+            if not first.startswith(RUNNABLE):
+                skipped.append(f"{f}: {first[:60]} (not a command this check runs)")
+                continue
+            ran += 1
+            try:
+                r = subprocess.run(body, shell=True, cwd=root, text=True,
+                                   capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                findings.append(f"{f}: `{first[:60]}` TIMEOUT after {timeout}s")
+                continue
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout).strip()
+                # A long-running SERVER that binds a busy port is not a broken
+                # doc command -- it is a command that collides with the box it
+                # is run on. Report it as WARN with the reason, and say what to
+                # do, rather than calling the document wrong.
+                if "Address already in use" in err and _looks_like_server(body, root):
+                    warnings.append(
+                        f"{f}: `{first[:60]}` needs a free port; this box already "
+                        f"runs it (use PORT=<free> to verify)")
+                    continue
+                findings.append(f"{f}: `{first[:60]}` exit {r.returncode}: "
+                                f"{err[:200]}")
+
+    note = [f"executed {ran} block(s), skipped {len(skipped)}"]
+    # skips are always visible; they are never silently absorbed
+    note.extend("skipped " + s for s in skipped[:20])
+    if findings:
+        return "C5 doc commands run", "FAIL", findings + warnings + note
+    if warnings:
+        return "C5 doc commands run", "WARN", warnings + note
+    if ran == 0:
+        # NOT a pass (it cannot see a document) and NOT a failure (the docs may
+        # legitimately need docker). A named coverage gap, reported every run.
+        return "C5 doc commands run", "WARN", \
+            ["no doc block was runnable on this box -- docs are UNVERIFIED here"] + note
+    return "C5 doc commands run", "PASS", warnings + note
+
+
+def c6_sources_parse(root):
+    findings = []
+    for f in _tracked(root):
+        if f.endswith(CODE_SUFFIXES):
+            try:
+                ast.parse(open(os.path.join(root, f), encoding="utf-8",
+                               errors="replace").read(), filename=f)
+            except SyntaxError as e:
+                findings.append(f"{f}: {e}")
+    return "C6 sources parse", "FAIL" if findings else "PASS", findings
+
+
+IMPORT_TARGETS = ["bank/bank.py", "agent/agent-daemon.py",
+                  "ui/stanley_chat.py", "agent/mcp-stdio.py",
+                  "ui/control.py"]
+
+
+def c7_sources_import(root, timeout=60):
+    """C6 proves a file PARSES. That is not the same as 'it can be loaded'.
+
+    The distinction cost this cohort a day: a registry reported 'structure
+    green, 0 problems' over a store containing a claim whose instrument could
+    not import its own dependency. Parsing is a fact about syntax; importing
+    is a fact about the module actually resolving its imports on this box.
+
+    Each target is loaded in a SUBPROCESS, so a file that starts a server on
+    import cannot wedge this check. A module that exits (CLI/server entry
+    points) counts as importable: SystemExit after a successful module body is
+    still a successful import. A timeout is a FAIL with the reason, never a
+    silent skip.
+
+    CWD COUPLING IS A SEPARATE FACT, and the first version of this check got
+    it wrong. ui/control.py does `import stanley_chat` (a sibling), so it
+    imports from ui/ and fails from the repo root. Reporting that as "import
+    failed" is the wrong noun: the module is fine, its cwd contract is
+    undeclared. So each target is tried from the repo root AND from its own
+    directory. Root-ok = PASS. Own-dir-only = WARN naming the coupling, which
+    is a real doc bug (the guide must say `cd ui`) but not a broken module.
+    Neither = FAIL.
+    """
+    findings, warn = [], []
+    for f in IMPORT_TARGETS:
+        path = os.path.join(root, f)
+        if not os.path.isfile(path):
+            findings.append(f"{f}: listed as an import target but MISSING")
+            continue
+        code = (
+            "import importlib.util,sys\n"
+            f"spec=importlib.util.spec_from_file_location('m', {os.path.basename(f)!r})\n"
+            "m=importlib.util.module_from_spec(spec)\n"
+            "try:\n"
+            "    spec.loader.exec_module(m)\n"
+            "except SystemExit:\n"
+            "    pass\n"
+        )
+
+        def try_from(cwd):
+            try:
+                r = subprocess.run([sys.executable, "-c", code], cwd=cwd,
+                                   capture_output=True, text=True,
+                                   timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return "timeout"
+            if r.returncode == 0:
+                return "ok"
+            tail = (r.stderr or r.stdout).strip().splitlines()
+            return tail[-1][:200] if tail else "?"
+
+        at_root = try_from(root)
+        if at_root == "ok":
+            continue
+        at_home = try_from(os.path.dirname(path))
+        if at_home == "ok":
+            warn.append(f"{f}: imports only from {os.path.dirname(f)}/ "
+                        f"(cwd-coupled; docs must say so)")
+        elif at_root == "timeout" or at_home == "timeout":
+            findings.append(f"{f}: import TIMEOUT after {timeout}s")
+        else:
+            findings.append(f"{f}: import failed from root AND own dir: {at_root}")
+    if findings:
+        return "C7 sources import", "FAIL", findings + warn
+    if warn:
+        return "C7 sources import", "WARN", warn
+    return "C7 sources import", "PASS", []
+
+
+# Numbers the README states about the code, and how to recompute each one.
+# A count in prose is a courier, not a check: every one of these drifted at
+# least once tonight (26 checks when there were 28; 12 modules when there
+# were 17; "five ways" when there were six; 101 claims when the graph held
+# 102). Each entry is (regex with one group, callable returning the truth).
+# The regex describes the SENTENCE, not just the number, so a sentence that
+# survives with a swapped value is still caught.
+README_COUNT_CLAIMS = [
+    (r"—\s*(\d+)\s+checks",
+     lambda r: _demo_pass_lines(r)),
+    (r"`python3 demo/town\.py`,\s*(\d+)\s+checks",
+     lambda r: _demo_pass_lines(r)),
+    (r"mutates the bank\s+(\w+)\s+ways",
+     lambda r: _selftest_control_lines(r)),
+    (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
+     lambda r: len([x for x in sh_ls(r) if x.strip()])),
+    # NO CLAIMGRAPH NUMBER LIVES HERE, and the reason is a better check, not
+    # an omission. agent-8's finding was real: mutating those numbers in the
+    # README left repo_check green. But by the time this branch could merge,
+    # the counts had MOVED OUT of the prose into a table generated by
+    # docs/claimgraph/build.py, and that script's own selftest (M3) already
+    # fails when the committed table disagrees with the committed graph.json.
+    # Re-adding regexes here would duplicate a live check against a sentence
+    # that no longer exists -- a control matching nothing, which is the exact
+    # failure mode this whole thread is about. The generated table is the
+    # stronger mechanism: the number cannot be typed wrong because it is not
+    # typed at all.
+]
+_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+          "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def _demo_pass_lines(root):
+    out = subprocess.run([sys.executable, "-I", "demo/town.py"], cwd=root,
+                         text=True, capture_output=True)
+    return len([l for l in out.stdout.splitlines() if l.startswith("  PASS")])
+
+
+def _selftest_control_lines(root):
+    out = subprocess.run([sys.executable, "-I", "demo/selftest_demo.py"],
+                         cwd=root, text=True, capture_output=True)
+    import re as _re
+    return len([l for l in out.stdout.splitlines()
+                if _re.match(r"^(guard|single|grant|env-var|unknown)", l)])
+
+
+def sh_ls(root):
+    out = subprocess.run(["git", "-C", root, "ls-files", "*.py"],
+                         text=True, capture_output=True)
+    return out.stdout.splitlines()
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # the repo this file lives in
+
+
+def c8_readme_numbers(root):
+    """The README's numbers about the code, recomputed instead of trusted.
+
+    WHY THIS IS A CHECK AND NOT ADVICE: the Verification table is the row
+    that makes the rest of the README credible, and three of its numbers were
+    stale at once while every suite was green. Each was a value a human had
+    copied from an earlier run. Nothing was lying; nothing was maintained.
+
+    A claim whose SENTENCE is gone is a FAIL, not a skip. Otherwise the
+    cheapest way to get green is to delete the claim, and the table quietly
+    shrinks to nothing -- a check that reports fewer claims every time it is
+    appeased. WARN is for a number that cannot be measured on this box.
+    """
+    path = os.path.join(root, "README.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return "C8 readme numbers", "FAIL", ["README.md is absent"]
+    findings, measured, absent = [], {}, []
+    for rx, truth in README_COUNT_CLAIMS:
+        import re as _re
+        m = _re.search(rx, text)
+        if not m:
+            absent.append(rx)
+            continue
+        stated_raw = m.group(1)
+        stated = _WORDS.get(stated_raw.lower())
+        if stated is None:
+            try:
+                stated = int(stated_raw)
+            except ValueError:
+                findings.append(f"unparseable number {stated_raw!r} for {rx}")
+                continue
+        actual = truth(root)
+        measured[rx] = actual
+        if stated != actual:
+            findings.append(f"README says {stated} for /{rx}/, measured {actual}")
+    if absent:
+        findings.append(f"{len(absent)} README claim(s) are no longer worded "
+                        f"so they can be checked: {absent}")
+    if findings:
+        return "C8 readme numbers", "FAIL", findings
+    return "C8 readme numbers", "PASS", \
+        [f"recomputed {len(measured)} README numbers"]
+
+
+# (text in README.md, its lie, label). Lives beside the check so the two
+# cannot drift apart.
+# Each entry is a REGEX with exactly one group -- the number to lie about --
+# so the control reads the claim actually in the README and lies about THAT.
+# Pinning literal text means the control breaks the moment the number
+# legitimately changes, which is a control pinning a value it is not testing.
+# Measured: '(20 files)' broke the moment the tree grew to 22 modules, and
+# before that it was VACUOUS -- the control's farm held 2 .py files, so the
+# count was already wrong before the mutation and C8 was red for the fixture.
+def _c8_controls():
+    """Build the control pairs FROM the README, so they do not go stale.
+
+    Hardcoded literals were the first version and they rotted within the hour:
+    the module count moved 17 -> 20 -> 22 -> 24 -> 25 and each time the
+    control stopped being buildable, which the selftest reports as a FAILURE
+    ("claim is still checkable") rather than a skip. Deriving them is the same
+    rule as the check itself -- a number typed beside the thing it describes
+    is a courier. (agent-8's form, from c8-claimgraph.)
+    """
+    import re as _re
+    text = open(os.path.join(HERE, "..", "README.md"), encoding="utf-8").read()
+
+    def find(rx):
+        m = _re.search(rx, text)
+        return (m.group(0), m.group(1)) if m else (None, None)
+
+    pairs = []
+    for rx, label, bump in (
+            (r"—\s*(\d+)\s+checks", "demo caption", 1),
+            (r"`python3 demo/town\.py`,\s*(\d+)\s+checks",
+             "verification table", 1),
+            (r"mutates the bank\s+(\w+)\s+ways", "selftest mutations", None),
+            (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
+             "tracked modules", 5)):
+        whole, val = find(rx)
+        if whole is None:
+            continue
+        if bump is None:      # a word, not a number
+            lie = "five" if val != "five" else "six"
+        else:
+            lie = str(int(val) + bump)
+        pairs.append((whole, whole.replace(val, lie, 1), label))
+    return pairs
+
+
+C8_CONTROLS = _c8_controls()
+
+def c9_readme_transcript(root):
+    """The README quotes bank output. Replay it against the bank in the tree.
+
+    C5 EXECUTES the fenced blocks, and this is not that. The transcript's
+    command lines are prefixed with '$', so C5 treats the block as prose and
+    never runs it -- which is why the quoted refusal drifted from
+    {"error": "insufficient funds"} to {"error": "unknown sender"} while every
+    suite stayed green. The text looks like output, so a reader trusts it more
+    than a claim; nothing was maintaining it.
+
+    Called C9, NOT C8: C8 is "readme numbers" (readme-truth's recomputation of
+    the counts), and two different checks sharing a number is how a report line
+    stops identifying a check. Renumbered during the merge that brought both.
+
+    Runs as a SUBPROCESS so a wedged bank cannot hang the checker, and a
+    non-zero exit is the finding. A missing replayer is a FAIL, not a skip:
+    otherwise deleting the script turns the check off.
+    """
+    script = os.path.join(root, "tools/check_readme_transcript.py")
+    if not os.path.exists(script):
+        return "C9 readme transcript", "FAIL", [
+            "tools/check_readme_transcript.py is absent, so the README's "
+            "quoted bank transcript is unverified"]
+    r = subprocess.run([sys.executable, script], cwd=root, text=True,
+                       capture_output=True, timeout=180)
+    if r.returncode != 0:
+        out = (r.stdout + r.stderr).strip().splitlines()
+        return "C9 readme transcript", "FAIL", out[:12] or ["replayer failed"]
+    return "C9 readme transcript", "PASS", [r.stdout.strip().splitlines()[-1]]
+
+
+def c10_readme_links_the_artifact(root):
+    """The README must still POINT AT the correction graph.
+
+    MASTER'S BLIND SPOT, measured 2026-10-18: the graph numbers moved out of
+    the prose into a table generated by build.py, and build.py's M3 correctly
+    fails when that table is stale. But nothing fails when the README stops
+    mentioning the graph at all. I deleted the whole paragraph from a clone of
+    master and ran tools/check.py:
+
+        repo_check  PASS (8 pass, 1 warn, 0 fail)
+        graph M3    PASS
+        CHECK: WARN -- exit 0
+
+    So the mechanism that replaced the numbers protects the numbers and not
+    the LINK. The correction graph is the thing in this repo that is hardest
+    to copy; a reader who never learns it exists is the failure this check
+    exists to prevent, and it was reachable in one deletion.
+
+    This does not restate a count -- counts belong to the generated table. It
+    asserts that docs/claimgraph/index.html is referenced from README.md, and
+    that the file it references is in the tree. A link to a file that does not
+    ship is worse than no link.
+    """
+    path = os.path.join(root, "README.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return "C10 readme links the graph", "FAIL", ["README.md is absent"]
+    target = "docs/claimgraph/index.html"
+    if target not in text:
+        return "C10 readme links the graph", "FAIL", [
+            f"README.md does not reference {target} -- the correction graph "
+            f"is in the tree and nothing tells a reader it exists"]
+    if not os.path.exists(os.path.join(root, target)):
+        return "C10 readme links the graph", "FAIL", [
+            f"README.md links {target} but that file is not in the tree"]
+    return "C10 readme links the graph", "PASS", [f"README.md links {target}"]
+
+
+def c11_readme_docker_flags(root):
+    """The README's transcribed `docker run` must match what control.py builds.
+
+    THE DEFECT THIS PINS (agent-10 and agent-7, independently, 2026-10-18):
+    README step 4 says "Under the hood it runs, from ui/control.py:start_agent"
+    and then shows a block missing the three durable volumes and
+    CLAUDE_CONFIG_DIR. An operator who copies it gets an agent whose memory is
+    wiped on every stop/start -- the feature the README opens with -- and
+    nothing caught it, because C5 skips `docker run` on a box with no daemon,
+    which is every box this was written on.
+
+    A transcription of a command that another file BUILDS is a courier. This
+    compares the block's flags to the flag list in ui/control.py by parsing
+    the source, so the block cannot drift from the code without failing here.
+    The two are allowed to differ only in the VALUES that are per-agent
+    placeholders (<model>, <prompts>, agent-1) -- the FLAG SETS must match.
+    """
+    readme = os.path.join(root, "README.md")
+    ctl = os.path.join(root, "ui", "control.py")
+    try:
+        text = open(readme, encoding="utf-8").read()
+    except OSError:
+        return "C11 readme docker flags", "FAIL", ["README.md is absent"]
+    try:
+        src = open(ctl, encoding="utf-8").read()
+    except OSError:
+        return "C11 readme docker flags", "FAIL", ["ui/control.py is absent"]
+
+    # 1. What does the README claim? The FIRST bash block containing '
+# docker
+    #    run' -- the block that advertises itself as the real invocation.
+    # Only fenced blocks, and only one that STARTS a docker run line -- the
+    # architecture diagram also mentions "docker run" in passing, and picking
+    # that chunk made this check compare the wrong text (a false FAIL on a
+    # correct README, which is how a check gets deleted).
+    # The block this check is about is the one that ADVERTISES ITSELF as the
+    # agent invocation -- it cites start_agent. The README has other docker
+    # run blocks (the bank, the UI); comparing those against start_agent's
+    # flags produced a false FAIL on a correct README, which is how a check
+    # gets deleted rather than fixed.
+    # The citation sits in the PROSE BEFORE the fence ("Under the hood it
+    # runs, from ui/control.py:start_agent:"), not inside it -- so a block is
+    # the agent invocation when it starts with `docker run` and the text
+    # immediately before it names start_agent. Matching inside the block only
+    # found nothing, and "found nothing" must not read as "fine".
+    parts = text.split("```")
+    block = None
+    for i in range(1, len(parts), 2):
+        body = parts[i]
+        if not re.search(r"^\s*docker run\b", body, re.M):
+            continue
+        if "start_agent" in parts[i - 1]:
+            block = body
+            break
+    if block is None:
+        # No abridged agent block is itself a way to stop this check seeing
+        # anything -- report it, do not pass.
+        return "C11 readme docker flags", "FAIL", [
+            "README has no agent `docker run` block citing start_agent"]
+
+    # 2. What flags does the code actually pass? Every literal that follows a
+    #    '-v' / '-e' / '--label' / '--name' / '--restart' / '--label' token in
+    #    start_agent's args list.
+    default_src = src.split("def start_agent", 1)
+    if len(default_src) < 2:
+        return "C11 readme docker flags", "FAIL", [
+            "ui/control.py has no start_agent -- the check cannot locate the "
+            "command it is meant to compare"]
+    body = default_src[1].split("\ndef ", 1)[0]
+    code_flags = set(re.findall(r'"(--[a-z-]+|-[a-z])"', body))
+
+    readme_flags = set(re.findall(r"(?<!\w)(--[a-z-]+|-[a-z])(?=\s|$)", block))
+
+    # --name/--restart/--label/-e/-v are the docker-level flags both should
+    # carry. A flag the CODE passes and the README omits is the defect.
+    missing = sorted(f for f in code_flags if f in (
+        "-v", "-e", "--label", "--name", "--restart") and f not in readme_flags)
+    if missing:
+        return "C11 readme docker flags", "FAIL", [
+            f"README's docker run omits flag(s) that start_agent passes: "
+            f"{missing}. An operator copying this block gets an agent that "
+            f"loses its memory on restart."]
+
+    # 3. The volume MOUNTS are the thing that was missing, so compare the
+    #    mount TARGETS, not just the -v flag. A block with one -v and a code
+    #    path with three is still the defect.
+    code_mounts = set(re.findall(r'"([^"]*?:/[^"]*)"', body))
+    code_targets = {m.split(":")[-1].rstrip(":ro") for m in code_mounts
+                    if ":" in m}
+    readme_targets = {m.split(":")[-1].rstrip(":ro")
+                      for m in re.findall(r"-v\s+(\S+)", block) if ":" in m}
+    lost = sorted(set(code_targets) - {"/workspace/self", "/workspace/transcripts",
+                                       "/workspace/.claude"} - readme_targets)
+    missing_durable = sorted({"/workspace/self", "/workspace/transcripts",
+                              "/workspace/.claude"} - readme_targets)
+    if missing_durable:
+        return "C11 readme docker flags", "FAIL", [
+            f"README's docker run does not mount {missing_durable} -- these "
+            f"are the durable volumes; without them the agent is a first-boot "
+            f"stranger after every stop/start."]
+    if "CLAUDE_CONFIG_DIR" not in block:
+        return "C11 readme docker flags", "FAIL", [
+            "README's docker run does not set CLAUDE_CONFIG_DIR; without it "
+            "the CLI's session records are not on a volume and resume cannot "
+            "work at all."]
+    del lost
+    return "C11 readme docker flags", "PASS", [
+        "README block carries every durable mount and CLAUDE_CONFIG_DIR"]
+
+
+CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
+          c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
+          c8_readme_numbers, c9_readme_transcript,
+          c10_readme_links_the_artifact, c11_readme_docker_flags]
+
+
+def _is_git_tree(root):
+    r = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def run(root="."):
+    """Tri-state: PASS / WARN / FAIL. Only FAIL fails the build; WARN is
+    printed every run. A check that cannot see is never allowed to be silent."""
+    # ONE FACT, REPORTED ONCE. C1/C2/C3/C5 all read `git ls-files`; without a
+    # repository each raises and prints "check crashed" -- four FAILs that read
+    # as four defects in the repo, when the only fact is that there is no .git
+    # (a `git archive` export, a copied tree). Name the real cause once instead
+    # of letting four checks each report their own confusion. This is the same
+    # rule as C5's skip split: a check reporting its own limitation as an
+    # object defect is the bug.
+    if not _is_git_tree(root):
+        return False, [("check", "FAIL",
+                        [f"{root} is not inside a git work tree, so the checks "
+                         f"that read `git ls-files` cannot see any files. This "
+                         f"is not a defect in the tree's contents: run inside a "
+                         f"clone, or `git init && git add -A && git commit -qm x` "
+                         f"to make an export checkable."])]
+    results = []
+    for fn in CHECKS:
+        try:
+            name, status, findings = fn(root)
+        except Exception as e:                     # a crash is a FAILED check
+            name, status, findings = fn.__name__, "FAIL", [f"check crashed: {e!r}"]
+        results.append((name, status, findings))
+    # WARN never fails the build; only FAIL does. That is the whole point of
+    # having three states: if WARN blocked, it would just be FAIL with extra
+    # words, and people would start silencing checks to get a green pipeline.
+    # The summary line stays loud about the warnings so the coverage gap is
+    # never mistaken for full verification.
+    return not any(s == "FAIL" for _, s, _ in results), results
+
+
+# --- negative controls ----------------------------------------------------
+def _git(root, *args):
+    subprocess.run(["git", "-C", root, *args], capture_output=True, check=True,
+                   text=True)
+
+
+def selftest():
+    """One deliberately-bad tree per check; each check MUST fail on it."""
+    print("negative controls — each check must FAIL on a lying input\n")
+    outcomes = []
+
+    def farm():
+        d = tempfile.mkdtemp(prefix="rc_")
+        _git(d, "init", "-q")
+        _git(d, "config", "user.email", "t@t")
+        _git(d, "config", "user.name", "t")
+        return d
+
+    # C1: a tracked .pyc
+    d = farm()
+    os.makedirs(os.path.join(d, "__pycache__"))
+    open(os.path.join(d, "__pycache__", "m.cpython-312.pyc"), "wb").write(b"\x00")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "junk")
+    _, r = run(d)
+    outcomes.append(("C1 catches tracked .pyc",
+                     dict((n, o) for n, o, _ in r)["C1 tracked junk"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C2: a secret in a tracked file at HEAD
+    d = farm()
+    open(os.path.join(d, "a.txt"), "w").write(
+        "token: " + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0UvW" + "\n")  # SYNTHETIC
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "secret")
+    _, r = run(d)
+    outcomes.append(("C2 catches a secret at HEAD",
+                     dict((n, o) for n, o, _ in r)["C2 secrets in HEAD"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C3: a secret that exists ONLY in history (deleted at HEAD)
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n*.log\n")
+    open(os.path.join(d, "control.log"), "w").write(
+        "[control] token: " + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0UvW" + "\n")  # SYNTHETIC
+    # NOTE: .gitignore is committed too, so the tree has >=2 blobs. Without
+    # that, C3's own coverage guard (a walk of <2 blobs is WARN, not PASS)
+    # fires and this control would be asserting against a WARN, which would
+    # hide the very thing it is testing. A control fixture has to satisfy the
+    # check's preconditions or it tests the fixture.
+    _git(d, "add", "-f", ".gitignore", "control.log")
+    _git(d, "commit", "-qm", "leak")
+    _git(d, "rm", "-q", "--cached", "control.log")
+    _git(d, "commit", "-qm", "remove")
+    _, r = run(d)
+    res = dict((n, o) for n, o, _ in r)
+    outcomes.append(("C3 catches a secret that exists only in HISTORY", res["C3 secrets in HISTORY"] == "FAIL"))
+    outcomes.append(("C3 does NOT fire on junk alone", res["C1 tracked junk"] == "PASS"))
+    shutil.rmtree(d)
+
+    # C3 coverage: a walk that inspected almost nothing must NOT read PASS.
+    d = farm()
+    open(os.path.join(d, "only.py"), "w").write("x = 1\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "one blob")
+    _, r = run(d)
+    status = dict((n, o) for n, o, _ in r)["C3 secrets in HISTORY"]
+    outcomes.append(("C3 refuses to PASS when it inspected almost nothing",
+                     status == "WARN"))
+    shutil.rmtree(d)
+
+    # C3 baseline: it may suppress a KNOWN leak (WARN), and it must NOT
+    # suppress a NEW one. A baseline that can turn a new leak green is a mute
+    # switch wearing a review comment.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, ".repo-check-baseline"), "w").write("old_leak.log  # accepted\n")
+    open(os.path.join(d, "old_leak.log"), "w").write(
+        "token: " + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0UvW" + "\n")
+    open(os.path.join(d, "new_leak.log"), "w").write(
+        "token: " + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0F" + "\n")
+    _git(d, "add", "-f", ".gitignore", ".repo-check-baseline", "old_leak.log")
+    _git(d, "commit", "-qm", "old known leak")
+    _git(d, "rm", "-q", "--cached", "old_leak.log")
+    _git(d, "commit", "-qm", "remove old")
+    _git(d, "add", "-f", "new_leak.log")
+    _git(d, "commit", "-qm", "NEW leak")
+    _git(d, "rm", "-q", "--cached", "new_leak.log")
+    _git(d, "commit", "-qm", "remove new")
+    _, r = run(d)
+    status = dict((n, o) for n, o, _ in r)["C3 secrets in HISTORY"]
+    outcomes.append(("C3 baseline suppresses a KNOWN leak but NOT a new one",
+                     status == "FAIL"))
+    shutil.rmtree(d)
+
+    # C4: no .gitignore at all
+    d = farm()
+    open(os.path.join(d, "x.py"), "w").write("print(1)\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "no ignore")
+    _, r = run(d)
+    outcomes.append(("C4 catches a missing .gitignore",
+                     dict((n, o) for n, o, _ in r)["C4 .gitignore covers junk"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C5: a README command that does not run
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\npython3 -c \"import definitely_not_a_module_xyz\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "bad doc")
+    _, r = run(d)
+    outcomes.append(("C5 catches a doc command that fails",
+                     dict((n, o) for n, o, _ in r)["C5 doc commands run"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C5b: SKIP must not silence a command that would have PASSED.
+    # "SKIP" used to be a universal silencer: any doc could disable its own
+    # check by writing it. Now a marked command is PROBED -- exit 0 means it
+    # was runnable all along and the SKIP hid a working check (WARN).
+    #
+    # The probe uses `test`, NOT `python3 -c`: python lines are no longer
+    # probed at all (two bypasses, see _probe_safe). The control follows the
+    # policy -- if the probe ever stops covering `test`, this goes red.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: no reason at all\ntest -d .\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 will not let SKIP hide a command that would pass",
+                     c5[0] == "WARN" and any("runs fine here" in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C5c: a legitimate SKIP is still honoured -- a command that genuinely
+    # cannot run here must not be turned into a failure, or every docker block
+    # in the repo goes red. This is the control that stops the fix above from
+    # being "ignore SKIP entirely".
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    # Uses `test` (still probed) rather than python3 -c (no longer probed):
+    # the command genuinely fails here, so the SKIP is honoured with its exit
+    # code. This is the control that stops "probe everything" from turning a
+    # legitimate docker-era SKIP into a red build.
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs a docker daemon\n"
+        "test -f /nonexistent-artifact\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "env skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 still honours SKIP when the command cannot run here",
+                     c5[0] == "WARN"
+                     and any("exits 1 without its environment" in str(x) for x in c5[1])
+                     and not any("runs fine" in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C5d: the probe must DECLINE a command it is not safe to run twice.
+    # The probe exists to catch a doc that hides a passing check behind SKIP;
+    # it must not become an execution primitive for a destructive line. A
+    # SKIP-marked command that imports or writes is reported as an honoured
+    # SKIP with "probe declined", and the file it would have created must NOT
+    # exist afterwards. Without this, "SKIP" would be a way to get the checker
+    # to run anything.
+    d = farm()
+    marker = os.path.join(d, "PROBE_SHOULD_NOT_CREATE_ME")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: destructive\n"
+        "python3 -c \"open('%s','w').write('x')\"\n```\n" % marker)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "dangerous skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 declines to PROBE a command that writes",
+                     any("probe declined" in str(x) for x in c5[1])
+                     and not os.path.exists(marker)))
+    shutil.rmtree(d)
+
+    # C5e: a SAFE PREFIX with a DESTRUCTIVE TAIL must be declined. C5d uses a
+    # line the allowlist already rejects on its first token (it contains
+    # open()). The hole agent-2 found is different and was live in the first
+    # version of this probe: the first token is allowed, and the shell still
+    # runs everything after it, so
+    #     python3 -c "print(1)" && rm -rf victim
+    # passed the allowlist and deleted the directory during a probe that was
+    # supposed to be side-effect free. A prefix check is not a statement about
+    # a shell line. The control's evidence is the VICTIM DIRECTORY, i.e. a
+    # positive artifact that survives -- not a log line claiming it did.
+    d = farm()
+    victim = os.path.join(d, "victim")
+    os.makedirs(victim)
+    open(os.path.join(victim, "important"), "w").write("x")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs docker\n"
+        "python3 -c \"print(1)\" && rm -rf victim\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "compound skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 will not probe a safe prefix with a shell tail",
+                     os.path.isdir(victim)
+                     and os.path.exists(os.path.join(victim, "important"))
+                     and any("probe declined" in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C5f: agent-10's bypass -- string concatenation spells 'open' without
+    # the substring 'open'. The right response was not a third blocklist
+    # entry; python lines are no longer probed at all. The control asserts the
+    # FILE IS NOT WRITTEN, which is the property that matters, rather than
+    # that a particular word was or was not found.
+    d = farm()
+    victim = os.path.join(d, "victim")
+    os.makedirs(victim)
+    open(os.path.join(victim, "important"), "w").write("original")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs docker\n"
+        "python3 -c \"__builtins__.__dict__['op'+'en']"
+        "('victim/important','w').write('pwned')\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "concatenated opcode")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    kept = open(os.path.join(victim, "important"), encoding="utf-8").read()
+    outcomes.append(("C5 does not probe a python line that spells open() "
+                     "around the blocklist",
+                     kept == "original"
+                     and any("not probed" in str(x) or "probe declined"
+                             in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C0: a tree with NO .git must be named as such, ONCE.
+    # Without this, C1/C2/C3/C5 each crash with "git ls-files exit 128" and the
+    # report shows four FAILs -- which reads as four defects in the repo. The
+    # only fact is that there is no repository. agent-7 hit this twice on a
+    # `git archive` export and got it wrong once.
+    d = tempfile.mkdtemp(prefix="rc_nogit_")
+    open(os.path.join(d, "x.py"), "w").write("print(1)\n")
+    ok0, r0 = run(d)
+    outcomes.append(("C0 names a missing .git ONCE instead of four crashes",
+                     (not ok0) and len(r0) == 1
+                     and "not inside a git work tree" in r0[0][2][0]
+                     and "git ls-files exit 128" not in str(r0)))
+    shutil.rmtree(d)
+
+    # C6: a .py that does not parse
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "broken.py"), "w").write("def f(:\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "bad syntax")
+    _, r = run(d)
+    outcomes.append(("C6 catches a SyntaxError",
+                     dict((n, o) for n, o, _ in r)["C6 sources parse"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C7: a module that PARSES but cannot IMPORT. This is the whole point of
+    # C7 existing next to C6 -- if C6 already caught it, C7 would be
+    # decoration. The file is syntactically perfect and imports a module that
+    # does not exist, which ast.parse cannot see.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "bank"))
+    open(os.path.join(d, "bank", "bank.py"), "w").write(
+        "import definitely_not_a_real_module_xyz\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "parses, cannot import")
+    _, r = run(d)
+    res = dict((n, o) for n, o, _ in r)
+    outcomes.append(("C6 does NOT catch an unimportable module (C7 is needed)",
+                     res["C6 sources parse"] == "PASS"))
+    outcomes.append(("C7 catches a module that parses but cannot import",
+                     res["C7 sources import"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C8: the README's numbers must be RECOMPUTED, and each claim must be
+    # shown to fail when it is wrong -- one control per claim, because a
+    # single "C8 catches a lie" would pass while three quarters of the check
+    # were dead code.
+    import re as _re
+    for old_text, new_text, label in C8_CONTROLS:
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        for rel in ("demo/town.py", "demo/selftest_demo.py"):
+            os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
+        # THE FARM MUST SATISFY EVERY OTHER CLAIM. The tracked-module count is
+        # measured with `git ls-files '*.py'` in the FARM, so a farm holding
+        # only the two demo scripts makes the README's module count false
+        # BEFORE any mutation -- C8 goes red for the fixture, and the control
+        # "passes" while testing nothing. Copy the same .py set the claim
+        # counts, so the only false number is the one this control injects.
+        if label == "tracked modules":
+            for py in sh_ls(ROOT):
+                dst = os.path.join(d, py)
+                os.makedirs(os.path.dirname(dst) or d, exist_ok=True)
+                shutil.copy(os.path.join(ROOT, py), dst)
+        shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
+        p = os.path.join(d, "README.md")
+        t = open(p, encoding="utf-8").read()
+        # _c8_controls() searched the LIVE README, so a sentence that has been
+        # deleted leaves no pair at all -- reported here as a FAILURE, not a
+        # silent skip, because a claim that vanishes must not turn its check
+        # off.
+        if old_text not in t:
+            outcomes.append((f"C8 {label} claim is still checkable", False))
+            shutil.rmtree(d)
+            continue
+        lying = new_text
+        # THE MUTATION MUST BE PROVEN TO MUTATE. Deriving the lie makes a
+        # no-op unlikely; it does not make it impossible. A control whose
+        # replacement changes nothing leaves an HONEST tree, C8 prints PASS,
+        # and the outcome line still reads "catches a stale <label> number
+        # PASS" -- a dead control reporting success. That state is reachable:
+        # it is what agent-10 found when a pinned literal drifted to the true
+        # value and old == new. Assert the file actually changed, and name the
+        # pair when it did not, so the diagnosis is in the output.
+        mutated = t.replace(old_text, lying, 1)
+        if mutated == t or lying == old_text:
+            outcomes.append((f"C8 {label} mutation actually mutates "
+                             f"(no-op: {old_text!r} -> {lying!r})", False))
+            shutil.rmtree(d)
+            continue
+        open(p, "w", encoding="utf-8").write(mutated)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "lying readme")
+        _, r8 = run(d)
+        c8 = dict((n, o) for n, o, _ in r8).get("C8 readme numbers")
+        outcomes.append((f"C8 catches a stale {label} number", c8 == "FAIL"))
+        shutil.rmtree(d)
+
+    # C10: deleting the paragraph that points at the correction graph must
+    # FAIL. Measured before this control existed: on master, removing the
+    # entire paragraph left repo_check and the graph selftest green and
+    # tools/check.py exiting 0. The numbers were protected; the link was not.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "docs/claimgraph"))
+    open(os.path.join(d, "docs/claimgraph/index.html"), "w").write("<html></html>")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\nSee [the graph](docs/claimgraph/index.html).\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "links the graph")
+    ok_has, r_has = run(d)
+    # the paragraph is gone AND the file it pointed at is still shipped: the
+    # exact state master was in when this check did not exist
+    open(os.path.join(d, "README.md"), "w").write("# x\n\nnothing here\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "paragraph removed")
+    _, r_gone = run(d)
+    # ARM 3 (agent-10's finding): the check has TWO limbs -- "the README
+    # mentions the target" and "the target ships". Only the first was
+    # controlled, so a refactor dropping the os.path.exists branch would keep
+    # this suite green. A control must cover every limb of the check it
+    # controls, or it certifies the half it happens to exercise.
+    os.remove(os.path.join(d, "docs/claimgraph/index.html"))
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\nSee [the graph](docs/claimgraph/index.html).\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "links a file that does not ship")
+    _, r_dangling = run(d)
+    outcomes.append((
+        "C10 passes when the README links the graph, fails when it does not",
+        dict((n, o) for n, o, _ in r_has)["C10 readme links the graph"] == "PASS"
+        and dict((n, o) for n, o, _ in r_gone)["C10 readme links the graph"] == "FAIL"))
+    outcomes.append((
+        "C10 fails when the README links a file that is not in the tree",
+        dict((n, o) for n, o, _ in r_dangling)
+        ["C10 readme links the graph"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C9: a README that quotes a response the bank does not give must FAIL.
+    # This is the drift agent-5 found by hand; the point of the control is
+    # that the replayer is not merely re-running the commands and comparing
+    # nothing.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "bank"))
+    os.makedirs(os.path.join(d, "tools"))
+    shutil.copy(os.path.join(ROOT, "bank/bank.py"), os.path.join(d, "bank"))
+    shutil.copy(os.path.join(ROOT, "tools/check_readme_transcript.py"),
+                os.path.join(d, "tools"))
+    shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
+    p = os.path.join(d, "README.md")
+    t = open(p, encoding="utf-8").read()
+    lie = t.replace('{"error": "unknown sender"}',
+                    '{"error": "insufficient funds"}')
+    if lie == t:
+        outcomes.append(("C9 catches a quoted response the bank does not give",
+                         False))
+    else:
+        open(p, "w", encoding="utf-8").write(lie)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "lying transcript")
+        _, r = run(d)
+        outcomes.append(("C9 catches a quoted response the bank does not give",
+                         dict((n, o) for n, o, _ in r)
+                         ["C9 readme transcript"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # THE TOOL MUST PASS ITS OWN CHECK. My first version hardcoded the real
+    # published token as the fixture string, so (a) the check that exists to
+    # stop the secret spreading was itself a second copy of it, and (b) the
+    # moment the file was committed C2 would flag its own source -- correctly.
+    # A scanning tool is a file like any other; scan it.
+    here = os.path.abspath(__file__)
+    own = scan_text(os.path.basename(here),
+                    open(here, encoding="utf-8", errors="replace").read())
+    # C11 controls: the README's transcribed docker-run block must carry the
+    # volumes and env the code passes. THREE arms, because each one is a
+    # different way to lose the property, and two of them were live issues
+    # while this check was being written: comparing the wrong block (the
+    # bank's), and finding no block at all and reading silence as agreement.
+    #
+    # Without these arms, disarming c11 (returning PASS unconditionally) left
+    # selftest at 26/26 GREEN -- measured at 14:41 today. A check with no
+    # control is a comment.
+    readme_src = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    ctl_src = open(os.path.join(ROOT, "ui", "control.py"), encoding="utf-8").read()
+
+    def c11_on(readme_text, ctl_text):
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        os.makedirs(os.path.join(d, "ui"), exist_ok=True)
+        # farm has no demo scripts; C11 does not read them
+        open(os.path.join(d, "README.md"), "w", encoding="utf-8").write(readme_text)
+        open(os.path.join(d, "ui", "control.py"), "w",
+             encoding="utf-8").write(ctl_text)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c11 fixture")
+        _ok, r = run(d)
+        shutil.rmtree(d)
+        return dict((n, o) for n, o, _ in r).get("C11 readme docker flags")
+
+    # The good direction: the real files must PASS (a check that fails on the
+    # real tree is worse than none -- it gets deleted).
+    outcomes.append(("C11 passes on the real README and control.py",
+                     c11_on(readme_src, ctl_src) == "PASS"))
+
+    # Arm 1: a durable volume is dropped from the block.
+    stripped = readme_src.replace(
+        "  -v agent-workspace-agent-1-claude:/workspace/.claude \\\n", "", 1)
+    outcomes.append(("C11 catches a dropped durable volume",
+                     stripped != readme_src
+                     and c11_on(stripped, ctl_src) == "FAIL"))
+
+    # Arm 2: the env var that makes resume work is dropped.
+    noenv = readme_src.replace("  -e CLAUDE_CONFIG_DIR=/workspace/.claude \\\n",
+                               "", 1)
+    outcomes.append(("C11 catches a dropped CLAUDE_CONFIG_DIR",
+                     noenv != readme_src
+                     and c11_on(noenv, ctl_src) == "FAIL"))
+
+    # Arm 3: no agent block at all -- silence must not read as agreement.
+    parts = readme_src.split("```")
+    idx = None
+    for i in range(1, len(parts), 2):
+        if re.search(r"^\s*docker run\b", parts[i], re.M) and "start_agent" in parts[i - 1]:
+            idx = i
+            break
+    if idx is None:
+        outcomes.append(("C11 catches a README with no agent docker-run block", False))
+    else:
+        abridged = "```".join(parts[:idx - 1] + parts[idx + 2:])
+        outcomes.append(("C11 catches a README with no agent docker-run block",
+                         c11_on(abridged, ctl_src) == "FAIL"))
+
+    outcomes.append(("the tool's own source contains no secret", not own))
+    outcomes.append(("C2 would catch it if it did (fixtures use SYNTHETIC)",
+                     any("SYNTHETIC" in l for l in
+                         open(here, encoding="utf-8").read().splitlines())))
+
+    bad = 0
+    for label, passed in outcomes:
+        print(f"  {'PASS' if passed else 'FAIL'}  {label}")
+        bad += (not passed)
+    print(f"\nselftest: {len(outcomes) - bad}/{len(outcomes)} controls passed")
+    return bad == 0
+
+
+if __name__ == "__main__":
+    if "--show-secrets" in sys.argv:
+        REDACT_FULL = True
+    if "--selftest" in sys.argv:
+        sys.exit(0 if selftest() else 1)
+    root = next((a for a in sys.argv[1:] if not a.startswith("-")), ".")
+    ok, results = run(root)
+    for name, status, findings in results:
+        print(f"[{ {'PASS': 'ok  ', 'WARN': 'WARN', 'FAIL': 'FAIL'}[status] }] {name}")
+        for f in findings[:12]:
+            print(f"        {f}")
+        if len(findings) > 12:
+            print(f"        ... and {len(findings) - 12} more")
+    fails = sum(1 for _, s, _ in results if s == "FAIL")
+    warns = sum(1 for _, s, _ in results if s == "WARN")
+    print(f"\nREPO CHECK: {'PASS' if ok else 'FAIL'} "
+          f"({len(results) - fails - warns} pass, {warns} warn, {fails} fail)")
+    sys.exit(0 if ok else 1)

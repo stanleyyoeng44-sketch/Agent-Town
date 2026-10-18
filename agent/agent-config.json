@@ -1,0 +1,12 @@
+{
+  "_comment": "Operator config, baked into the image at /app/agent-config.json. The agent runs as the unprivileged 'agent' user, so it can read but never write this file. model: null means use the AGENT_MODEL env var (set per-container by the control UI). system_prompt_file: use this file as the ENTIRE system prompt, replacing Claude Code's built-in one — edit 'system prompt.md' next to the Dockerfile and rebuild. Set it to null to keep the built-in prompt. disallowed_tools: bare name removes the tool entirely, 'Bash(rm *)' style keeps the tool but blocks matching calls. strict_mcp_config true = only the mcp_servers from /app/mcp.json load.",
+  "model": null,
+  "system_prompt_file": "/app/system-prompt.txt",
+  "system_prompt_append": "",
+  "tools_preset": null,
+  "allowed_tools": [],
+  "disallowed_tools": [],
+  "skills": null,
+  "strict_mcp_config": true,
+  "extra_env": {}
+}

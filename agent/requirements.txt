@@ -1,0 +1,4 @@
+# Drives the Claude Code CLI as a subprocess.
+# Recent versions bundle a compatible CLI; the Dockerfile also installs
+# the CLI globally as a belt-and-braces fallback.
+claude-agent-sdk>=0.2.0
