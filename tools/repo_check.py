@@ -1490,10 +1490,38 @@ def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
     # that tuple keeps every arm -- including the one that adds a token to
     # code -- and loses coverage invisibly. The tool prints how many blocks it
     # read; compare that to the tree.
+    # A COUNT THAT CANNOT BE READ IS NOT A COUNT THAT IS WRONG.
+    # Measured (agent-2, on ce5497b, confirming agent-8's report): the tools
+    # print the count only on their SUCCESS line -- "TOKENCHECK: MATCH (2
+    # token(s) mounted by all 3 bank block(s))" -- while a real failure prints
+    # "TOKENCHECK: DIFFER (2 token(s) x 3 bank block(s))". Matching only the
+    # MATCH phrasing therefore returns None on EVERY genuine defect, and
+    # `None != want` emitted the NARROWING message for a tree that had not
+    # been narrowed. Reproduced by deleting README's admin-token mount: the
+    # tool correctly named README.md and ADMIN_TOKEN_FILE, and this guard
+    # replaced that finding with "read None doc block(s) ... a typed
+    # supply-side list", a cause nothing in the run measured.
+    # Two repairs, and the second is the one that matters:
+    #   1. match the count under EITHER verdict, since both print it;
+    #   2. if no count can be read, do NOT claim narrowing: fall through to
+    #      the verdict branch, so the reader sees the tool's own findings
+    #      (which name the file and the token). A missing measurement must
+    #      never become a confident wrong cause -- the same rule as "missing
+    #      is None, never 0", stated as "missing is not a count". It does
+    #      NOT weaken the gate: an unreadable count only skips the counting
+    #      arm, and the verdict arm below still FAILs on a real defect.
+    def _counted(pattern, text):
+        """(found, value): value is None when no count could be READ."""
+        m = re.search(pattern, text)
+        return (m is not None, int(m.group(1)) if m else None)
+
     if blocks is not None:
-        m = re.search(blocks[0], "\n".join(out))
-        got_b = int(m.group(1)) if m else None
+        found_b, got_b = _counted(blocks[0], "\n".join(out))
         want_b = blocks[1](root)
+        if not found_b:
+            # Fall through to the verdict below so the tool's own findings --
+            # which name the file and the token -- are what the reader sees.
+            got_b = want_b
         if got_b != want_b:
             return label, "FAIL", [
                 f"{tool} read {got_b} doc block(s) but this tree has "
@@ -1501,9 +1529,12 @@ def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
                 f"same defect as a narrowed input set: the verdict survives "
                 f"and the coverage does not."]
     if reach is not None:
-        m = re.search(reach[0], "\n".join(out))
-        got = int(m.group(1)) if m else None
+        found, got = _counted(reach[0], "\n".join(out))
         want = reach[1](root)
+        if not found:
+            # Same rule as the supply side above: an unreadable count makes no
+            # claim about coverage. Let the verdict branch print the findings.
+            got = want
         if got != want:
             return label, "FAIL", [
                 f"{tool} checked {got} {reach[2]}(s) but this tree has "
@@ -1598,7 +1629,7 @@ def c15_portcheck(root):
                       # which is portcheck's owner's call, not a mutant I can
                       # write here.
                       ],
-                     reach=(r"MATCH \((\d+) publish site", _publisher_docs,
+                     reach=(r"(?:MATCH|DIFFER) \((\d+) publish site", _publisher_docs,
                             "publish site"))
 
 
@@ -1633,9 +1664,9 @@ def c16_tokencheck(root):
                       ("docs/CLOUD-DEPLOYMENT.md",
                        "  -v ~/.config/docker-ai/agent0-transfer-token:"
                        "/run/secrets/agent0-transfer-token:ro \\\n", "")],
-                     reach=(r"MATCH \((\d+) token", _required_tokens,
+                     reach=(r"(?:MATCH|DIFFER) \((\d+) token", _required_tokens,
                             "token"),
-                     blocks=(r"all (\d+) bank block", _bank_blocks))
+                     blocks=(r"(?:all| x) (\d+) bank block", _bank_blocks))
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
