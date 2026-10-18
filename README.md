@@ -267,7 +267,7 @@ Claims in this README and how they were checked:
 | Claim | Checked how |
 |---|---|
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 26 checks, exit 0, no Docker |
-| **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank five ways and requires the demo to go red each time |
+| **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
 | Every `.py` file here parses | `ast.parse` on all tracked modules — all OK |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |

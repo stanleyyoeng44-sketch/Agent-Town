@@ -6,6 +6,9 @@ the colours are driven by the lines themselves, so a FAIL in the capture is
 red in the image and a check that disappears from the demo disappears from
 the picture.
 
+Emits BOTH <out>.png (what GitHub renders) and <out>.svg (the same lines as
+real <text>, so the claim is checkable with grep rather than by eye).
+
 DEPENDENCY: matplotlib, for its bundled DejaVu Sans Mono. This agent image
 has NO system fonts and no cairo, so a rasteriser like cairosvg/resvg
 renders every glyph invisible -- use matplotlib. matplotlib is NOT in the
@@ -94,10 +97,6 @@ def main():
             fontfamily=FONT, ha="center", va="center", zorder=2)
 
     y = 1 - bar_h - top_in / fig_h
-    # the two lines that carry the whole point of the artifact
-    highlight = ("bank wrote its payment notice to the DEMO mailbox, not live",
-                 "demo wrote nothing into the real /shared/mailbox",
-                 "memory crossed the sleep boundary")
     for line in lines:
         ax.text(0.022, y, line, color=classify(line), fontsize=fs,
                 fontfamily=FONT, ha="left", va="top", zorder=2)
@@ -105,7 +104,34 @@ def main():
 
     fig.savefig(base + ".png", facecolor=BG, dpi=110)
     plt.close(fig)
-    print(f"wrote {base}.png  ({len(lines)} lines)")
+
+    # Also emit an SVG with every line as real <text>. The PNG is what GitHub
+    # renders; the SVG is the version a person or a diff can actually READ, so
+    # the claim "the picture cannot show a check the demo no longer prints"
+    # is checkable with grep instead of by eye.
+    import html as _html
+    W, LH, PX, PT = 980, 20, 22, 58
+    H = PT + LH * len(lines) + 26
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+           f'viewBox="0 0 {W} {H}">',
+           f'<rect width="{W}" height="{H}" rx="10" fill="{BG}"/>',
+           f'<rect width="{W}" height="38" rx="10" fill="{BAR}"/>',
+           f'<rect y="28" width="{W}" height="10" fill="{BAR}"/>']
+    for i, c in enumerate(("#e2607a", "#e0b23c", "#54d18b")):
+        out.append(f'<circle cx="{22 + i * 20}" cy="19" r="6" fill="{c}"/>')
+    out.append(f'<text x="{W/2}" y="24" fill="{DIM}" font-family="{FONT}" '
+               f'font-size="12" text-anchor="middle">'
+               f'{_html.escape(title)}</text>')
+    y = PT
+    for line in lines:
+        out.append(f'<text xml:space="preserve" x="{PX}" y="{y}" '
+                   f'fill="{classify(line)}" font-family="{FONT}" '
+                   f'font-size="13">{_html.escape(line)}</text>')
+        y += LH
+    out.append("</svg>")
+    with open(base + ".svg", "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"wrote {base}.png and {base}.svg  ({len(lines)} lines)")
 
 
 if __name__ == "__main__":
