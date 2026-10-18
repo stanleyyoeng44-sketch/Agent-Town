@@ -22,16 +22,20 @@ Usage (from the daemon):
 
 import json
 import os
+import re
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
-    CallToolRequest,
+    CallToolRequestParams,
     CallToolResult,
-    ListToolsRequest,
     ListToolsResult,
+    PaginatedRequestParams,
     TextContent,
     Tool,
 )
@@ -39,18 +43,26 @@ from mcp.types import (
 RESTART_FLAG = "/tmp/restart-requested"
 SHARED = "/shared"
 MAILBOX = os.path.join(SHARED, "mailbox")
+HUMAN_OUTBOX = "/workspace/human/outbox"
+BANK_URL = os.environ.get("BANK_URL", "http://host.docker.internal:8790")
+AGENT_NAME_RE = re.compile(r"^(?:agent-[0-9]+|glm-agent)$")
 
 
 def peers(my_name):
     try:
         return sorted(d for d in os.listdir(MAILBOX)
-                      if os.path.isdir(os.path.join(MAILBOX, d)) and d != my_name)
+                      if AGENT_NAME_RE.fullmatch(d)
+                      and os.path.isdir(os.path.join(MAILBOX, d))
+                      and d != my_name)
     except OSError:
         return []
 
 
 def main():
     my_name = os.environ.get("AGENT_NAME", "agent")
+    # Only agent-0 exposes the human-facing tool. The UI reads the
+    # delegate's private workspace, never the peer-shared volume.
+    is_delegate = my_name == "agent-0"
     server = Server("life-cycle")
 
     async def handle_list_tools(ctx, params) -> ListToolsResult:
@@ -95,7 +107,61 @@ def main():
                     ),
                     inputSchema={"type": "object", "properties": {}},
                 ),
-            ],
+                Tool(
+                    name="check_money",
+                    description=(
+                        "Check how many coins you have in your bank "
+                        "account. Your account automatically loses 1 coin "
+                        "per minute; transfers move coins between agents."
+                    ),
+                    inputSchema={"type": "object", "properties": {}},
+                ),
+                Tool(
+                    name="send_money",
+                    description=(
+                        f"Transfer coins from your account to another "
+                        f"agent's. You are '{my_name}'. The amount must "
+                        "be a positive integer you can afford; the bank "
+                        "rejects overdrafts. The recipient is notified "
+                        "through their mailbox. Money is scarce: you "
+                        "lose 1 coin per minute, so spend deliberately."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "recipient": {
+                                "type": "string",
+                                "description": "the receiving agent's name",
+                            },
+                            "amount": {
+                                "type": "integer",
+                                "description": "coins to send (>= 1)",
+                            },
+                        },
+                        "required": ["recipient", "amount"],
+                    },
+                ),
+            ] + ([Tool(
+                name="talk_to_stanley",
+                description=(
+                    "Send a message to Stanley, the human operator. "
+                    "Stanley reads it in the UI. Use this to report to "
+                    "them, ask them things, or relay what the agents are "
+                    "doing. Their replies arrive as messages from "
+                    "Stanley. This is your ONLY channel to "
+                    "Stanley — no other agent has one."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "what to say to Stanley",
+                        }
+                    },
+                    "required": ["message"],
+                },
+            )] if is_delegate else [])
         )
 
     async def handle_call_tool(ctx, params) -> CallToolResult:
@@ -114,6 +180,9 @@ def main():
             if not recipient or not message:
                 return CallToolResult(content=[TextContent(
                     type="text", text="error: recipient and message required")])
+            if not AGENT_NAME_RE.fullmatch(recipient):
+                return CallToolResult(content=[TextContent(
+                    type="text", text="error: recipient must be an agent")])
             if recipient == my_name:
                 return CallToolResult(content=[TextContent(
                     type="text", text="error: that's your own name")])
@@ -131,6 +200,89 @@ def main():
                 type="text",
                 text=f"Message delivered to {recipient}'s mailbox; "
                      "it will reach them at their next safe point.")])
+        if name == "check_money":
+            try:
+                with urllib.request.urlopen(
+                        f"{BANK_URL}/balance/{my_name}", timeout=10) as r:
+                    data = json.loads(r.read())
+                return CallToolResult(content=[TextContent(
+                    type="text",
+                    text=f"You have {data['money']} coins.",
+                )])
+            except urllib.error.HTTPError as e:
+                return CallToolResult(content=[TextContent(
+                    type="text", text=f"bank error: {e.code}")])
+            except OSError as e:
+                return CallToolResult(content=[TextContent(
+                    type="text", text=f"bank unreachable: {e}")])
+        if name == "send_money":
+            recipient = str(args.get("recipient", "")).strip()
+            amount = args.get("amount")
+            if (isinstance(amount, bool) or not isinstance(amount, int)
+                    or amount < 1):
+                return CallToolResult(content=[TextContent(
+                    type="text", text="error: amount must be a positive integer")])
+            if recipient == my_name:
+                return CallToolResult(content=[TextContent(
+                    type="text", text="error: cannot send money to yourself")])
+            payload = json.dumps({"from": my_name, "to": recipient,
+                                  "amount": amount}).encode()
+            headers = {"Content-Type": "application/json"}
+            if is_delegate:
+                try:
+                    with open("/app/agent0-transfer-token", encoding="utf-8") as f:
+                        headers["X-Agent0-Token"] = f.read().strip()
+                except OSError:
+                    return CallToolResult(content=[TextContent(
+                        type="text", text="delegate transfer credential unavailable")])
+            req = urllib.request.Request(
+                f"{BANK_URL}/transfer", data=payload, method="POST",
+                headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read())
+                return CallToolResult(content=[TextContent(
+                    type="text",
+                    text=f"Sent {amount} coins to {recipient}. You now "
+                         f"have {data['money']} coins. They were notified "
+                         "via their mailbox.",
+                )])
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = json.loads(e.read()).get("error", str(e.code))
+                except Exception:
+                    detail = str(e.code)
+                return CallToolResult(content=[TextContent(
+                    type="text", text=f"transfer failed: {detail}")])
+            except OSError as e:
+                return CallToolResult(content=[TextContent(
+                    type="text", text=f"bank unreachable: {e}")])
+        if name == "talk_to_stanley":
+            if not is_delegate:
+                return CallToolResult(content=[TextContent(
+                    type="text",
+                    text="error: only the delegate agent may contact Stanley")])
+            message = str(args.get("message", "")).strip()
+            if not message:
+                return CallToolResult(content=[TextContent(
+                    type="text", text="error: message required")])
+            try:
+                os.makedirs(HUMAN_OUTBOX, exist_ok=True)
+                message_id = uuid.uuid4().hex
+                path = os.path.join(HUMAN_OUTBOX, f"{time.time_ns()}-{message_id}.msg")
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"id": message_id, "text": message}, f)
+                    f.write("\n")
+                os.replace(tmp, path)
+            except OSError as e:
+                return CallToolResult(content=[TextContent(
+                    type="text", text=f"error: {e}")])
+            return CallToolResult(content=[TextContent(
+                type="text",
+                text="Queued for Stanley in your private outbox. "
+                     "Their replies arrive through your private inbox.",
+            )])
         if name == "restart":
             with open(RESTART_FLAG, "w") as f:
                 f.write(str(time.time()))
@@ -143,9 +295,9 @@ def main():
         raise ValueError(f"unknown tool: {name}")
 
     server.add_request_handler(
-        "tools/list", ListToolsRequest, handle_list_tools)
+        "tools/list", PaginatedRequestParams, handle_list_tools)
     server.add_request_handler(
-        "tools/call", CallToolRequest, handle_call_tool)
+        "tools/call", CallToolRequestParams, handle_call_tool)
 
     import anyio
 

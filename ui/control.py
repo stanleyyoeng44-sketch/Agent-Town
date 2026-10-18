@@ -16,19 +16,49 @@ Talks to Docker via the docker CLI (subprocess). Responsibilities:
 No frameworks: stdlib only.
 """
 
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import stanley_chat
 
 UI_DIR = os.path.dirname(os.path.abspath(__file__))
 PROMPTS_DIR = os.path.join(UI_DIR, "prompts")
 IMAGE = os.environ.get("AGENT_IMAGE", "agent-glm")
 PORT = int(os.environ.get("CONTROL_PORT", "8080"))
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,60}$")
+PRIVATE_DIR = Path.home() / ".config" / "docker-ai"
+CONTROL_TOKEN_FILE = PRIVATE_DIR / "control-token"
+BANK_ADMIN_TOKEN_FILE = PRIVATE_DIR / "bank-admin-token"
+_agent_chat_lock = threading.Lock()
+
+
+def ensure_token(path):
+    PRIVATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.exists():
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secrets.token_urlsafe(32) + "\n")
+    return path.read_text(encoding="utf-8").strip()
+
+
+CONTROL_TOKEN = ensure_token(CONTROL_TOKEN_FILE)
+
+
+def agent0_online():
+    return agent_running("agent-0")
 
 
 def run_docker(args, input_text=None, timeout=30):
@@ -79,7 +109,7 @@ def start_agent(name, model="deepseek-v4.1-flash"):
         else:
             with open(prompt_path(name), "w") as f:
                 f.write("You are a docker agent.\n")
-    ok, out, err = run_docker([
+    args = [
         "run", "-d", "--name", name, "--restart", "unless-stopped",
         "--label", "agent.ui=1",
         "--label", "agent.model=" + model,
@@ -87,7 +117,13 @@ def start_agent(name, model="deepseek-v4.1-flash"):
         "-e", f"AGENT_MODEL={model}",
         "-v", "agent-mailbox:/shared",
         "-v", f"{prompt_path(name)}:/app/system-prompt.txt:ro",
-        IMAGE])
+    ]
+    if name == "agent-0":
+        transfer_token = PRIVATE_DIR / "agent0-transfer-token"
+        if not transfer_token.is_file():
+            return False, "agent-0 transfer token is missing"
+        args.extend(["-v", f"{transfer_token}:/app/agent0-transfer-token:ro"])
+    ok, out, err = run_docker(args + [IMAGE])
     return ok, (out.strip() if ok else err.strip())
 
 
@@ -103,6 +139,101 @@ def container_write(name, path, text):
         ["exec", "-i", name, "sh", "-c", f"cat > {path}"],
         input_text=text)
     return ok, err
+
+
+CONTAINER_SYSTEM_PROMPT = "/app/system-prompt.txt"
+CONTAINER_CONFIG = "/app/agent-config.json"
+
+
+def prompt_config_mode(name):
+    """How the daemon's config wires the system prompt, read from the
+    container: 'file' (this file IS the whole prompt), 'append' (glued
+    onto the CLI built-in), 'builtin' (file ignored) or None (unknown)."""
+    ok, out, _ = run_docker(["exec", name, "cat", CONTAINER_CONFIG])
+    if not ok:
+        return None
+    try:
+        cfg = json.loads(out)
+    except ValueError:
+        return None
+    if cfg.get("system_prompt_file"):
+        return "file"
+    if cfg.get("system_prompt_append"):
+        return "append"
+    return "builtin"
+
+
+# Transcript events that represent something delivered TO the agent.
+INBOX_EVENT_KINDS = ("peer-message", "human-message", "task")
+
+
+def read_pending(name):
+    """Messages waiting in the shared mailbox, not yet picked up by the
+    daemon's feed_chat loop (which deletes them on delivery). Read-only:
+    the files stay where they are."""
+    if not NAME_RE.match(name):
+        return []
+    ok, out, _ = run_docker([
+        "exec", name, "sh", "-c",
+        f"cat /shared/mailbox/{name}/incoming/*.msg 2>/dev/null"])
+    if not ok or not out.strip():
+        return []
+    # `cat` of several JSON files concatenated: split on object boundaries
+    # between "}" and "{" (same trick as _drain_stanley_outbox).
+    pending = []
+    for chunk in re.split(r"(?<=\})\s*(?=\{)", out):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            msg = json.loads(chunk)
+        except ValueError:
+            continue
+        text = (msg.get("text") or "").strip()
+        if text:
+            pending.append({"sender": msg.get("from", "unknown"),
+                            "time": msg.get("time", ""), "text": text,
+                            "kind": "pending", "life": None})
+    return pending
+
+
+def list_inbox(name, cursor=None, limit=30):
+    """Most-recent-first feed of everything delivered to this agent,
+    rebuilt from the per-life transcripts (the daemon deletes mailbox
+    files on delivery, so the transcripts are the only durable record).
+    `cursor` is the position of the last item already shown
+    ("<life-id>:<line-no>"); returns up to `limit` older items plus the
+    next cursor (None when the oldest message has been reached)."""
+    lives = list_lives(name)  # newest life first
+    cur_life, cur_line = None, None
+    if cursor:
+        m = re.match(r"^(.+):(\d+)$", cursor)
+        if m:
+            cur_life, cur_line = m.group(1), int(m.group(2))
+    msgs = []
+    for life in lives:
+        lid = life["id"]
+        events = read_life(name, lid)
+        if not events:
+            continue
+        hits = [(i, e) for i, e in enumerate(events)
+                if e.get("kind") in INBOX_EVENT_KINDS]
+        if lid == cur_life and cur_line is not None:
+            hits = [(i, e) for i, e in hits if i < cur_line]
+        for i, e in reversed(hits):
+            kind = e.get("kind")
+            if kind == "peer-message":
+                sender = e.get("from", "unknown")
+            elif kind == "human-message":
+                sender = "stanley"
+            else:
+                sender = "operator"
+            msgs.append({"sender": sender, "time": e.get("time", ""),
+                         "text": e.get("text", ""), "kind": kind,
+                         "life": lid})
+            if len(msgs) >= limit:
+                return {"messages": msgs, "next": f"{lid}:{i}"}
+    return {"messages": msgs, "next": None}
 
 
 def list_lives(name):
@@ -145,6 +276,83 @@ def submit_task(name, text):
     return ok, (out.strip() if ok else err.strip())
 
 
+def dispatch_human_messages():
+    """Send durable pending UI messages into agent-0's private inbox."""
+    script = (
+        "import json,os,sys; "
+        "m=json.load(sys.stdin); d='/workspace/human/inbox'; "
+        "os.makedirs(d,exist_ok=True); "
+        "p=d+'/'+m['id']+'.msg'; t=p+'.tmp'; "
+        "f=open(t,'w',encoding='utf-8'); json.dump(m,f); f.close(); "
+        "os.replace(t,p)"
+    )
+    with _agent_chat_lock:
+        for message_id, text in stanley_chat.pending_messages():
+            ok, _, _ = run_docker(["exec", "-i", "agent-0", "python3", "-c", script],
+                                  input_text=json.dumps({"id": message_id, "text": text}))
+            if ok:
+                stanley_chat.mark_delivered(message_id)
+
+
+def collect_delegate_messages():
+    """Persist agent-0's private outbox to the host before deleting files."""
+    with _agent_chat_lock:
+        script = (
+            "import glob,os; "
+            "print('\\n'.join(os.path.basename(p) for p in "
+            "sorted(glob.glob('/workspace/human/outbox/*.msg'))))"
+        )
+        ok, out, _ = run_docker(["exec", "agent-0", "python3", "-c", script])
+        if not ok:
+            return
+        for name in out.splitlines():
+            if not re.fullmatch(r"[0-9]+-[0-9a-f]{32}\.msg", name):
+                continue
+            path = stanley_chat.HUMAN_OUTBOX + "/" + name
+            ok, raw, _ = run_docker(["exec", "agent-0", "cat", path])
+            if not ok:
+                continue
+            try:
+                message = json.loads(raw)
+                message_id, text = message["id"], message["text"]
+                if not (re.fullmatch(r"[0-9a-f]{32}", message_id)
+                        and isinstance(text, str) and text.strip()):
+                    continue
+                stanley_chat.record_delegate(message_id, text)
+            except (ValueError, KeyError):
+                continue
+            run_docker(["exec", "agent-0", "rm", "--", path])
+
+
+def chat_worker():
+    while True:
+        try:
+            dispatch_human_messages()
+            collect_delegate_messages()
+        except Exception as exc:
+            print(f"[control] chat worker: {exc}", flush=True)
+        time.sleep(2)
+
+
+def bank_request(path, data=None, admin=False):
+    headers = {}
+    if admin:
+        headers["X-Bank-Admin-Token"] = ensure_token(BANK_ADMIN_TOKEN_FILE)
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        "http://127.0.0.1:8790" + path,
+        data=json.dumps(data).encode() if data is not None else None,
+        headers=headers, method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.load(exc)
+    except OSError as exc:
+        return 503, {"error": f"bank unavailable: {exc}"}
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -175,6 +383,11 @@ PAGE = """<!doctype html>
   .agent.running .dot { background:var(--ok); }
   .agent .nm span { font-size:13px; }
   .agent .st { font-size:11px; color:var(--dim); margin-left:15px; }
+  .agent .coins { font-size:11.5px; color:var(--user); background:var(--bg);
+                  border:1px solid var(--border); border-radius:9px;
+                  padding:1px 7px; white-space:nowrap; }
+  .agent .coins.broke { color:var(--warn); }
+  .agent .coins.unknown { color:var(--faint); border-style:dashed; }
   #newbtn { margin:10px; padding:9px; background:var(--accent); color:#fff; border:none;
             border-radius:6px; font:600 13px var(--mono); cursor:pointer; }
   #newbtn:hover { filter:brightness(1.1); }
@@ -213,6 +426,27 @@ PAGE = """<!doctype html>
                color:#9a9a9a; font-size:12px; white-space:pre-wrap; word-wrap:break-word; }
   .statusline { color:var(--faint); font-size:11.5px; margin:4px 0 10px 4px; }
   .statusline b { color:var(--dim); font-weight:400; }
+  /* ---------- inbox ---------- */
+  .inbox { margin:0 0 10px; border:1px solid var(--border); border-radius:8px;
+           background:var(--panel); overflow:hidden; }
+  .inbox .hd { display:flex; justify-content:space-between; font-size:11px;
+               letter-spacing:.07em; text-transform:uppercase; padding:5px 12px;
+               border-bottom:1px solid var(--border); background:var(--panel2);
+               color:var(--dim); }
+  .inbox .hd .snd { color:var(--user); }
+  .inbox .bd { padding:8px 12px; white-space:pre-wrap; word-wrap:break-word;
+               font-size:12.5px; color:var(--text); }
+  .inbox.pending { border-color:#4a5a35; }
+  .inbox.pending .hd .snd { color:var(--ok); }
+  .inbox.taskm .hd .snd { color:var(--tool); }
+  #inboxview { display:none; flex:1; flex-direction:column; padding:10px 22px 70px;
+               overflow-y:auto; }
+  #inboxmore { color:var(--faint); font-size:11.5px; text-align:center;
+               padding:6px; cursor:pointer; }
+  #inboxmore:hover { color:var(--dim); }
+  /* ---------- stanley chat history ---------- */
+  #chathistory div.msgrow { margin:0 0 10px; padding:8px 12px; border-radius:8px; white-space:pre-wrap; }
+
   /* ---------- editors ---------- */
   #editor { display:none; flex:1; flex-direction:column; padding:14px 22px; overflow:auto; }
   #editor h3 { color:var(--dim); font-size:12px; letter-spacing:.06em; margin-bottom:6px; }
@@ -248,11 +482,35 @@ PAGE = """<!doctype html>
     <div class="tab active" data-tab="convo">Conversation</div>
     <div class="tab" data-tab="sys">System prompt</div>
     <div class="tab" data-tab="wake">Wake prompt</div>
+    <div class="tab" data-tab="inbox">Inbox</div>
+    <div class="tab" data-tab="stanley">Stanley chat</div>
   </div>
   <div id="headbar"><span id="title"></span>
     <label style="cursor:pointer"><input type="checkbox" id="follow" checked> follow</label>
   </div>
   <div id="view"></div>
+  <div id="inboxview">
+    <div id="inboxlist"></div>
+    <div id="inboxmore"></div>
+  </div>
+  <div id="stanleyview" style="display:none; flex:1; flex-direction:column; padding:14px 22px; overflow:hidden;">
+    <div id="moneybar" style="display:flex; gap:10px; align-items:center; padding:8px 12px; margin-bottom:10px; background:var(--panel); border:1px solid var(--border); border-radius:8px;">
+      <span style="color:var(--dim); font-size:12px;">agent-0 account:</span>
+      <span id="moneyval" style="color:var(--user); font-weight:600;">…</span>
+      <span style="color:var(--faint); font-size:11.5px;">(no decay)</span>
+      <span style="flex:1"></span>
+      <input id="topupamount" type="number" min="1" max="1000000" placeholder="coins"
+        style="width:90px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px; font:12.5px var(--mono);">
+      <button class="act" id="topupbtn" style="padding:6px 12px;">Add money</button>
+    </div>
+    <div id="chathistory" style="flex:1; overflow-y:auto;"></div>
+    <div style="display:flex; gap:10px; margin-top:10px;">
+      <input id="chatinput" placeholder="message to agent-0 (the delegate)…"
+        style="flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:9px; font:13px var(--mono);">
+      <button class="act" id="chatsend">Send</button>
+    </div>
+    <span class="note" id="chatnote"></span>
+  </div>
   <div id="editor">
     <h3 id="edtitle"></h3>
     <textarea id="edtext" spellcheck="false"></textarea>
@@ -274,26 +532,76 @@ PAGE = """<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 let agents = [], current = null, tab = 'convo', lastLen = -1, promptCache = {};
+let controlToken = localStorage.getItem('control-token') || '';
+
+function api(url, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers,
+    {'Content-Type': 'application/json', 'X-Control-Token': controlToken});
+  return fetch(url, opts).then(r => {
+    if (r.status === 403 && !document.getElementById('tokenbar')) showTokenBar();
+    return r;
+  });
+}
+
+function showTokenBar(){
+  const bar = document.createElement('div');
+  bar.id = 'tokenbar';
+  bar.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99;background:var(--panel);border:1px solid var(--warn);border-radius:8px;padding:10px;display:flex;gap:8px;align-items:center;';
+  bar.innerHTML = '<span style="font-size:12px;color:var(--warn);">control token:</span>';
+  const inp = document.createElement('input');
+  inp.style.cssText = 'background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px;font:12px var(--mono);width:220px;';
+  inp.value = controlToken;
+  const btn = document.createElement('button');
+  btn.className = 'act'; btn.textContent = 'Save';
+  btn.onclick = () => {
+    controlToken = inp.value.trim();
+    localStorage.setItem('control-token', controlToken);
+    bar.remove();
+    loadAgents();
+  };
+  bar.appendChild(inp); bar.appendChild(btn);
+  document.body.appendChild(bar);
+}
 
 function esc(s){ const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 
 async function loadAgents(){
-  agents = await (await fetch('/api/agents')).json();
+  agents = await (await api('/api/agents')).json();
+  // balances for the whole crowd in one call; failure is non-fatal —
+  // the rail just shows '?' badges
+  let balances = {};
+  try { balances = (await (await api('/api/bank/accounts')).json()).accounts || {}; }
+  catch (e) {}
   const box = $('#agents'); box.innerHTML = '';
   for (const a of agents) {
     if (a.error) continue;
     const d = document.createElement('div');
     d.className = 'agent' + (a.status.startsWith('Up') ? ' running':'')
                 + (a.name === current ? ' active':'');
-    d.innerHTML = `<div class="nm"><span><span class="dot"></span>${esc(a.name)}</span></div>
-                   <div class="st">${esc(a.status)}</div>`;
+    const bal = balances[a.name];
+    const coins = document.createElement('span');
+    coins.className = 'coins' + (bal === undefined ? ' unknown' : (bal <= 0 ? ' broke' : ''));
+    coins.textContent = bal === undefined ? '?' : ('ⓒ ' + bal);
+    coins.title = bal === undefined ? 'no bank account yet (created on first touch)'
+                : `${bal} coins (1 coin lost per 60s, agent-0 exempt)`;
+    const nameSpan = document.createElement('span');
+    nameSpan.innerHTML = `<span class="dot"></span>${esc(a.name)}`;
+    const nm = document.createElement('div');
+    nm.className = 'nm';
+    nm.appendChild(nameSpan);
+    nm.appendChild(coins);
+    const st = document.createElement('div');
+    st.className = 'st';
+    st.textContent = a.status;
+    d.appendChild(nm);
+    d.appendChild(st);
     d.onclick = () => select(a.name);
     box.appendChild(d);
   }
   if (!current && agents.length && !agents[0].error) select(agents[0].name);
 }
 
-function select(name){ current = name; lastLen = -1; promptCache = {}; loadAgents(); renderTab(); }
+function select(name){ current = name; lastLen = -1; promptCache = {}; inboxCursor = null; loadAgents(); renderTab(); }
 
 /* ---------- conversation rendering ---------- */
 
@@ -361,11 +669,11 @@ function renderEvents(evs){
 
 async function loadConvo(){
   if (!current) { $('#view').innerHTML = '<div class="statusline">select an agent</div>'; return; }
-  const lives = await (await fetch(`/api/agent/${current}/lives`)).json();
+  const lives = await (await api(`/api/agent/${current}/lives`)).json();
   if (!lives.length) { $('#view').innerHTML = '<div class="statusline">no lives yet</div>'; return; }
   // render the newest life (could be extended to a life dropdown)
   const life = lives[0];
-  const evs = await (await fetch(`/api/agent/${current}/life/${life.id}`)).json();
+  const evs = await (await api(`/api/agent/${current}/life/${life.id}`)).json();
   if (evs.length === lastLen) return;
   lastLen = evs.length;
   $('#title').textContent = `${current} · life ${life.id} · ${evs.length} events`;
@@ -379,27 +687,131 @@ async function loadConvo(){
 
 async function loadPrompt(kind){
   if (!current) return;
-  const r = await fetch(`/api/agent/${current}/prompt/${kind}`);
+  // tab id 'sys' is named 'system' on the API route
+  const apiKind = kind === 'sys' ? 'system' : kind;
+  const r = await api(`/api/agent/${current}/prompt/${apiKind}`);
   const j = await r.json();
   $('#edtext').value = j.text ?? '';
-  $('#ednote').textContent = kind === 'system'
-    ? 'applies at the next life (sleep/rebirth) — no rebuild needed'
-    : 'this file is the agent’s own note to itself; editing overwrites it';
+  $('#ednote').textContent = j.error
+    ? ('read failed: ' + j.error)
+    : (kind === 'sys'
+      ? (j.mode === 'append'
+          ? 'container config APPENDS this text to the CLI built-in prompt (system_prompt_append)'
+          : j.mode === 'builtin'
+            ? 'container config IGNORES this file — set system_prompt_file in /app/agent-config.json to use it'
+            : 'read live from the container; replaces the built-in prompt; applies at the next life (no rebuild)')
+      : 'read live from the container; editing overwrites the agent’s own note to itself');
 }
 
 async function savePrompt(kind){
-  const r = await fetch(`/api/agent/${current}/prompt/${kind}`, {
+  const apiKind = kind === 'sys' ? 'system' : kind;
+  const r = await api(`/api/agent/${current}/prompt/${apiKind}`, {
     method: 'PUT', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({text: $('#edtext').value})});
   const j = await r.json();
   $('#ednote').textContent = j.ok ? 'saved ✓' : ('save failed: ' + j.error);
 }
 
+/* ---------- inbox ---------- */
+
+let inboxCursor = null, inboxBusy = false;
+
+function inboxRow(m, pending){
+  const cls = 'inbox' + (pending ? ' pending' : (m.kind === 'task' ? ' taskm' : ''));
+  const label = pending ? 'pending in mailbox'
+    : (m.kind === 'peer-message' ? 'peer message' : (m.kind === 'task' ? 'task' : 'stanley'));
+  const life = m.life ? ` · life ${m.life}` : '';
+  return `<div class="${cls}"><div class="hd"><span class="snd">${esc(m.sender)}</span>
+          <span>${esc(label)} · ${esc(m.time)}${esc(life)}</span></div>
+          <div class="bd">${esc(m.text)}</div></div>`;
+}
+
+async function loadInbox(append){
+  if (!current || inboxBusy) return;
+  inboxBusy = true;
+  try {
+    const url = `/api/agent/${current}/inbox` +
+                (append && inboxCursor ? `?cursor=${encodeURIComponent(inboxCursor)}` : '');
+    const j = await (await api(url)).json();
+    const box = $('#inboxlist');
+    if (!append) box.innerHTML = '';
+    // pending messages first (newest traffic), then the delivered history
+    if (!append && (j.pending || []).length)
+      box.insertAdjacentHTML('afterbegin',
+        j.pending.map(m => inboxRow(m, true)).join(''));
+    for (const m of (j.messages || []))
+      box.insertAdjacentHTML('beforeend', inboxRow(m, false));
+    inboxCursor = j.next;
+    $('#inboxmore').textContent = inboxCursor ? 'scroll for more…' : '— oldest —';
+    if (!append) $('#inboxview').scrollTop = 0;
+  } finally { inboxBusy = false; }
+}
+
+$('#inboxview').addEventListener('scroll', () => {
+  const v = $('#inboxview');
+  if (tab === 'inbox' && inboxCursor && !inboxBusy &&
+      v.scrollHeight - v.scrollTop - v.clientHeight < 80)
+    loadInbox(true);
+});
+
+/* ---------- stanley chat ---------- */
+
+let chatLen = -1;
+async function loadChat(){
+  const r = await api('/api/stanley/chat');
+  const j = await r.json();
+  const hist = j.history || [];
+  const money = await (await api('/api/stanley/money')).json();
+  $('#moneyval').textContent = (money.money ?? '—') + ' coins';
+  $('#chatnote').textContent = j.agent_online ? '' :
+    'agent-0 is offline; messages are saved and will be delivered when it starts';
+  if (hist.length === chatLen) return;   // unchanged
+  chatLen = hist.length;
+  const box = $('#chathistory'); box.innerHTML = '';
+  for (const m of hist) {
+    const mine = m.from === 'stanley';
+    const d = document.createElement('div');
+    d.style.cssText = mine
+      ? 'margin:0 0 10px; padding:8px 12px; border-radius:8px; background:var(--panel2); color:var(--user); white-space:pre-wrap;'
+      : 'margin:0 0 10px 0 40px; padding:8px 12px; border-radius:8px; background:#1b2340; color:var(--text); white-space:pre-wrap;';
+    const who = document.createElement('div');
+    who.style.cssText = 'font-size:10.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); margin-bottom:3px;';
+    who.textContent = (mine ? 'stanley' : 'agent-0') + ' · ' + (m.time || '');
+    d.appendChild(who);
+    d.appendChild(document.createTextNode(m.text));
+    if (m.status === 'pending') {
+      const pending = document.createElement('span');
+      pending.style.cssText = 'color:var(--faint);font-size:11px;margin-left:8px;';
+      pending.textContent = '(pending delivery)';
+      d.appendChild(pending);
+    }
+    box.appendChild(d);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+async function sendChat(){
+  const input = $('#chatinput');
+  const text = input.value.trim();
+  if (!text) return;
+  const r = await api('/api/stanley/chat', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+  const j = await r.json();
+  if (j.ok) { input.value=''; chatLen = -1; await loadChat(); }
+  else $('#chatnote').textContent = j.error || 'send failed';
+}
+
 function renderTab(){
+  const isChat = tab === 'stanley';
+  const isInbox = tab === 'inbox';
   $('#view').style.display = tab === 'convo' ? 'block' : 'none';
-  $('#editor').style.display = tab === 'convo' ? 'none' : 'flex';
-  $('#edtitle').textContent = tab === 'sys' ? `system prompt — ${current} (mounted read-only into /app/system-prompt.txt)`
-                                            : `wake prompt — ${current} (/workspace/self/wake.md)`;
+  $('#inboxview').style.display = isInbox ? 'flex' : 'none';
+  $('#stanleyview').style.display = isChat ? 'flex' : 'none';
+  $('#editor').style.display = (tab === 'convo' || isChat || isInbox) ? 'none' : 'flex';
+  if (isChat) return;
+  if (isInbox) { inboxCursor = null; loadInbox(false); return; }
+  $('#edtitle').textContent = tab === 'sys' ? `system prompt — ${current} (read from /app/system-prompt.txt inside ${current})`
+                                            : `wake prompt — ${current} (read from /workspace/self/wake.md inside ${current})`;
   lastLen = -1;
   if (tab === 'convo') loadConvo(); else loadPrompt(tab);
 }
@@ -411,18 +823,31 @@ document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
   t.classList.add('active'); tab = t.dataset.tab; renderTab();
 });
 $('#savebtn').onclick = () => savePrompt(tab);
+$('#chatsend').onclick = sendChat;
+$('#topupbtn').onclick = async () => {
+  const amount = parseInt($('#topupamount').value, 10);
+  if (!amount || amount < 1) { $('#chatnote').textContent = 'enter a coin amount'; return; }
+  const r = await api('/api/stanley/money', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({amount})});
+  const j = await r.json();
+  if (r.ok) { $('#topupamount').value=''; $('#chatnote').textContent = `added ${amount} coins ✓`; loadChat(); }
+  else $('#chatnote').textContent = j.error || 'top-up failed';
+};
+$('#chatinput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
 $('#newbtn').onclick = () => { $('#overlay').style.display = 'flex'; $('#err').textContent=''; };
 $('#cancelnew').onclick = () => $('#overlay').style.display = 'none';
 $('#createnew').onclick = async () => {
   const name = $('#newname').value.trim();
-  const r = await fetch('/api/agents', {method:'POST',
+  const r = await api('/api/agents', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
   const j = await r.json();
   if (j.ok) { $('#overlay').style.display='none'; $('#newname').value=''; await loadAgents(); select(name); }
   else $('#err').textContent = j.error || 'failed';
 };
 
-setInterval(async () => { await loadAgents(); if (tab === 'convo') loadConvo(); }, 3000);
+setInterval(async () => { await loadAgents(); if (tab === 'convo') loadConvo(); if (tab === 'stanley') loadChat(); }, 3000);
 loadAgents();
 </script>
 </body>
@@ -439,14 +864,37 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode() if not isinstance(obj, bytes) else obj
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        # The page and API change as we edit; never let the browser serve
+        # a stale copy from its cache.
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _authorized(self):
+        return hmac.compare_digest(
+            self.headers.get("X-Control-Token", ""), CONTROL_TOKEN)
 
     def do_GET(self):
         path = self.path.split("?")[0]
         if path in ("/", ""):
             return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        # Everything under /api requires the control token — the page
+        # supplies it after the operator pastes it once (it lives at
+        # ~/.config/docker-ai/control-token). This is what keeps agents
+        # (localhost-reachable via host.docker.internal) out of the
+        # operator's plane: they have no way to learn the token.
+        if path.startswith("/api/") and not self._authorized():
+            return self._send(403, {"error": "forbidden"})
+        if path == "/api/stanley/chat":
+            return self._send(200, {"history": stanley_chat.read_history(),
+                                    "agent_online": agent0_online()})
+        if path == "/api/stanley/money":
+            status, payload = bank_request("/balance/agent-0")
+            return self._send(status, payload)
+        if path == "/api/bank/accounts":
+            status, payload = bank_request("/accounts")
+            return self._send(status, payload)
         if path == "/api/agents":
             ok, out, err = run_docker([
                 "ps", "-a", "--filter", "label=agent.ui=1",
@@ -468,11 +916,33 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             name, kind = m.group(1), m.group(2)
             if kind == "system":
-                p = prompt_path(name)
-                text = open(p).read() if os.path.exists(p) else ""
+                # Read what the daemon actually feeds the SDK: the file
+                # inside the container. It is the host prompts/<name>/
+                # file bind-mounted at start, so the two agree unless the
+                # mount is missing — reading through the container shows
+                # the truth. Fall back to the host file if the container
+                # is unreachable.
+                text = container_read(name, CONTAINER_SYSTEM_PROMPT)
+                if text is None:
+                    p = prompt_path(name)
+                    text = open(p).read() if os.path.exists(p) else ""
+                return self._send(200, {"text": text,
+                                        "mode": prompt_config_mode(name),
+                                        "source": "container"})
             else:
-                text = container_read(name, "/workspace/self/wake.md") or ""
-            return self._send(200, {"text": text})
+                ok, out, err = run_docker(["exec", name, "cat",
+                                           "/workspace/self/wake.md"])
+                if not ok:
+                    return self._send(200, {"text": "", "error":
+                                           err.strip() or "unreadable"})
+                return self._send(200, {"text": out, "source": "container"})
+        m = re.match(r"^/api/agent/([^/]+)/inbox$", path)
+        if m:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            cursor = (qs.get("cursor") or [None])[0]
+            data = list_inbox(m.group(1), cursor)
+            data["pending"] = read_pending(m.group(1))
+            return self._send(200, data)
         return self._send(404, {"error": "not found"})
 
     def do_PUT(self):
@@ -500,11 +970,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if not self._authorized():
+            return self._send(403, {"error": "forbidden"})
         length = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except Exception:
             return self._send(400, {"error": "bad body"})
+        if path == "/api/stanley/chat":
+            # Stanley -> agent-0: queue durably; the chat worker delivers
+            # into agent-0's private inbox shortly after.
+            text = (body.get("text") or "").strip()
+            if not text:
+                return self._send(400, {"error": "empty message"})
+            stanley_chat.queue_to_delegate(text)
+            return self._send(200, {"ok": True})
+        if path == "/api/stanley/money":
+            amount = body.get("amount")
+            if type(amount) is not int or not 0 < amount <= 1_000_000:
+                return self._send(400, {"error": "amount must be 1..1000000"})
+            status, payload = bank_request(
+                "/admin/topup", {"amount": amount}, admin=True)
+            return self._send(status, payload)
         if path == "/api/agents":
             name = (body.get("name") or "").strip()
             model = (body.get("model") or "").strip() or "deepseek-v4.1-flash"
@@ -525,4 +1012,9 @@ if __name__ == "__main__":
     os.makedirs(PROMPTS_DIR, exist_ok=True)
     print(f"[control] UI on http://localhost:{PORT}  (image: {IMAGE}, "
           f"prompts: {PROMPTS_DIR})", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print(f"[control] token: {CONTROL_TOKEN}", flush=True)
+    threading.Thread(target=chat_worker, daemon=True).start()
+    # 0.0.0.0: reachable from the LAN (e.g. a phone on the same Wi-Fi).
+    # The control token gates every /api call, so a stray LAN peer without
+    # the token can see only the static HTML shell.
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
