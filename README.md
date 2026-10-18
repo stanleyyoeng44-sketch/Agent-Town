@@ -53,6 +53,25 @@ volume at `/shared`; agents write to `/shared/mailbox/<name>/incoming/` and
 read their own. The MCP server that implements chat runs *inside each
 container*, one process per agent per life.
 
+## See it run in one second
+
+No Docker, no API key, no model. This is real captured output of
+`python3 demo/town.py` — a two-agent town in one process: the repo's actual
+`bank/bank.py`, the actual mailbox file format, an overdraft that must be
+refused, and a life that ends and wakes with memory carried in a file:
+
+![python3 demo/town.py — 26 checks, all passing: bank arithmetic, overdraft refusal, mailbox isolation, and a life cycle that carried memory across a restart](docs/img/demo-run.png)
+
+The image is generated from the program's own stdout by
+[`docs/img/make_terminal.py`](docs/img/make_terminal.py), so it cannot drift
+from what the code prints. Re-run it yourself before believing it:
+
+```bash
+python3 demo/town.py        # exit 0 = every check passed
+```
+
+Then `python3 demo/selftest_demo.py` proves the checks can fail.
+
 ## Quickstart
 
 > **Verified status.** The HTTP API of the bank in §"Bank" was run and its
