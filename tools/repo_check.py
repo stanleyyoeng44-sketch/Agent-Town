@@ -1429,13 +1429,17 @@ def _publisher_docs_read(root):
                         errors="replace").read()
         except OSError:
             continue
-        for m in re.finditer(r"```[a-z]*\n(.*?)```", text, re.S):
-            body = m.group(1)
-            if re.search(r"^\s*docker run\b", body, re.M) and \
-               re.search(r"\bagent-bank\b", body) and \
-               re.search(r"(?:^|\s)-p\s+\S+:\d+", body):
+        # A doc counts only if it publishes a -p for the bank, because that
+        # is what portcheck's doc loop reports. A doc that STARTS the bank
+        # with no -p at all is a different defect (portcheck's docstring calls
+        # it "the strongest form of cutting a caller off") and must not be
+        # counted here: doing so made this reach assertion accuse a CORRECT
+        # tool of narrowing its input when the real change was that a doc
+        # stopped publishing. A check that misnames its cause gets deleted.
+        if re.search(r"^\s*docker run\b.*\bagent-bank\b", text, re.M) or \
+           re.search(r"docker run\b[^\n]*\bagent-bank\b", text):
+            if re.search(r"(?:^|\s)-p\s+\S+:\d+", text, re.M):
                 n += 1
-                break
     return n
 
 
@@ -1540,7 +1544,16 @@ def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
         m = re.search(reach[0], "\n".join(out))
         got = int(m.group(1)) if m else None
         want = reach[1](root)
-        if got != want:
+        # ONE-DIRECTIONAL on purpose. Under-reporting is the attack: the tool
+        # read FEWER docs than exist because its input set was narrowed. But a
+        # tool may legitimately read MORE than this ground truth counts -- a
+        # doc that starts the bank with no -p at all is still read by the tool
+        # and is still a defect the tool reports separately, while the ground
+        # truth counts only docs that publish. Asserting equality made this
+        # check accuse a CORRECT tool when a doc simply stopped publishing,
+        # which is the "check that bites correct code" failure this repo
+        # deletes checks for. Measured on that exact tree before changing it.
+        if got is None or got < want:
             return label, "FAIL", [
                 f"{tool} checked {got} {reach[2]}(s) but this tree has "
                 f"{want}. A detector that narrows its INPUT SET keeps its "
@@ -1890,10 +1903,19 @@ def _c17_reach(workflow_text, root):
     # Two stubs. (a) exits 0 printing a count BELOW the step's threshold --
     # catches a step that types its own number. (b) exits 1 -- catches a step
     # that swallows a real failure with `|| true` or a missing pipefail.
+    # (a) a stub reporting too few suites: catches a TYPED/echoed count.
+    # (b) a stub printing a GOOD count but exiting 1: catches a step whose
+    #     trailing assertion masks the runner's failure -- agent-6's Hole 1,
+    #     measured: `set -o pipefail` makes the pipeline nonzero but a step
+    #     exits with its LAST command's status, so a trailing successful
+    #     `test` returned 0 on a failing run. This stub is that defect as a
+    #     permanent arm: the count is right, the run failed, the step must
+    #     still go red.
     stubs = [
         ("import sys\nprint('check: 3 suite(s), from /stub')\nsys.exit(0)\n",
          "a stub reporting 3 suites"),
-        ("import sys\nsys.exit(1)\n", "a stub exiting 1"),
+        ("import sys\nprint('check: 15 suite(s), from /stub')\nsys.exit(1)\n",
+         "a stub printing a GOOD count and exiting 1"),
     ]
     results = []
     for body, label in stubs:
@@ -2913,6 +2935,7 @@ def selftest():
     # because C17 now STUBS the runner and requires the step to go red.
     _good_step = ("name: ci\njobs:\n  t:\n    steps:\n"
                   "      - run: |\n"
+                  "          set -e\n"
                   "          set -o pipefail\n"
                   "          python3 tools/check.py | tee /tmp/c.log\n"
                   "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
