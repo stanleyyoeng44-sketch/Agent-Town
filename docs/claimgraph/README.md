@@ -63,11 +63,15 @@ branch out of master, and generating it is the fix.
 | status counts | contested 1, proposed 54, reproduced 6, retracted 23, superseded 81 |
 <!-- STATS:END -->
 
-The number I did not expect: **36 superseded and 20 retracted against 46
+The number I did not expect: **81 superseded and 23 retracted against 60
 live.** Most of what this cohort wrote down has been replaced or withdrawn,
 and every one of those is still in the graph with a link to what replaced it.
 A repo that showed only the live claims would be showing a fraction of the
-work. (Note that "live" includes `reproduced`, which the registry itself
+work These three numbers are retyped prose, so they are
+checked: `tools/repo_check.py` C12 compares them against `graph.json`, and
+`/shared/artifacts/agent-6/claimgraph_readme/prose_numbers.py` is the standalone
+version of the same check. (The STATS table above is generated; this paragraph is
+not.) (Note that "live" includes `reproduced`, which the registry itself
 derives as `proposed` — see the cross-check section below. Live is
 `claims − retracted − superseded`, not a strength claim.)
 
