@@ -28,7 +28,9 @@ Exit: 0 shipped passes AND the control fires; 1 either half failed.
 """
 import ast
 import asyncio
+import os
 import sys
+import tempfile
 import textwrap
 
 DAEMON = sys.argv[1] if len(sys.argv) > 1 else "agent/agent-daemon.py"
@@ -216,9 +218,132 @@ def pre_fix_body(body):
     return mutated
 
 
+# ---------------------------------------------------------------------------
+# D. THE DELIVERY ARM -- does the daemon HAND the stream the REAL wake prompt?
+#
+# WHY THIS EXISTS (agent-6, measured): the A/B/C sections above prove
+# prompt_stream TRANSMITS whatever wake_prompt it is given -- the harness
+# binds the literal "WAKE" and checks the string comes out. They cannot prove
+# the daemon HANDS IT THE REAL ONE. One line, nothing else touched:
+#
+#     agent/agent-daemon.py:558   wake_prompt = read_wake_prompt()
+#                          ->     wake_prompt = ""
+#     tools/test_prompt_stream.py -> A 4/4 PASS, exit 0
+#
+# Every agent would wake to "Your wake-up prompt to yourself:" followed by
+# nothing. That is Stanley's headline claim (the agent wakes holding the note
+# its last life wrote) delivered as an empty string, with the suite green.
+#
+# The chain has two links and this section measures both:
+#   D1  read_wake_prompt RETURNS the note, for all three file states
+#   D2  the variable prompt_stream interpolates is ASSIGNED FROM that reader
+# Neither link alone is enough: D2 without D1 pins a call to a broken reader;
+# D1 without D2 pins a working reader nobody calls.
+# ---------------------------------------------------------------------------
+
+def extract_function(path, name):
+    """Pull one top-level function out of the shipped file, unparsed."""
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if fn is None:
+        raise SystemExit("FAIL: no %s in %s" % (name, path))
+    return ast.unparse(ast.Module(body=[fn], type_ignores=[])), tree
+
+
+def d1_reader_returns_the_note():
+    """Run the SHIPPED read_wake_prompt against real files on disk."""
+    body, _ = extract_function(DAEMON, "read_wake_prompt")
+    work = tempfile.mkdtemp()
+    wake = os.path.join(work, "wake.md")
+    ns = {"os": os, "WAKE_FILE": wake, "str": str}
+    exec(compile(body, "<read_wake_prompt>", "exec"), ns)
+    read = ns["read_wake_prompt"]
+
+    ok = True
+    BODY = "# wake\nDO THESE THREE THINGS."
+
+    open(wake, "w").write(BODY)
+    got = read()
+    hit = (got.strip() == BODY.strip())
+    ok = ok and hit
+    print("  %-5s a real wake.md comes back verbatim          got=%r"
+          % ("PASS" if hit else "FAIL", got[:36]))
+
+    os.remove(wake)
+    got = read()
+    hit = "first boot" in got.lower()
+    ok = ok and hit
+    print("  %-5s no wake.md gives the FIRST-BOOT text        got=%r"
+          % ("PASS" if hit else "FAIL", got[:36]))
+
+    open(wake, "w").write("   \n\n")
+    got = read()
+    hit = "first boot" in got.lower()
+    ok = ok and hit
+    print("  %-5s a whitespace-only wake.md is NOT a plan     got=%r"
+          % ("PASS" if hit else "FAIL", got[:36]))
+    return ok
+
+
+def d2_stream_is_handed_the_reader():
+    """The variable the stream interpolates must BE read_wake_prompt().
+
+    Structural on purpose: driving live_one_life needs the SDK, and a fake
+    client would prove the fake, not the daemon. What can fail here is exact:
+    replacing the call with a literal (&quot;", None, a constant) leaves the
+    stream interpolating something that is not the note.
+    """
+    _, tree = extract_function(DAEMON, "read_wake_prompt")   # parse once
+    live = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.AsyncFunctionDef)
+                 and n.name == "live_one_life"), None)
+    if live is None:
+        raise SystemExit("FAIL: no live_one_life in %s" % DAEMON)
+
+    # 1. an assignment `wake_prompt = <call>` where the call is read_wake_prompt
+    assigned_from_reader = False
+    for node in ast.walk(live):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not any(isinstance(t, ast.Name) and t.id == "wake_prompt"
+                       for t in targets):
+                continue
+            v = node.value
+            if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                    and v.func.id == "read_wake_prompt"):
+                assigned_from_reader = True
+
+    # 2. every JoinedStr in the function that interpolates `wake_prompt`
+    interpolated = []
+    for node in ast.walk(live):
+        if isinstance(node, ast.JoinedStr):
+            for v in node.values:
+                if (isinstance(v, ast.FormattedValue)
+                        and isinstance(v.value, ast.Name)
+                        and v.value.id == "wake_prompt"):
+                    interpolated.append(node)
+
+    ok = True
+    print("  %-5s wake_prompt is ASSIGNED FROM read_wake_prompt()"
+          % ("PASS" if assigned_from_reader else "FAIL"))
+    ok = ok and assigned_from_reader
+    hit = len(interpolated) >= 1
+    print("  %-5s the stream INTERPOLATES wake_prompt (%d site(s))"
+          % ("PASS" if hit else "FAIL", len(interpolated)))
+    ok = ok and hit
+    return ok
+
+
 def main():
     body = extract(DAEMON)
     shipped_ok = run_cases(compile_stream(body), "A. SHIPPED prompt_stream")
+
+    print("\nD. DELIVERY -- does the daemon hand the stream the REAL note?")
+    d1_ok = d1_reader_returns_the_note()
+    d2_ok = d2_stream_is_handed_the_reader()
+    delivery_ok = d1_ok and d2_ok
 
     stripped = strip_wake_from_kick(body)
     stripped_ok = run_cases(compile_stream(stripped),
@@ -236,10 +361,12 @@ def main():
     control_fired = not control_ok
 
     print()
+    print("  delivery chain intact (reader returns, stream uses it): %s"
+          % delivery_ok)
     print("  control fired (resume kick lost the prompt): %s" % strip_caught)
     print("  control fired (pre-fix shape went mute): %s"
           % ("PASS" if control_fired else "FAIL -- this test is blind"))
-    good = shipped_ok and control_fired and strip_caught
+    good = shipped_ok and control_fired and strip_caught and delivery_ok
     print("\n%s" % ("PROMPT-STREAM PASS" if good else "PROMPT-STREAM FAIL"))
     return 0 if good else 1
 
