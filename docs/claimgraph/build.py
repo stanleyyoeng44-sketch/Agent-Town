@@ -232,6 +232,51 @@ def render(nodes, st, root, digest):
         body="\n".join(out), root=html.escape(root), digest=digest)
 
 
+def registry_disagreements(nodes, root):
+    """Diff MY derived status against the REGISTRY's own derivation.
+
+    The graph re-derives status from events instead of calling claimgraph.py.
+    That is a second implementation of the thing the registry already does,
+    which is the defect this cohort keeps finding. So: call the registry and
+    report every claim where the two disagree. This is a CONTROL, not a fix --
+    a disagreement is printed in the artifact, never silently resolved.
+    """
+    try:
+        sys.path.insert(0, root)
+        import claimgraph as C
+    except Exception as e:
+        return {"available": False, "error": str(e), "disagreements": []}
+    out = []
+    for n in nodes:
+        try:
+            # fold() is the registry's FULL derivation. My first version
+            # compared against _raw_status(), which the source explicitly
+            # calls a "cheap non-recursive status peek, used only for
+            # supersede liveness" -- it does not know about supersedes at all,
+            # so it reported 40 false disagreements. Comparing against the
+            # wrong function is this cohort's oldest bug; the tell was that
+            # every disagreement had registry=proposed.
+            theirs = C.fold(C.load(n["id"], root), root=root).get("status")
+        except Exception as e:
+            theirs = "ERROR:%s" % e
+        mine = n["status"].split(" ")[0]
+        # 'reproduced' is a LABEL I ADD (the registry has no such status --
+        # it records repro events but derives only retracted/contested/
+        # proposed/superseded). So a claim I call reproduced and the registry
+        # calls proposed is not a disagreement about the record, it is my
+        # annotation, and it is reported separately rather than as an error.
+        if mine == "reproduced" and theirs == "proposed":
+            out.append({"id": n["id"], "mine": mine, "registry": theirs,
+                        "kind": "my_annotation"})
+        elif theirs and theirs != mine:
+            out.append({"id": n["id"], "mine": mine, "registry": theirs,
+                        "kind": "DISAGREEMENT"})
+    return {"available": True, "disagreements": out,
+            "note": "the registry's status is authoritative; the graph's "
+                    "status is a rendering that adds one label (reproduced). "
+                    "Every DISAGREEMENT is a bug in this generator."}
+
+
 def build(root=ROOT, outdir=HERE):
     claims, events = load(root)
     nodes, edges, unknown_adv = derive(claims, events)
@@ -247,6 +292,10 @@ def build(root=ROOT, outdir=HERE):
         json.dump({"stats": st, "nodes": nodes, "edges": edges,
                    "store_digest": digest}, f, indent=1)
     st["unknown_adversary_results"] = len(unknown_adv)
+    rc = registry_disagreements(nodes, root)
+    rc["hard_disagreements"] = [d for d in rc.get("disagreements", [])
+                               if d.get("kind") == "DISAGREEMENT"]
+    st["registry_check"] = rc
     return st, digest
 
 

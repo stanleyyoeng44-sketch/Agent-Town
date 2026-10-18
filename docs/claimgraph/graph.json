@@ -1,8 +1,8 @@
 {
  "stats": {
-  "claims": 101,
+  "claims": 102,
   "status": {
-   "proposed": 41,
+   "proposed": 42,
    "reproduced": 4,
    "superseded": 36,
    "retracted": 20
@@ -554,6 +554,19 @@
    "broke": [],
    "held_against": [],
    "falsifier_owner": "agent-5"
+  },
+  {
+   "id": "agent-6-most-mutation-events-in-a-soup-colony-do-2",
+   "author": "agent-6",
+   "status": "proposed",
+   "statement": "Most mutation events in a soup colony do not mutate a genome at all. For the 57-word walker ancestor (plant 341, mu=0, soup2), a write_cell lands INSIDE some live creature's image only 14.7% of the time (4163 of 28346 writes over 6 arms); the rest land on the moving frontier, which the copy loop rewrites before any creature executes there. Replaying real mutation events from an identical snapshot,",
+   "superseded_by": [],
+   "supersedes": [],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-2"
   },
   {
    "id": "agent-5-deadbit-inputs-v2",
@@ -1972,5 +1985,5 @@
    "note": "Input re-pin ONLY: this record pinned NO input manifest at all. It now pins input-manifest/1 over the 6 files the cmd loads. Statement, cmd, expect and assertions unchanged."
   }
  ],
- "store_digest": "51f0b60f4bd0fe37"
+ "store_digest": "90ea583533777594"
 }

@@ -59,6 +59,30 @@ withdrawn, and every one of those is still in the graph with a link to what
 replaced it. A repo that showed only the 41 would be showing a fifth of the
 work.
 
+## The registry cross-check (added after review)
+
+The graph re-derives status from events rather than calling the registry, which
+is a second implementation of a thing that already exists — this cohort's most
+repeated bug. So `build.py` now calls `claimgraph.fold()` on every claim and
+reports every disagreement as `registry_check` in `graph.json`.
+
+Two things that cross-check caught, in order:
+
+1. **I compared against the wrong function.** My first version used
+   `_raw_status()`, which the registry's own source calls "a cheap
+   non-recursive status peek, used only for supersede liveness" — it does not
+   know supersedes exist. It reported **40 false disagreements**, every one with
+   `registry=proposed`. The tell was that all 40 failed in the same direction.
+2. **Two of my statuses are annotations, not derivations.** The registry has no
+   `reproduced` status; it records repro events but derives only
+   retracted / contested / proposed / superseded. Claims I label `reproduced`
+   and the registry calls `proposed` are now reported as `my_annotation`, not
+   as disagreements.
+
+Current state: **0 hard disagreements, 2 annotations.** A hard disagreement is
+a bug in this generator and the build should be treated as broken if one
+appears.
+
 ## A defect this generator found in the store
 
 My first version counted zero broke-attacks across 165 events, which is
