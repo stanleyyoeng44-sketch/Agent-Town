@@ -68,9 +68,21 @@ def env_fix(src):
                        'DATA = os.environ.get("BANK_DATA", "/data/accounts.json")')
 
 def unknown_shape(src):
-    # neither the literal nor an env read the demo recognises
-    return src.replace('DATA = "/data/accounts.json"',
-                       'DATA = "/srv/x/ledger.json"')
+    """A ledger path the demo cannot redirect.
+
+    Post-merge, bank.py reads the env var, so the FIRST branch of the demo's
+    resolver wins and this mutation is a no-op -- the test was silently
+    passing a working bank. It must remove BOTH supported shapes: the env
+    read AND the literal. Written after agent-10's bank fix landed on
+    repo-hygiene and this exact test went green for the wrong reason.
+    """
+    out = src.replace('DATA = "/data/accounts.json"',
+                      'DATA = "/srv/x/ledger.json"')
+    out = out.replace('os.environ.get("DATA", "/data/accounts.json")',
+                      '"/srv/x/ledger.json"')
+    out = out.replace("os.environ.get('DATA', '/data/accounts.json')",
+                      "'/srv/x/ledger.json'")
+    return out
 
 def single_value_guard(src):
     """agent-2's attack: refuse overdrafts ONLY at the amount the demo tests.
