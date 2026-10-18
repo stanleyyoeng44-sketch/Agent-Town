@@ -268,29 +268,40 @@ def main():
         # wealth. This is the check whose absence let a minting bank pass the
         # whole demo. It runs BEFORE any transfer that could muddy the books.
         ghost = http("GET", f"{base}/balance/ghost-not-an-agent")
-        check("unknown name is created at 0, not funded",
-              ghost.get("money") == 0, str(ghost))
-        check("unknown name reports exists=false",
+        check("unknown name reads as money=0", ghost.get("money") == 0, str(ghost))
+        check("unknown name reads as exists=false",
               ghost.get("exists") is False, str(ghost))
+        # A READ must not create the row either. Checking `money` alone would
+        # pass against a bank that creates the account at 0, which is a storage
+        # mint: unbounded growth from unauthenticated reads. Measured on master
+        # before this check existed: 2,000 reads -> 2,002 accounts.
+        check("a read did not create the account",
+              "ghost-not-an-agent" not in
+              http("GET", f"{base}/accounts")["accounts"], "row exists")
+        # And the SECOND read must say the same thing. If the first read
+        # created the account, `exists` flips from false to true and the field
+        # is reporting the previous call instead of the world.
+        ghost2 = http("GET", f"{base}/balance/ghost-not-an-agent")
+        check("exists does not change on a second read",
+              ghost2.get("exists") is False, str(ghost2))
+        # The creation path that DOES exist is the recipient of a transfer.
+        # It must be created at 0, not funded.
+        http("POST", f"{base}/transfer",
+             {"from": "agent-1", "to": "fresh-recipient", "amount": 1})
+        fresh = http("GET", f"{base}/balance/fresh-recipient")
+        check("a freshly created recipient is paid, not granted",
+              fresh.get("money") == 1, str(fresh))
         total_before = sum(http("GET", f"{base}/accounts")["accounts"].values())
-        check("touching an unknown name creates no coins",
+        check("no coins were created by any of the above",
               total_before == 200,
               f"total={total_before} expected 200 (2 x 100)")
-        # ...and the GRANT half. The two checks above only prove the READ did
-        # not fund the name; a bank whose ensure_account creates at
-        # START_MONEY but whose GET path was fixed passes both. The mint is
-        # only closed if a name that does get created -- a fresh RECIPIENT --
-        # is created at ZERO. Measured: the grant-on-create negative control
-        # passed the demo until this line existed.
-        r_new = http("POST", f"{base}/transfer",
-                     {"from": "agent-2", "to": "fresh-recipient", "amount": 1})
-        check("a fresh recipient is created at 0 and then paid",
-              r_new.get("recipient_balance") == 1,
-              f"{r_new}")
-        total_after = sum(http("GET", f"{base}/accounts")["accounts"].values())
-        check("creation granted nothing (no new coins)",
-              total_after == total_before,
-              f"total={total_after} expected {total_before}")
+        # The GRANT half is checked above ("a freshly created recipient is
+        # paid, not granted"): a NEGATIVE control (create funds the name)
+        # makes that line fail, which is what the grant-on-create limb in
+        # selftest_demo.py requires. Deliberately ONE check for the property,
+        # not a second transfer to the same name -- two checks asserting the
+        # same thing from different call sites is how a count grows without
+        # the coverage doing so.
 
         check("transfer 25 moves coins", r.get("ok") is True, str(r))
         check("sender debited", r["money"] == 75, str(r))
