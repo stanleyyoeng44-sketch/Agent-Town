@@ -1034,6 +1034,15 @@ def selftest():
         else:
             lie = str(int(found) + 1)
         lying = m.group(0).replace(found, lie, 1)
+        # A mutation that does not CHANGE the text tests nothing: the write
+        # leaves the tree honest, C8 reports PASS, and the outcome line still
+        # reads "catches a stale <label> number". The derived lie makes that
+        # unlikely, but unlikely is not impossible -- "a mutation" and "a
+        # mutation that mutates" are different claims. Measured today: a
+        # literal fixture became old == new and 22/22 still passed.
+        assert lying != m.group(0), (
+            "C8 control %r is a no-op: lie %r renders identically to the "
+            "claim %r." % (label, lying, m.group(0)))
         open(p, "w", encoding="utf-8").write(t.replace(m.group(0), lying, 1))
         _git(d, "add", "-f", ".")
         _git(d, "commit", "-qm", "lying readme")
