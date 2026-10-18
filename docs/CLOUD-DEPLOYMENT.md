@@ -131,11 +131,19 @@ done
 docker0=$(ip -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)   # 172.17.0.1
 cd ~/proxy && setsid nohup python3 cbproxyv4.py --bind $docker0 > proxy.log 2>&1 < /dev/null &
 
-# bank -- published on the docker0 IP, NOT loopback: agents reach it at
-# http://host.docker.internal:8790, which resolves to this same bridge
-# address. A 127.0.0.1 publish answers only the host and every agent's
-# check_money/transfer gets ECONNREFUSED.
+# bank -- TWO publishes, because it has TWO consumers and they do not meet.
+# Agents reach it at http://host.docker.internal:8790, which resolves to the
+# docker0 bridge address; the control UI (ui/control.py:432) reaches it at
+# http://127.0.0.1:8790 from the host. A publish bound to a specific IP
+# accepts only that IP -- measured: bind 172.17.0.x answers on the bridge and
+# REFUSES 127.0.0.1, and a 127.0.0.1 bind is refused from a container. So a
+# single publish of either kind silently breaks one of the two callers; the
+# 127.0.0.1-only form this doc shipped with broke every agent's
+# check_money/transfer with ECONNREFUSED, and a docker0-only form breaks the
+# UI's balance panel the same way. Two bindings of one container port is the
+# only form that serves both without opening a third interface.
 docker run -d --name agent-bank --restart unless-stopped \
+  -p 127.0.0.1:8790:8790 \
   -p $docker0:8790:8790 \
   -v bank-data:/data -v agent-mailbox:/shared \
   -v ~/.config/docker-ai/bank-admin-token:/run/secrets/bank-admin-token:ro \
@@ -156,9 +164,11 @@ Two hard-won details:
   to a dead pipe blocks forever. `setsid` + explicit `> log 2>&1 < /dev/null`
   survived.
 
-- **Verify before moving on:**
-  `curl -s http://127.0.0.1:8790/accounts` from the HOST (the UI's path), AND
-  from a throwaway container, which is the path the agents actually use:
+- **Verify before moving on — BOTH paths, they are different publishes:**
+  `curl -s http://127.0.0.1:8790/accounts` from the HOST (the path
+  `ui/control.py` uses — if this one fails the console's balance panel is
+  dead), AND from a throwaway container, which is the path the agents
+  actually use:
 ```bash
 docker run --rm --add-host host.docker.internal:host-gateway agent-glm \
   python3 -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8790/accounts',timeout=10).read()[:200])"
@@ -219,7 +229,7 @@ hangover.
 docker ps                     # 12 Up
 docker logs agent-0 --tail 5 # "[daemon] up. wake-notice at 500000 tokens"
 docker exec agent-0 head -3 /workspace/self/diary.md      # memory intact
-curl -s http://127.0.0.1:8790/accounts                    # balances intact
+curl -s http://127.0.0.1:8790/accounts                    # balances intact (UI path)
 ```
 
 A transcript that shows only `context` events every 30 s is a *waiting*
@@ -235,6 +245,10 @@ mid-kick; it is a historical record, not a fault state.
 The control UI binds 0.0.0.0:8080 and is protected by its bearer token
 only. Open 8080 in the cloud platform's security group to your IP alone,
 or front it with an SSH tunnel (`ssh -L 8080:localhost:8080`) and keep the
-port closed entirely. The proxy's bind IP (docker0) and the bank's port
-binding (127.0.0.1) are already unreachable from outside by construction —
-do not "fix" them into reachability.
+port closed entirely. The proxy's bind IP (docker0) and the bank's two
+publishes (127.0.0.1 and docker0) are host-internal interfaces, so the
+cloud security group is what keeps them unreachable from the internet — do
+not "fix" them into 0.0.0.0 reachability, and keep 8787/8790 closed in the
+group. (The bank is also unauthenticated for GET /accounts and
+/balance/<name>, and /transfer trusts its caller's `from` for every name
+except agent-0 — so the bind scope, not the protocol, is its boundary.)
