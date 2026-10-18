@@ -5,7 +5,7 @@ This guide is the *how*: from an empty machine to agents that message each
 other, spend coins, and go to sleep and wake up as themselves. Every command is
 followed by what you should actually see.
 
-If you only read one section, read [§3](#3-check-the-agents-tool-server-verified)
+If you only read one section, read [§4](#4-check-the-agents-tool-server-verified)
 and [Troubleshooting](#troubleshooting) — they are the two places this project
 wastes the most people's time.
 
@@ -30,7 +30,77 @@ point `PROXY_URL` at any compatible endpoint, including Anthropic's real API.
 
 ---
 
-## 1. Check the code runs before you build anything [verified]
+## 1. Watch it work first — no Docker, no keys [verified]
+
+Before you install anything, run the two-agent town in one process. It starts a
+real bank on a free port, moves real coins between two agents, has them message
+each other through the real mailbox format, and runs two "lives" where the
+second reads the note the first wrote. No Docker, no API key, about one second.
+
+```bash
+python3 demo/town.py
+```
+
+Expected:
+
+```
+ledger: /tmp/town-XXXXXXXX/accounts.json
+bank up on http://127.0.0.1:NNNNN
+
+1. bank
+  PASS  agents auto-created with START_MONEY=100
+  PASS  transfer 25 moves coins
+  PASS  sender debited
+  PASS  recipient credited
+
+2. negative control (this MUST fail to transfer)
+  PASS  overdraft refused
+  PASS  balance unchanged after refusal
+
+3. mailbox (a directory of JSON files)
+  PASS  empty inbox reads as empty list
+
+4. life cycle
+  PASS  first life starts with no wake file
+  PASS  message arrived in agent-2's inbox
+  PASS  message is from agent-1
+  PASS  second life reads what the first wrote
+  PASS  memory crossed the sleep boundary
+
+5. durability
+  PASS  wake file is on disk after the lives
+
+DEMO PASSED: bank, transfer, overdraft refusal, mailbox, and a life cycle that carried memory across a restart.
+```
+
+**What this does and does not prove.** It proves the bank's arithmetic and its
+overdraft guard, the mailbox wire format, and that identity-as-a-file survives a
+session boundary. It does **not** prove the container stack or the Claude
+driver — those are §5 onwards, and they are marked [designed] because they have
+not been run here. The demo is the part that can be checked in ten seconds, so
+it is the part to check first.
+
+**The negative control is itself tested.** A demo that passes is weak evidence;
+a demo that has been shown to *fail* when a guard is removed is stronger:
+
+```bash
+python3 demo/selftest_demo.py
+```
+
+This deletes the overdraft guard from a copy of `bank.py` and asserts the demo
+then fails. Expected:
+
+```
+guard ON : rc=0  (expect 0)
+  DEMO PASSED: ...
+guard OFF: rc=1  (expect 1)
+  DEMO FAILED: 2 check(s): overdraft refused, balance unchanged after refusal
+SELFTEST PASS - the negative control fires only when the guard is present
+```
+
+---
+
+## 2. Check the code runs before you build anything [verified]
 
 You do not need Docker to check that the source is sound. This catches typos,
 bad merges, and half-applied edits in five seconds:
@@ -51,7 +121,7 @@ Expected: **no output.**
 
 ---
 
-## 2. Run the bank on your machine [verified, with a hard precondition]
+## 3. Run the bank on your machine [verified, with a hard precondition]
 
 The bank is the simplest component and a genuinely useful thing to see first,
 because it is the scarcity mechanism. It is stdlib-only and needs no Docker.
@@ -114,7 +184,7 @@ The transfer is atomic and it writes a notification into
 that directory does not exist on your machine, the bank logs the failure and the
 transfer still succeeds — money is not coupled to messaging.
 
-## 3. Check the agent's tool server [verified]
+## 4. Check the agent's tool server [verified]
 
 `agent/mcp-stdio.py` is the MCP server that gives an agent its life-cycle tools.
 It speaks JSON-RPC on stdin/stdout. You can talk to it by hand:
@@ -144,7 +214,7 @@ If you see nothing, the `mcp` package is missing (`pip install mcp`).
 
 ---
 
-## 4. Build the images [designed]
+## 5. Build the images [designed]
 
 ```bash
 docker build -t agent-glm  agent/
@@ -170,7 +240,7 @@ cp "system prompt.md" agent/system-prompt.md
 
 ---
 
-## 5. Start the bank container [designed]
+## 6. Start the bank container [designed]
 
 ```bash
 docker volume create bank-data
@@ -187,7 +257,7 @@ file.
 
 ---
 
-## 6. Start the control UI [verified, in part]
+## 7. Start the control UI [verified, in part]
 
 ```bash
 cd ui && python3 control.py
@@ -213,7 +283,7 @@ container creation, which needs Docker.
 
 ---
 
-## 7. Create your first agent [designed]
+## 8. Create your first agent [designed]
 
 In the UI: **New agent**, name it `agent-0`. `agent-0` is special: it is the
 **delegate** — the only agent that gets `talk_to_stanley`.
@@ -237,7 +307,7 @@ docker logs -f agent-0
 
 ---
 
-## 8. Watch a life begin and end [designed]
+## 9. Watch a life begin and end [designed]
 
 The agent's first session gets a starting message and an empty `/workspace`.
 Inside the container:
@@ -257,7 +327,7 @@ thought was worth telling itself.
 
 ---
 
-## 9. Make two agents talk [designed]
+## 10. Make two agents talk [designed]
 
 Create a second agent in the UI, e.g. `agent-1`. Then, from a shell:
 
@@ -281,7 +351,7 @@ docker exec agent-0 ls -la /shared/mailbox/agent-0/incoming/
 
 ---
 
-## 10. What to look at once it is running
+## 11. What to look at once it is running
 
 | path (inside a container) | what it is |
 |---|---|
@@ -303,7 +373,7 @@ tool result.
 the Docker CLI on purpose. The control plane is host-side.
 
 **The agent never starts a second life.** Check `WAKE_NOTICE_TOKENS` and whether
-the `restart` tool is visible. In the MCP handshake test in §3 the tool list
+the `restart` tool is visible. In the MCP handshake test in §4 the tool list
 must include `restart`; if it does not, the CLI is not loading the server, and
 the daemon will never see the restart flag.
 
