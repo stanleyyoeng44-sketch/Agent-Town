@@ -119,6 +119,16 @@ def replay(root, readme_text, verbose=False):
     if not pairs:
         return ["the transcript blocks contain no '$ command' lines to replay"]
 
+    # THE README'S OWN CLOCK, read from the README rather than assumed. A decay
+    # claim is meaningless without units; these two numbers are what turn a
+    # quoted balance into an equation. `stated` is None when either is absent,
+    # and the second-balance branch FAILs on None instead of skipping -- an
+    # unreadable claim is the defect, not a reason to pass.
+    decay_m = re.search(r"DECAY_SECONDS=(\d+)", readme_text)
+    later_m = re.search(r"(\d+)\s+seconds?\s+later", readme_text)
+    stated = ((int(decay_m.group(1)), int(later_m.group(1)))
+              if decay_m and later_m else None)
+
     port = free_port()
     # DATA is a FILE path, not a directory (bank.py:41 defaults to
     # /data/accounts.json). Passing a mkdtemp directory makes the bank die at
@@ -185,6 +195,10 @@ def replay(root, readme_text, verbose=False):
         # behaviour is selected by the value it is checking cannot reject that
         # value. The selector has to be the POSITION in the transcript.
         balance_seen = 0
+        # The most recent quoted /balance figure, used to make a later
+        # transfer's money an ARITHMETIC assertion rather than a comparison
+        # to a constant seed. None until the transcript quotes one.
+        last_balance_quoted = None
         for cmd, quoted in pairs:
             if verbose:
                 print(f"    replay: {cmd}")
@@ -219,27 +233,58 @@ def replay(root, readme_text, verbose=False):
             if m:
                 body = json.loads(m.group(1))
                 got = http(port, "POST", m.group(2), body)
-                if quoted != got:
-                    # A field whose value is (1000 - ticks) is a claim about
-                    # wall-clock, not about the code. Compare every field
-                    # EXCEPT 'money' exactly, then require the balance to be
-                    # consistent with the README's own starting number and the
-                    # integers this run can produce.
-                    diff = {k for k in set(quoted) | set(got)
-                            if quoted.get(k) != got.get(k)}
-                    if diff == {"money"} and isinstance(quoted.get("money"), int) \
-                            and isinstance(got.get("money"), int):
-                        # The README's figure must be 1000 - amount - ticks
-                        # for some small whole number of ticks.
-                        q, g = quoted["money"], got["money"]
-                        amt = body.get("amount", 0)
-                        if (1000 - amt - q) < 0:
-                            fails.append(f"{cmd}: README money {q} is not a "
-                                         f"reachable decay from 1000")
-                    else:
-                        fails.append(f"{cmd}\n      README: {quoted}\n"
-                                     f"      bank:   {got}")
+                if quoted is None:
+                    fails.append(f"{cmd}: README quotes no response for this "
+                                 f"transfer, so there is nothing to check")
+                    continue
+                # Compare every field EXCEPT 'money' exactly. 'money' is a
+                # wall-clock quantity (seed - amount - decay ticks), so it
+                # cannot be compared to the bank's figure literally -- but it
+                # CAN be compared to the README's OWN arithmetic, and the old
+                # code did not: it asked only `(1000 - amt - q) < 0`, i.e. "is
+                # the quoted number not larger than the seed". MEASURED on
+                # ce5497b: a transfer line quoting 900 after a 7-coin transfer
+                # PASSED (93 coins vanished); 999 was the ONE value rejected,
+                # and only because 1000-7-999 is negative. A constant that
+                # happens to be right for the other fields is not an assertion
+                # about this one.
+                diff = {k for k in set(quoted) | set(got)
+                        if k != "money" and quoted.get(k) != got.get(k)}
+                if diff:
+                    fails.append(f"{cmd}\n      README: {quoted}\n"
+                                 f"      bank:   {got}")
+                    continue
+                q = quoted.get("money")
+                if q is None and "money" not in quoted:
+                    # An ERROR response legitimately has no money field
+                    # ("unknown sender"). The diff above already compared
+                    # every non-money field exactly, so a matching error is
+                    # fully checked; only a SUCCESS response carries money.
+                    continue
+                if not isinstance(q, int):
+                    fails.append(f"{cmd}: README money {q!r} is not an integer")
+                    continue
+                amt = body.get("amount", 0)
+                seed = last_balance_quoted
+                if seed is None:
+                    # Without a preceding quoted balance there is nothing to
+                    # be consistent WITH, so say so rather than pass. That is
+                    # a FAIL, not a skip: an uncheckable number is exactly the
+                    # thing this arm exists to catch.
+                    fails.append(f"{cmd}: README quotes money {q} but no "
+                                 f"earlier quoted balance to check it against")
+                    continue
+                # Seeded decay is 1 coin per DECAY_SECONDS; the harness runs
+                # DECAY_SECONDS=1, so the tick count is bounded by the wall
+                # clock since the bank started. Never a fixed literal.
+                ticks = int(time.time() - seen_at) + 1
+                lo, hi = seed - amt - ticks, seed - amt
+                if not (lo <= q <= hi):
+                    fails.append(
+                        f"{cmd}: README money {q} is not {seed} - {amt} minus "
+                        f"0..{ticks} decay tick(s), i.e. not in {lo}..{hi}")
                 continue
+
             m = re.search(r"localhost:\d+(/\S+)", cmd)
             if m:
                 path = m.group(1)
@@ -280,26 +325,73 @@ def replay(root, readme_text, verbose=False):
                               f"{elapsed:.2f}s elapsed explains "
                               f"{1000 - cur} tick(s) (allowed "
                               f"{int(elapsed // 1) + 1})")
+                    if quoted and isinstance(quoted.get("money"), int):
+                        last_balance_quoted = quoted["money"]
                     continue
-                if is_balance and quoted and quoted.get("money") != 1000:
-                    # The decay assertion: wait until the balance has moved,
-                    # then require it moved by whole ticks, not by a constant.
-                    before = http(port, "GET", path)["money"]
-                    deadline = time.time() + 5
-                    while time.time() < deadline:
-                        now = http(port, "GET", path)["money"]
-                        if now < before:
-                            break
-                        time.sleep(0.1)
+                if is_balance and balance_seen == 2:
+                    # SECOND READ: the README claims DECAY -- less money than
+                    # the seed, after a STATED number of seconds. The old code
+                    # selected this branch by `quoted.get("money") != 1000`,
+                    # the README's own value again, and then DISCARDED the
+                    # value: it checked only that the BANK's number went down.
+                    # MEASURED on ce5497b: quoting 0, 5, 500, 998 or 1001 for
+                    # the second balance all PASSED, including 1001 -- a rise
+                    # during a claimed decay. Same defect as the first-balance
+                    # one; this is its SECOND instance in this file.
+                    #
+                    # The transcript is arithmetic, and the README states every
+                    # input to it: DECAY_SECONDS on the launch line and "N
+                    # seconds later" on the ellipsis line. Assert the stated
+                    # equation. None of the three numbers on the right is the
+                    # value under test, so the check can reject it.
+                    got = http(port, "GET", path)
+                    cur = got.get("money")
+                    q = None if quoted is None else quoted.get("money")
+                    if not isinstance(q, int):
+                        fails.append(f"{cmd}: the SECOND balance in the "
+                                     f"transcript must quote an integer "
+                                     f"money; got {q!r}")
+                    elif last_balance_quoted is None:
+                        fails.append(f"{cmd}: no earlier quoted balance for "
+                                     f"this decay claim to be relative to")
+                    elif stated is None:
+                        # No stated clock -> the quoted number has no units
+                        # and cannot be checked. FAIL rather than pass: an
+                        # unreadable claim is the defect, not a reason to skip.
+                        fails.append(f"{cmd}: the transcript claims decay but "
+                                     f"does not state both DECAY_SECONDS and "
+                                     f"'N seconds later', so the quoted "
+                                     f"balance {q} has no units")
                     else:
-                        fails.append(f"{path}: balance never decayed with "
-                                     f"DECAY_SECONDS=1")
-                    # Do not compare the literal; the README's 998 is a
-                    # wall-clock claim. Compare the DIRECTION and that the
-                    # account still exists.
-                    cur = http(port, "GET", path)
-                    if not cur.get("exists"):
-                        fails.append(f"{path}: account vanished during decay")
+                        decay_secs, later_secs = stated
+                        ticks = later_secs // decay_secs
+                        want = last_balance_quoted - ticks
+                        if q != want:
+                            fails.append(
+                                f"{cmd}\n      README: {quoted}\n"
+                                f"      the README states DECAY_SECONDS="
+                                f"{decay_secs} and '{later_secs} seconds "
+                                f"later', so {last_balance_quoted} decays by "
+                                f"{ticks} to {want}; it quotes {q}")
+                        else:
+                            # The README's number is now an ASSERTED equation.
+                            # The BANK is a different clock: the harness runs
+                            # DECAY_SECONDS=1 and does not wait the README's
+                            # five seconds, so the bank's value is only
+                            # required to be a whole number of ITS OWN ticks
+                            # below the seed -- the same clock-derived bound
+                            # the first-balance arm uses, never a literal 998.
+                            elapsed = time.time() - seen_at
+                            low = 1000 - int(elapsed // 1) - 1
+                            if not isinstance(cur, int) or not (low <= cur <= 1000):
+                                fails.append(
+                                    f"{cmd}\n      README: {quoted}\n"
+                                    f"      bank:   {got}\n"
+                                    f"      {elapsed:.2f}s after the bank "
+                                    f"started at DECAY_SECONDS=1, the balance "
+                                    f"can only be {low}..1000")
+                    if quoted and isinstance(quoted.get("money"), int):
+                        last_balance_quoted = quoted["money"]
                     continue
                 got = http(port, "GET", path)
                 if quoted != got:
@@ -374,8 +466,51 @@ def main():
             caught = bool(replay(ROOT, mutated))
             print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
             first_results.append(caught)
+        # THE LATER-READ ARMS. MEASURED (agent-2, 2026-10-18, on ce5497b):
+        # the SECOND balance and the TRANSFER's resulting money were both
+        # selected/ignored by their own value. Quoting 0, 5, 500, 998 or 1001
+        # for the second balance all PASSED -- including 1001, a RISE during a
+        # claimed decay -- and a transfer quoting 900 after a 7-coin transfer
+        # PASSED with 93 coins unaccounted for. The arms above mutate only the
+        # first balance, so they could not have caught either. Each arm below
+        # is a different lie; each must be rejected, and the pristine read
+        # (ok_real) must stay green.
+        later_lies = [
+            ('{"agent": "agent-2", "money": 998, "exists": true}',
+             '{"agent": "agent-2", "money": 1001, "exists": true}',
+             "a second balance of 1001 (a RISE during a claimed decay)"),
+            ('{"agent": "agent-2", "money": 998, "exists": true}',
+             '{"agent": "agent-2", "money": 500, "exists": true}',
+             "a second balance of 500 (not the stated decay)"),
+            ('{"agent": "agent-2", "money": 998, "exists": true}',
+             '{"agent": "agent-2", "money": 0, "exists": true}',
+             "a second balance of 0 (the whole account gone in 5s)"),
+        ]
+        # The transfer arm needs the README's own arithmetic to be kept valid
+        # up to the mutated line, or it would pass/fail for the wrong reason:
+        # 998 - 7 = 991. Quoting 900 leaves 93 coins unaccounted.
+        later_lies.append(
+            ('"ok": true, "money": 991, "recipient": "agent-3", '
+             '"recipient_balance": 7',
+             '"ok": true, "money": 900, "recipient": "agent-3", '
+             '"recipient_balance": 7',
+             "a transfer result of 900 after a 7-coin transfer (93 vanished)"))
+        later_results = []
+        for old, new, label in later_lies:
+            mutated = text.replace(old, new, 1)
+            if mutated == text:
+                print(f"  FAIL  could not build the lie: {label}; the README "
+                      f"no longer carries the line this arm mutates")
+                later_results.append(False)
+                continue
+            # replay() returns the LIST OF FAILURES; a caught lie is a
+            # NON-EMPTY list. Same inverted-`not` trap recorded above.
+            caught = bool(replay(ROOT, mutated))
+            print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
+            later_results.append(caught)
 
-        all_ok = (ok_real and built and not ok_bad and all(first_results))
+        all_ok = (ok_real and built and not ok_bad and all(first_results)
+                  and all(later_results))
         return 0 if all_ok else 1
 
     fails = replay(ROOT, text, verbose="--verbose" in args)
