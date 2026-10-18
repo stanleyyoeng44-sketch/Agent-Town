@@ -643,13 +643,18 @@ def c8_readme_numbers(root):
 
 # (text in README.md, its lie, label). Lives beside the check so the two
 # cannot drift apart.
+# Each entry is a REGEX with exactly one group -- the number to lie about --
+# so the control reads the claim actually in the README and lies about THAT.
+# Pinning literal text means the control breaks the moment the number
+# legitimately changes, which is a control pinning a value it is not testing.
+# Measured: '(20 files)' broke the moment the tree grew to 22 modules, and
+# before that it was VACUOUS -- the control's farm held 2 .py files, so the
+# count was already wrong before the mutation and C8 was red for the fixture.
 C8_CONTROLS = [
-    ("— 28 checks", "— 27 checks", "demo caption"),
-    ("`python3 demo/town.py`, 28 checks", "`python3 demo/town.py`, 27 checks",
-     "verification table"),
-    ("mutates the bank six ways", "mutates the bank five ways",
-     "selftest mutations"),
-    ("(20 files)", "(12 files)", "tracked modules"),
+    (r"—\s*(\d+)\s+checks", "demo caption"),
+    (r"`python3 demo/town\.py`,\s*(\d+)\s+checks", "verification table"),
+    (r"mutates the bank\s+(\w+)\s+ways", "selftest mutations"),
+    (r"\((\d+) files\)", "tracked modules"),
 ]
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
@@ -993,24 +998,43 @@ def selftest():
     # shown to fail when it is wrong -- one control per claim, because a
     # single "C8 catches a lie" would pass while three quarters of the check
     # were dead code.
-    for old, newv, label in C8_CONTROLS:
+    import re as _re
+    for pattern, label in C8_CONTROLS:
         d = farm()
         open(os.path.join(d, ".gitignore"), "w").write(
             "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
         for rel in ("demo/town.py", "demo/selftest_demo.py"):
             os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
             shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
+        # THE FARM MUST SATISFY EVERY OTHER CLAIM. The tracked-module count is
+        # measured with `git ls-files '*.py'` in the FARM, so a farm holding
+        # only the two demo scripts makes the README's module count false
+        # BEFORE any mutation -- C8 goes red for the fixture, and the control
+        # "passes" while testing nothing. Copy the same .py set the claim
+        # counts, so the only false number is the one this control injects.
+        if label == "tracked modules":
+            for py in sh_ls(ROOT):
+                dst = os.path.join(d, py)
+                os.makedirs(os.path.dirname(dst) or d, exist_ok=True)
+                shutil.copy(os.path.join(ROOT, py), dst)
         shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
         p = os.path.join(d, "README.md")
         t = open(p, encoding="utf-8").read()
-        if old not in t:
+        m = _re.search(pattern, t)
+        if not m:
             # Cannot build the control because the sentence is gone. That is a
             # FAILURE, not a skip: it is exactly the state in which C8 stops
             # checking anything while still reporting PASS.
             outcomes.append((f"C8 {label} claim is still checkable", False))
             shutil.rmtree(d)
             continue
-        open(p, "w", encoding="utf-8").write(t.replace(old, newv, 1))
+        found = m.group(1)
+        if label == "selftest mutations":
+            lie = "five" if found != "five" else "six"
+        else:
+            lie = str(int(found) + 1)
+        lying = m.group(0).replace(found, lie, 1)
+        open(p, "w", encoding="utf-8").write(t.replace(m.group(0), lying, 1))
         _git(d, "add", "-f", ".")
         _git(d, "commit", "-qm", "lying readme")
         _, r8 = run(d)
