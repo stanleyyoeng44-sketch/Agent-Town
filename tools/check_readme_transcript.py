@@ -125,7 +125,11 @@ def replay(root, readme_text, verbose=False):
     # startup with IsADirectoryError -- which is how this check first failed,
     # and it failed on its own setup rather than on the README.
     ledger = os.path.join(tempfile.mkdtemp(prefix="replay_"), "accounts.json")
-    env = dict(os.environ, SEED="agent-2:1000", DECAY_SECONDS="1",
+    # agent-9 is seeded SOLELY for the control transfer below; it is a name
+    # the README transcript never mentions. Top-up needs the admin token,
+    # which this harness does not mount -- seeding is the operator act that
+    # is available here and needs no token.
+    env = dict(os.environ, SEED="agent-2:1000,agent-9:100", DECAY_SECONDS="1",
                PORT=str(port), DATA=ledger)
     # The bank binds the port from its own argv/env; read the source to find
     # which, rather than assuming.
@@ -149,6 +153,24 @@ def replay(root, readme_text, verbose=False):
                 time.sleep(0.1)
         else:
             return ["bank never accepted a connection on its port"]
+
+        # CONTROL (credit: agent-5's repo_audit/check_readme_transcript.py):
+        # a funded transfer must still WORK. Without it, a mismatch could
+        # equally mean the bank is broken, and "the bank is broken" and "the
+        # README is stale" look identical from a diff. This control is run
+        # first, on a live bank this script started from the tree.
+        # It uses agent-9 -> agent-8, names the transcript never touches:
+        # my first version moved agent-2's balance and then compared the
+        # transcript's agent-2 line against the moved balance, so the control
+        # corrupted the world it was guarding and the check failed on its own
+        # probe. A control must not write to the state under test.
+        ctl = http(port, "POST", "/transfer",
+                   {"from": "agent-9", "to": "agent-8", "amount": 7})
+        if ctl.get("ok") is not True:
+            fails.append(f"CONTROL FAILED: a funded transfer did not succeed "
+                         f"({ctl}) -- the bank in this tree is broken, so no "
+                         f"mismatch below can be attributed to the README")
+            return fails
 
         snapshot = None
         for cmd, quoted in pairs:
