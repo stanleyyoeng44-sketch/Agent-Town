@@ -20,6 +20,9 @@ CHECKS
     C4 .gitignore present  and covers the classes above
     C5 docs commands run   every ```sh block in README runs, or is marked
     C6 sources import      every .py in the tree parses (stdlib ast only)
+    C14 check registry     every c<N>_ check defined here is in CHECKS, so a
+                           merge that drops one list entry cannot turn a check
+                           off silently (nothing else reads the registry)
 
 Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
 CONTROL per check: it builds a deliberately bad tree and asserts the check
@@ -1129,6 +1132,78 @@ def c12_undefined_names(root):
     return "C12 undefined names", "PASS", [
         "no unbound name in any tracked .py (10/10 detection cases, "
         "legal-code control clean)"]
+def _registry_orphans(source):
+    """Parse a repo_check.py SOURCE and return (defined, registered, orphans).
+
+    A check is a module-level function named c<N>_<words>. It runs only
+    because its name is also an element of the CHECKS list. Those are two
+    separate facts and nothing used to compare them.
+
+    Module-level only, deliberately: the file contains nested helpers named
+    c11_on/c12_on/c13_on, and ast.walk would report them. A check that bites
+    correct code gets deleted, and then it catches nothing.
+    """
+    tree = ast.parse(source)
+    defined, registered = [], []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and re.fullmatch(
+                r"c[0-9]+_[a-z0-9_]+", node.name):
+            defined.append(node.name)
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "CHECKS" for t in node.targets):
+            registered = [e.id for e in node.value.elts if isinstance(e, ast.Name)]
+    return (sorted(defined), sorted(registered),
+            sorted(set(defined) - set(registered)),
+            sorted(set(registered) - set(defined)))
+
+
+def registry_status(source):
+    """Return (status, findings) for one source string. Shared by C14 and the
+    C14 control, so the control exercises the same code path."""
+    defined, registered, orphans, phantoms = _registry_orphans(source)
+    findings = []
+    if orphans:
+        findings.append(
+            "DEFINED BUT NEVER REGISTERED: " + ", ".join(orphans) +
+            " -- the function exists, is documented, and would FAIL if it "
+            "ran, but it is not in CHECKS, so nothing ever calls it. A green "
+            "run cannot tell this apart from the check passing.")
+    if phantoms:
+        findings.append(
+            "REGISTERED BUT NOT DEFINED: " + ", ".join(phantoms) +
+            " -- CHECKS names a function that does not exist here.")
+    return ("FAIL" if findings else "PASS"), findings + [
+        f"{len(registered)} checks registered: " + ", ".join(registered)]
+
+
+def c14_check_registry(root):
+    """A check that is defined but never registered is a check that can be
+    erased silently -- and this repo had no guard against it.
+
+    MEASURED (agent-4, 2026-10-18): inject a real check function that would
+    return FAIL, do not add it to CHECKS, and the whole repo reports
+    PASS (10 pass, 1 warn, 0 fail); `--selftest` reports 33/33. The function
+    is dead code wearing the name of a check.
+
+    SCOPE, and it is narrower than it looks: this compares NAMES. A check
+    whose body is gutted to `return ("x", "PASS", [])` is still registered and
+    still named, and C14 passes. That is the boundary of a registry check, not
+    a defect in this one -- catching a gutted body needs a different
+    instrument (inject a defect per check and require red). Stated here so
+    "registry PASS" is not read as more than it is. (agent-2's review.)
+
+    This is the same failure the checker already names elsewhere: "a missing
+    replayer is a FAIL, not a skip: otherwise deleting the script turns the
+    check off" (C9). A merge that drops one line from CHECKS turns a check off
+    just as completely, and emits no conflict marker when the added line sits
+    on a line the other side also edited.
+
+    `root` is unused on purpose: the file it audits is the one running, not one
+    looked up under the tree, so the control can hand a mutated source string
+    to registry_status without writing it into a git tree.
+    """
+    return ("C14 check registry",) + registry_status(
+        open(os.path.join(HERE, "repo_check.py"), encoding="utf-8").read())
 
 
 def _mutant_tree(root, rel, old, new, mutate=True):
@@ -1324,7 +1399,7 @@ CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
-          c13_claimgraph_prose_numbers, c12_undefined_names,
+          c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
           c15_portcheck, c16_tokencheck]
 
 
@@ -1332,6 +1407,20 @@ def _is_git_tree(root):
     r = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
                        capture_output=True, text=True)
     return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _self_guard():
+    """C14 cannot detect its OWN removal from CHECKS: if it is not in the list,
+    it does not run, and no other check reads the registry.
+
+    So the guard lives OUTSIDE the registry, evaluated on every run regardless
+    of CHECKS. It is one line of evidence and it is checked the same way any
+    other fact is: assert it, and prove the assertion can fail (selftest).
+
+    A check that guards everything except its own deletion has a hole exactly
+    the shape of its purpose.
+    """
+    return c14_check_registry in CHECKS
 
 
 def run(root="."):
@@ -1352,6 +1441,21 @@ def run(root="."):
                          f"clone, or `git init && git add -A && git commit -qm x` "
                          f"to make an export checkable."])]
     results = []
+    # The registry check cannot report its own absence (see _self_guard).
+    # Report it here, first, so unticking C14 cannot turn it off. A crash here
+    # is a FAIL, not a skipped row, for the same reason a check crash is.
+    try:
+        guarded = _self_guard()
+    except Exception as e:
+        guarded = False
+        guard_detail = f"self-guard crashed: {e!r}"
+    else:
+        guard_detail = ("c14_check_registry is registered in CHECKS" if guarded
+                        else "c14_check_registry is ABSENT from CHECKS, so the "
+                             "registry check does not run and no other check "
+                             "reads the registry")
+    results.append(("C14 self-guard", "PASS" if guarded else "FAIL",
+                    [guard_detail]))
     for fn in CHECKS:
         try:
             name, status, findings = fn(root)
@@ -2029,6 +2133,54 @@ def selftest():
     fn_bad = FN.replace("    threshold = 5\n", "")
     outcomes.append(("C12 catches a deleted local in a function body",
                      fn_bad != FN and c12_on(fn_bad) == "FAIL"))
+    # C14: the registry. Three arms in two directions. A one-armed control
+    # here would be satisfied by a check that returns FAIL unconditionally,
+    # which is the failure this check exists to prevent, one level up.
+    real_src = open(here, encoding="utf-8").read()
+    outcomes.append(("C14 passes on the real repo_check.py",
+                     registry_status(real_src)[0] == "PASS"))
+
+    # Arm A: define a check, do not register it. This is the exact shape of a
+    # merge that keeps the function hunk and loses the CHECKS-list line.
+    orphaned = real_src.replace(
+        "CHECKS = [c1_tracked_junk,",
+        "def c99_orphan(root):\n"
+        "    return 'C99 orphan', 'FAIL', ['never called']\n\n\n"
+        "CHECKS = [c1_tracked_junk,", 1)
+    st, fd = registry_status(orphaned)
+    outcomes.append(("C14 catches a check DEFINED but missing from CHECKS",
+                     orphaned != real_src and st == "FAIL"
+                     and any("c99_orphan" in f for f in fd)))
+
+    # Arm B: the SAME name, but nested inside another function, must NOT be
+    # flagged. The real file already carries c11_on/c12_on/c13_on helpers
+    # named exactly like checks; a check that walked every FunctionDef would
+    # report them and bite correct code. Synthetic so the arm cannot go
+    # vacuous when those helpers are renamed.
+    nested_src = real_src.replace(
+        "CHECKS = [c1_tracked_junk,",
+        "def _wrapper():\n"
+        "    def c99_nested(root):\n"
+        "        return 'not a check', 'PASS', []\n"
+        "    return c99_nested\n\n\n"
+        "CHECKS = [c1_tracked_junk,", 1)
+    st_b, fd_b = registry_status(nested_src)
+    outcomes.append(("C14 does NOT flag a nested check-shaped helper",
+                     nested_src != real_src and st_b == "PASS"
+                     and not any("c99_nested" in f for f in fd_b)))
+
+    # Arm C: C14's own removal must still be caught. registry_status cannot
+    # see this (if C14 is unregistered it never runs), so the guard is
+    # asserted directly, in both the restored and removed states.
+    _saved = list(CHECKS)
+    try:
+        CHECKS.remove(c14_check_registry)
+        outcomes.append(("C14 self-guard fires when its CHECKS entry is removed",
+                         _self_guard() is False))
+    finally:
+        CHECKS[:] = _saved
+    outcomes.append(("C14 self-guard passes on the restored list",
+                     _self_guard() is True))
 
     bad = 0
     for label, passed in outcomes:
