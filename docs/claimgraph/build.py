@@ -534,7 +534,54 @@ if __name__ == "__main__":
         print("README", "updated" if changed else "already current")
         print("digest", dg)
         sys.exit(0)
-    st, dg = build()
+    # READING MUST NOT BE WRITING, AND ONE COMMAND MUST LEAVE A CONSISTENT TREE.
+    #
+    # Three incidents in one evening, all from this dispatch:
+    #   * agent-7 ran `build.py --help` to read the usage; it regenerated
+    #     index.html and graph.json from the LIVE store over the committed
+    #     values in the shared clone.
+    #   * agent-6 ran `build.py` with no arguments to read the stats; it
+    #     rewrote the same two committed artifacts in a fresh worktree.
+    #   * the old default wrote index.html and graph.json but NOT the README
+    #     STATS table, which only `sync-readme` updates -- so the documented
+    #     one-command regeneration left the tree in a state where this file's
+    #     own selftest FAILS (M3). A generator whose documented recipe
+    #     produces a red build is worse than one that does nothing.
+    #
+    # So: no arguments, or an unrecognised one INCLUDING --help, computes and
+    # prints the stats WITHOUT touching the tree. Writing requires --write,
+    # and --write also syncs the README, so the tree it leaves behind passes
+    # selftest. The read-only path still answers the question it was invoked
+    # with -- build() takes an outdir, so the same numbers are computed into a
+    # temp directory and discarded. Refusing to answer would just send the
+    # next agent to --write to find out what the numbers are.
+    known = sys.argv[1] if len(sys.argv) > 1 else None
+    if known == "selftest":
+        sys.exit(selftest())
+    if known == "--write":
+        st, dg = build()
+        print(json.dumps(st))
+        print("digest", dg)
+        print("wrote", os.path.join(HERE, "index.html"))
+        # The STATS table is a separate artifact; writing one without the
+        # other is what made the documented command red. Do both.
+        changed = sync_readme(st)
+        print("README", "updated" if changed else "already current")
+        sys.exit(0)
+    if known == "sync-readme":
+        st, dg = build()
+        changed = sync_readme(st)
+        print("README", "updated" if changed else "already current")
+        print("digest", dg)
+        sys.exit(0)
+    # READ-ONLY: same numbers, nothing written.
+    discard = tempfile.mkdtemp(prefix="claimgraph-readonly-")
+    try:
+        st, dg = build(outdir=discard)
+    finally:
+        shutil.rmtree(discard, ignore_errors=True)
     print(json.dumps(st))
     print("digest", dg)
-    print("wrote", os.path.join(HERE, "index.html"))
+    print("(read-only: nothing written. Pass --write to regenerate "
+          "index.html, graph.json AND the README stats table.)")
+    sys.exit(0)
