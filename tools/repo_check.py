@@ -1187,40 +1187,61 @@ def c13_claimgraph_prose_numbers(root):
     return "C13 claimgraph prose numbers", "PASS", checked
 
 
-def _undefined_names_silences_file(src, root):
-    """Return a reason string if tools/undefined_names.py would return NO
-    findings for this whole source because of a module-wide escape hatch,
-    else None.
+# A name no fixture in this repo contains. Appended to a COPY of a source to
+# ask the checker a behavioural question about that source.
+_C12_PROBE = "_C12_PROBE_UNDEFINED"
+_C12_PROBE_SRC = "\n\ndef _c12_probe():\n    return %s\n" % _C12_PROBE
 
-    THE ESCAPE-CALL SET IS IMPORTED FROM THE TOOL, NOT COPIED. The first
-    version of this function hard-coded the escape names and had already
-    drifted: it listed "__import__", which undefined_names.py's ESCAPE_CALLS
-    does NOT, so a legal fixture that legitimately used __import__ would be
-    called vacuous by this guard while the real tool still checked it
-    (agent-2, measured over 11 constructs). A hand-copied predicate drifts
-    and nothing notices. So the escape set is read from the tool module
-    itself, and an arm asserts the two agree.
+
+def _probe_silent(tool_mod, src):
+    """True iff the tool reports NOTHING for src even though one plain
+    undefined name has been appended to it -- i.e. the tool is refusing the
+    whole file."""
+    return tool_mod.check_source(src + _C12_PROBE_SRC) == []
+
+
+def _undefined_names_silences_file(src, root):
+    """Return a short label if tools/undefined_names.py would return NO
+    findings for this whole source because of a whole-file bail-out, else
+    None.
+
+    MEASURED ON THE TOOL, NOT MIRRORED (agent-2, life 18). Two earlier
+    versions of this guard re-implemented the tool's bail-out predicate
+    here: first a hand-copied name set (already drifted on __import__), then
+    an imported name set PLUS a hand-written except-NameError walk.
+    Importing closed the DATA half only; the NameError test is CODE.
+    agent-2 measured that deleting the tool's NameError short-circuit left
+    this guard -- and all 56 selftest controls -- green, because the arm
+    probed two names and the clause that had to fail was not a name. A
+    predicate is only as drift-proof as its least-imported clause.
+
+    So this function now has no bail-out predicate of its own. It appends
+    ONE plain undefined name to a copy of src and asks the tool's own
+    check_source whether it says anything. Silence on content whose only
+    novelty is an undefined name means the tool is refusing the whole file
+    -- for whatever reason, however many bail-outs exist, including ones
+    added after this comment was written. The label returned is
+    best-effort prose for the human reading the FAIL; the verdict does not
+    depend on it.
     """
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return "does not parse"
-    # Import the tool once; its ESCAPE_CALLS is the definition, not our copy.
+        return "it does not parse"
     tool_mod = _load_undefined_names(root)
-    escape_calls = getattr(tool_mod, "ESCAPE_CALLS", set()) if tool_mod else set()
-    # star import
+    if tool_mod is None or not hasattr(tool_mod, "check_source"):
+        return "the tool could not be imported, so its behaviour is unmeasured"
+    if not _probe_silent(tool_mod, src):
+        return None
+    # It is silent. Name the likeliest hatch for the failure message only --
+    # this labelling is a courtesy and is deliberately NOT the verdict.
     for n in ast.walk(tree):
-        if isinstance(n, (ast.Import, ast.ImportFrom)):
-            if any(a.name == "*" for a in n.names):
-                return "a star import"
-    # escape calls -- the SET comes from the tool
-    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+                a.name == "*" for a in n.names):
+            return "a star import"
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                and n.func.id in escape_calls):
+                and n.func.id in getattr(tool_mod, "ESCAPE_CALLS", ())):
             return "a %s() call" % n.func.id
-    # except NameError -- the CONDITION mirrors the tool's third short-circuit.
-    # Kept in sync by the equality arm below (which also flags a tool change).
-    for n in ast.walk(tree):
         if isinstance(n, ast.ExceptHandler) and n.type is not None:
             t = n.type
             names = [t] if isinstance(t, ast.Name) else (
@@ -1228,7 +1249,7 @@ def _undefined_names_silences_file(src, root):
             if any(isinstance(x, ast.Name) and x.id == "NameError"
                    for x in names):
                 return "an except NameError probe"
-    return None
+    return "a whole-file bail-out"
 
 
 def _load_undefined_names(root):
@@ -1352,11 +1373,11 @@ def c12_undefined_names(root):
     vacuous_reason = _undefined_names_silences_file(legal_src, root)
     if vacuous_reason:
         findings.append("THE FALSE-POSITIVE CONTROL IS VACUOUS: "
-                        "tools/tests/undefined_names_legal.py trips the "
-                        "checker's whole-file short-circuit (%s), so it can "
-                        "never report a false positive no matter what legal "
-                        "code it contains. Move that case to "
-                        "undefined_names_escapes.py." % vacuous_reason)
+                        "tools/tests/undefined_names_legal.py is NOT "
+                        "CHECKABLE (%s), so it can never report a false "
+                        "positive no matter what legal code it contains. "
+                        "Move that case to undefined_names_escapes.py."
+                        % vacuous_reason)
     # THE MUTANT FORM OF THE SAME ASSERTION (agent-2's sharper version). The
     # AST check above asks "does this file trip a known bail-out?" -- but
     # there are FIVE independent whole-file bail-outs and a sixth could be
@@ -1386,39 +1407,77 @@ def c12_undefined_names(root):
             os.remove(mutant_path)
         except OSError:
             pass
-    # DRIFT ARM: this classifier must agree with the TOOL about which calls
-    # are escapes. The first version copied the set by hand and had already
-    # diverged (it listed __import__, the tool did not), so a legal fixture
-    # using __import__ would be called vacuous while the tool still checked
-    # it. Assert the agreement on a name in the set and one out of it, using
-    # the tool's OWN check_source on a snippet that also has a real undefined
-    # name: if the name is an escape, check_source returns [] (silent); if it
-    # is not, it reports the undefined name.
+    # ONE-ARM-PER-BAIL-OUT. The escapes fixture above stacks a star import,
+    # a globals() call AND an except NameError in a single file, so ANY one
+    # of them keeps it silent: delete the tool's NameError short-circuit and
+    # that control still passes (agent-2 reported it; I reproduced it
+    # independently before writing this). An over-determined control is a
+    # control that cannot fail -- the very defect this check exists to catch
+    # -- so it gets the same treatment: one snippet per hatch, each carrying
+    # a REAL undefined name, each required to be silent ON ITS OWN.
+    #
+    # AND the complement: the SAME snippets with the hatch removed must be
+    # REPORTED. Without that half an arm passes if the tool went silent for
+    # an unrelated reason -- silence is only evidence when the same content
+    # without the hatch speaks.
     tool_mod = _load_undefined_names(root)
     if tool_mod is not None and hasattr(tool_mod, "check_source"):
-        def _tool_silent(snippet):
-            return tool_mod.check_source(snippet) == []
-        # __import__ must NOT silence the tool (it is not in ESCAPE_CALLS);
-        # vars() MUST. If the tool's set changes, one of these flips and the
-        # arm below reds -- which is the point: drift is caught, not assumed.
-        if _tool_silent("def f():\n    __import__('os')\n    return ZZZ_UNDEF\n"):
-            findings.append("ESCAPE-SET DRIFT: the tool now treats "
-                            "__import__() as a whole-file escape, but this "
-                            "classifier's assumed set (imported from the "
-                            "tool) disagrees -- update the classifier or the "
-                            "tool, they must name the same calls.")
-        imp_src = "def f():\n    __import__('os')\n    return ZZZ_UNDEF\n"
-        if _undefined_names_silences_file(imp_src, root) is not None:
-            findings.append("ESCAPE-SET DRIFT: this classifier calls a file "
-                            "using __import__() vacuous, but the tool still "
-                            "checks it -- the classifier's escape set has "
-                            "diverged from the tool's.")
+        star = "from math import *\n\ndef f():\n    return %s\n" % _C12_PROBE
+        glob_ = ("def f():\n    name = 'X'\n    return globals()[name]\n"
+                 "\ndef g():\n    return %s\n" % _C12_PROBE)
+        nerr = ("def f():\n    try:\n        return 1\n"
+                "    except NameError:\n        return 2\n"
+                "\ndef g():\n    return %s\n" % _C12_PROBE)
+        star_x = ("import math\n\ndef f():\n    return math.pi\n"
+                  "\ndef g():\n    return %s\n" % _C12_PROBE)
+        glob_x = ("def f():\n    name = 'X'\n    return name\n"
+                  "\ndef g():\n    return %s\n" % _C12_PROBE)
+        nerr_x = ("def f():\n    try:\n        return 1\n"
+                  "    except ValueError:\n        return 2\n"
+                  "\ndef g():\n    return %s\n" % _C12_PROBE)
+        for label, hatch_src, plain_src in (
+                ("a star import", star, star_x),
+                ("a globals() call", glob_, glob_x),
+                ("an except NameError handler", nerr, nerr_x)):
+            if not _probe_silent(tool_mod, hatch_src):
+                findings.append(
+                    "SHORT-CIRCUIT ARM RED (%s): a file carrying %s and one "
+                    "plain undefined name was still REPORTED, so %s is no "
+                    "longer a whole-file bail-out. Either it was removed "
+                    "from tools/undefined_names.py (it is a correct "
+                    "conservatism -- restore it) or its definition moved and "
+                    "this arm needs the new form." % (label, label, label))
+            if _probe_silent(tool_mod, plain_src):
+                findings.append(
+                    "SHORT-CIRCUIT ARM VACUOUS (%s): the control with the "
+                    "hatch REMOVED was also silent, so the arm above cannot "
+                    "tell the hatch apart from an unrelated short-circuit -- "
+                    "it is not measuring what it claims." % label)
+        # The vacuity verdict above must itself be able to say NO: a source
+        # with no bail-out at all must come back checkable.
+        if _undefined_names_silences_file(
+                "def f():\n    return %s\n" % _C12_PROBE, root) is not None:
+            findings.append(
+                "CLASSIFIER RED: a source with no bail-out at all was judged "
+                "uncheckable, so the vacuity test above would certify every "
+                "fixture and prove nothing.")
+        # __import__ is NOT an escape in the tool; keep the original drift
+        # case (it is what caught the hand-copied set in life 17).
+        if _probe_silent(
+                tool_mod,
+                "def f():\n    __import__('os')\n    return %s\n"
+                % _C12_PROBE):
+            findings.append(
+                "ESCAPE-SET DRIFT: the tool now treats __import__() as a "
+                "whole-file escape; UPDATE this check's prose and the "
+                "escapes-fixture docstring, which both assert it is not.")
     if findings:
         return "C12 undefined names", "FAIL", findings
     return "C12 undefined names", "PASS", [
         "no unbound name in any tracked .py (10/10 detection cases, "
-        "legal-code control clean AND not short-circuited, escape control "
-        "silent, escape-set matches the tool)"]
+        "legal-code control clean AND measurably checkable, one arm per "
+        "whole-file bail-out each with a non-vacuous complement, __import__ "
+        "still checked)"]
 def _registry_orphans(source):
     """Parse a repo_check.py SOURCE and return (defined, registered, orphans).
 

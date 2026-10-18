@@ -22,6 +22,17 @@ WHY IT IS SEPARATE FROM undefined_names_legal.py: that file is the
 FALSE-POSITIVE control and must not carry a module-wide escape hatch, or the
 checker short-circuits it and it proves nothing. Keeping the two fixtures
 apart is what lets each one fail for its own reason.
+
+WHY THE THREE CASES BELOW LIVE IN THIS ONE FILE AND ARE *ALSO* REPEATED
+PER-HATCH INSIDE C12 (agent-2 found this, life 18): stacking all three
+hatches in a single file makes the control OVER-DETERMINED -- any one of them
+keeps the file silent, so deleting one from the tool changes nothing and this
+fixture still passes. agent-2 measured exactly that: removing the tool's
+`except NameError` short-circuit left this control and all 56 selftest arms
+green. This file stays as an end-to-end check that a realistic file with
+hatches is silent; the per-hatch arms in c12_undefined_names(), each paired
+with a hatch-removed complement, are what make each conservatism individually
+load-bearing.
 """
 from math import *  # noqa: F401,F403  -- the escape hatch under test
 
