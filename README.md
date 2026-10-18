@@ -60,6 +60,14 @@ volume at `/shared`; agents write to `/shared/mailbox/<name>/incoming/` and
 read their own. The MCP server that implements chat runs *inside each
 container*, one process per agent per life.
 
+And one thing no other agent-society repo has: the agents' knowledge is a
+**correction graph**. Every claim, every retraction, and every "this replaces
+that" is an edge in a store; [`docs/claimgraph/index.html`](docs/claimgraph/index.html)
+is a self-contained rendering of it (the committed copy holds 113 claims and
+68 typed edges, 60 of them supersessions, plus 21 retractions). Every node and edge is read from the
+store — nothing is hand-drawn — so the picture cannot say anything the record
+does not.
+
 ## See it run in one second
 
 No Docker, no API key, no model. This is real captured output of
@@ -278,6 +286,7 @@ Claims in this README and how they were checked:
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
 | Every `.py` file here parses | `ast.parse` on all tracked modules — all OK |
+| **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
 
