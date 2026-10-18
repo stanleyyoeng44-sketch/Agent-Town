@@ -1745,30 +1745,118 @@ def c17_ci_runs_the_suites(root):
                  "invariants, not that its code works (agent-6)."])
     # A step that only runs check.py and trusts its exit code is not enough:
     # check.py exits 0 on WARN, so a run that discovered 0 suites passes.
-    # Require the workflow to assert the printed suite COUNT.
+    # The step must ASSERT THE COUNT -- and asserting it TEXTUALLY is not
+    # enough either. agent-6 measured that hole in the first version of this
+    # check: a step that runs `python3 tools/check.py >/dev/null 2>&1 || true`
+    # and then `echo "check: 15 suite(s)"` into the log satisfied every text
+    # pattern. The check proved the WORKFLOW was well-spoken, not that the
+    # number came from the run -- which is the same "output vs connection"
+    # distinction this repo spent the night on, one level up.
+    #
+    # So the arm is a REACH test on the PIPELINE: replace tools/check.py with
+    # a stub that prints a count BELOW the threshold and exits 0, run the
+    # step's own shell, and require the step to go RED. If the workflow reads
+    # the number from the run, a stub printing 3 suites makes `test "$n" -ge
+    # 15` fail. If the number is typed or echoed, nothing happens. A second
+    # stub exits 1 and the step must propagate that too (set -o pipefail).
     for name, st in invoked:
-        window = open(os.path.join(wf_dir, name), encoding="utf-8").read()
-        # The assertion must be ABOUT the line check.py prints ("check: N
-        # suite(s)"), not merely contain the word "suite". A bare `grep suite`
-        # over some other file satisfied the earlier pattern and proved
-        # nothing -- the same "well-spoken control" defect this repo keeps
-        # finding. Accept either the literal output prefix check.py emits, or
-        # a grep whose pattern mentions the suite-count phrase.
-        _count_re = (r"check:\s*[0-9]+\s+suite"
-                     r"|grep[^\n]*suite[^\n]*log"
-                     r"|grep[^\n]*log[^\n]*suite")
-        if not re.search(_count_re, window):
-            findings.append(
-                "%s runs check.py but never asserts the DISCOVERED SUITE COUNT. "
-                "check.py exits 0 on WARN, so a step wired to the exit code "
-                "passes when it runs 0 suites and when it runs 16 -- which is "
-                "the same defect one level up. Assert the '<N> suite(s)' line."
-                % name)
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        ok, why = _c17_reach(text, root)
+        if not ok:
+            findings.append("%s: %s" % (name, why))
     if findings:
         return ("C17 CI runs the test suites", "FAIL", findings)
     return ("C17 CI runs the test suites", "PASS",
-            ["%d workflow step(s) invoke tools/check.py and assert its suite "
-             "count: %s" % (len(invoked), ", ".join(sorted({n for n, _ in invoked})))])
+            ["%d workflow step(s) invoke tools/check.py, and the step's own "
+             "shell FAILS when a stub reports too few suites or exits 1: %s"
+             % (len(invoked), ", ".join(sorted({n for n, _ in invoked})))])
+
+
+def _c17_step_scripts(workflow_text):
+    """The shell body of every step whose commands mention tools/check.py."""
+    lines = workflow_text.splitlines()
+    scripts = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        st = raw.strip()
+        if st.startswith("- "):
+            st = st[2:]
+        if st.startswith("run:"):
+            body = []
+            rest = st[4:].strip()
+            base = len(raw) - len(raw.lstrip())
+            if rest and rest not in ("|", ">", "|-", ">-"):
+                body.append(rest)
+            else:
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i]
+                    if not nxt.strip():
+                        i += 1
+                        continue
+                    if len(nxt) - len(nxt.lstrip()) <= base:
+                        break
+                    body.append(nxt.strip())
+                    i += 1
+                if any(re.search(r"(?<![\w-])tools/check\.py\b", b)
+                       for b in body):
+                    scripts.append("\n".join(body))
+                continue
+            if any(re.search(r"(?<![\w-])tools/check\.py\b", b)
+                   for b in body):
+                scripts.append("\n".join(body))
+        i += 1
+    return scripts
+
+
+def _c17_reach(workflow_text, root):
+    """Run each check.py step against STUBBED runners and require a red.
+
+    This is the arm that makes the count assertion mean something. It is
+    deliberately a stub on the PIPELINE, not a text match on the file.
+    """
+    import tempfile
+    import shutil
+    scripts = _c17_step_scripts(workflow_text)
+    if not scripts:
+        return False, ("no runnable step invokes tools/check.py (found the "
+                       "name in prose or an echo, not as a command)")
+    # Two stubs. (a) exits 0 printing a count BELOW the step's threshold --
+    # catches a step that types its own number. (b) exits 1 -- catches a step
+    # that swallows a real failure with `|| true` or a missing pipefail.
+    stubs = [
+        ("import sys\nprint('check: 3 suite(s), from /stub')\nsys.exit(0)\n",
+         "a stub reporting 3 suites"),
+        ("import sys\nsys.exit(1)\n", "a stub exiting 1"),
+    ]
+    results = []
+    for body, label in stubs:
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "tools"))
+            # The stub IS tools/check.py in the scratch dir, so the step's own
+            # `python3 tools/check.py` runs it. grep and test are the real
+            # binaries; only the runner is stubbed.
+            open(os.path.join(d, "tools", "check.py"), "w").write(body)
+            r = subprocess.run(["bash", "-c", scripts[0]], cwd=d,
+                               capture_output=True, text=True, timeout=120)
+            results.append((label, r.returncode, r))
+        except Exception as exc:  # a check must not crash the whole report
+            results.append((label, None, exc))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    for label, rc, r in results:
+        if rc is None:
+            return False, ("could not run the step against %s (%s), so its "
+                           "count assertion cannot be shown to be connected"
+                           % (label, r))
+        if rc == 0:
+            return False, (
+                "the step stays GREEN when %s -- so the suite count it "
+                "asserts is not read from the run. A step can print the right "
+                "number while measuring nothing." % label)
+    return True, ""
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
@@ -2727,13 +2815,39 @@ def selftest():
         "C17 FAILs on a step that trusts check.py's exit code",
         _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
                 "      - run: python3 tools/check.py\n") == "FAIL"))
+    # The PASS arm must be a step whose assertion is CONNECTED to the run,
+    # because C17 now STUBS the runner and requires the step to go red.
+    _good_step = ("name: ci\njobs:\n  t:\n    steps:\n"
+                  "      - run: |\n"
+                  "          set -o pipefail\n"
+                  "          python3 tools/check.py | tee /tmp/c.log\n"
+                  "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
+                  " | grep -oE '[0-9]+' | head -1)\n"
+                  "          test -n \"$n\" || exit 1\n"
+                  "          test \"$n\" -ge 15 || exit 1\n")
     outcomes.append((
-        "C17 PASSes only when the workflow asserts the suite COUNT",
+        "C17 PASSes on a step whose count assertion is read from the run",
+        _c17_on(_good_step) == "PASS"))
+    # agent-6's attack, and the reason this arm exists: a step that throws the
+    # runner's output away and ECHOES a typed count satisfied every textual
+    # pattern the first version of C17 used. It must FAIL now, because the
+    # stubbed runner prints 3 and the echoed 15 hides it.
+    outcomes.append((
+        "C17 FAILs on a step that ECHOES a typed count instead of reading one",
         _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
                 "      - run: |\n"
-                "          python3 tools/check.py | tee /tmp/c.log\n"
-                "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log)\n"
-                "          test -n \"$n\"\n") == "PASS"))
+                "          set -o pipefail\n"
+                "          true && python3 tools/check.py >/dev/null 2>&1 || true\n"
+                "          echo \"check: 15 suite(s)\" > /tmp/c.log\n"
+                "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
+                " | grep -oE '[0-9]+' | head -1)\n"
+                "          test \"$n\" -ge 15 || exit 1\n") == "FAIL"))
+    outcomes.append((
+        "C17 FAILs on a step that swallows check.py's failure (no pipefail)",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          python3 tools/check.py | tee /tmp/c.log || true\n"
+                "          echo \"check: 15 suite(s)\"\n") == "FAIL"))
     outcomes.append((
         "C17 does NOT mistake repo_check.py for the suite runner",
         _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
