@@ -191,14 +191,21 @@ class Handler(BaseHTTPRequestHandler):
             name = m.group(1)
             with _lock:
                 ticks = decay_ticks()
-                balance, created = ensure_account(name)
-                if ticks or created:
+                # A READ MUST NOT WRITE. This used to call ensure_account(),
+                # which CREATED the row and saved the ledger, so 2,000 reads
+                # of fresh names grew /data/accounts.json without bound while
+                # honestly answering exists=false. Stopping creation from
+                # FUNDING the account did not stop it creating one. Decay is
+                # still persisted when it advanced; the account row is not.
+                existed = name in _accounts
+                balance = _accounts.get(name, 0)
+                if ticks:
                     save()
             # `exists` distinguishes "this agent has an account" from "you
             # asked about a name". 200-with-0 is friendlier to the MCP client
             # than 404 and it is honest about what the number means.
             return self._send(200, {"agent": name, "money": balance,
-                                    "exists": not created})
+                                    "exists": existed})
         return self._send(404, {"error": f"unknown path {path}"})
 
     def do_POST(self):
