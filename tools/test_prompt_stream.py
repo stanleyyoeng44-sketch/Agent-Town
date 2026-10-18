@@ -41,6 +41,21 @@ CASES = [
     (True, [], ["late"], "resumed, mail arrives at a boundary", True),
 ]
 
+# Cases where the FIRST TURN MUST CONTAIN the wake-up prompt itself.
+# The shipped test asserted only bool(first) -- that a turn exists. Stanley's
+# commit made "the resume path sends the wake-up prompt" its headline claim,
+# and two mutants that DELETE the prompt from the kick passed the old suite:
+#   wake_prompt body -> "(omitted)"        : PASS
+#   wake_prompt body removed entirely      : PASS
+# A turn that opens the session but carries no plan is not the behaviour the
+# commit claims, and only a content assertion can tell the two apart.
+MUST_CARRY_WAKE = {
+    # The activation path THIS commit added. The fresh-life case is not in
+    # this set because the harness stubs opening_message() with a constant,
+    # so a missing prompt there would be the stub's doing, not the code's.
+    "resumed, no mail",
+}
+
 
 def extract(path):
     """The shipped prompt_stream body, as an unparsed source string."""
@@ -100,11 +115,53 @@ def run_cases(fn, label):
     for resumed, pending, items, name, must in CASES:
         first = run_case(fn, resumed, pending, items)
         passed = bool(first) == must
-        ok = ok and passed
+        if passed and name in MUST_CARRY_WAKE:
+            passed = "WAKE" in (first or "")
+            if not passed:
+                print("  %-5s %-36s first=%r  (does NOT carry the wake "
+                      "prompt)" % ("FAIL", name, (first or "")[:40]))
+                ok = False
+                continue
         print("  %-5s %-36s first=%r"
               % ("PASS" if passed else "FAIL", name,
                  (first or "<NOTHING>")[:40].replace("\n", " ")))
     return ok
+
+
+def strip_wake_from_kick(body):
+    """Remove f-string interpolation of wake_prompt from the RESUME kick.
+
+    This is the mutant that the old assertions could not see: the turn is
+    still yielded (bool(first) is True), but it no longer carries the plan.
+    Built from the parsed AST so it cannot miss on a whitespace change, and
+    it REFUSES to return a no-op mutation -- a control that did not mutate is
+    not a control.
+    """
+    def visit(src):
+        tree = ast.parse(src)
+        hit = [False]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                keep = []
+                for v in node.values:
+                    if isinstance(v, ast.FormattedValue) and \
+                            isinstance(v.value, ast.Name) and \
+                            v.value.id == "wake_prompt":
+                        hit[0] = True
+                        keep.append(ast.Constant(value="[PROMPT-REMOVED]"))
+                    else:
+                        keep.append(v)
+                node.values = keep
+        return ast.unparse(tree), hit[0]
+
+    src = "async def _x():\n" + textwrap.indent(body, "    ")
+    out, changed = visit(src)
+    if not changed:
+        raise SystemExit("FAIL: could not find wake_prompt in the kick; the "
+                         "control would be a no-op")
+    # strip the synthetic wrapper back off
+    tree = ast.parse(out)
+    return "\n".join(ast.unparse(st) for st in tree.body[0].body)
 
 
 def pre_fix_body(body):
@@ -163,6 +220,13 @@ def main():
     body = extract(DAEMON)
     shipped_ok = run_cases(compile_stream(body), "A. SHIPPED prompt_stream")
 
+    stripped = strip_wake_from_kick(body)
+    stripped_ok = run_cases(compile_stream(stripped),
+                            "\nC. CONTROL -- a resume kick that DROPS the "
+                            "wake prompt MUST fail")
+    # Inverted, like the pre-fix control: the mutant must be caught.
+    strip_caught = not stripped_ok
+
     mutated = pre_fix_body(body)
     control_ok = run_cases(compile_stream(mutated),
                            "\nB. CONTROL -- the pre-fix shape MUST go mute "
@@ -172,9 +236,10 @@ def main():
     control_fired = not control_ok
 
     print()
+    print("  control fired (resume kick lost the prompt): %s" % strip_caught)
     print("  control fired (pre-fix shape went mute): %s"
           % ("PASS" if control_fired else "FAIL -- this test is blind"))
-    good = shipped_ok and control_fired
+    good = shipped_ok and control_fired and strip_caught
     print("\n%s" % ("PROMPT-STREAM PASS" if good else "PROMPT-STREAM FAIL"))
     return 0 if good else 1
 
