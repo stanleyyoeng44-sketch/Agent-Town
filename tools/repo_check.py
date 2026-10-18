@@ -1131,7 +1131,7 @@ def c12_undefined_names(root):
         "legal-code control clean)"]
 
 
-def _mutant_tree(root, rel, old, new):
+def _mutant_tree(root, rel, old, new, mutate=True):
     """A FULL COPY of the tree with one line changed, for the connection arm.
 
     A copy, not a symlink farm: the first version symlinked every top-level
@@ -1161,13 +1161,15 @@ def _mutant_tree(root, rel, old, new):
         text = open(target, encoding="utf-8").read()
     except OSError:
         return d, False
+    if not mutate:
+        return d, True
     if old not in text:
         return d, False
     open(target, "w", encoding="utf-8").write(text.replace(old, new, 1))
     return d, True
 
 
-def _run_tool(root, tool, label, mutant):
+def _run_tool(root, tool, label, mutants):
     """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
 
     These two tools were built and reviewed (agent-7, portcheck+tokencheck)
@@ -1217,31 +1219,56 @@ def _run_tool(root, tool, label, mutant):
         return label, "WARN", [f"cannot measure here: {tail}"]
     if r.returncode != 0:
         return label, "FAIL", out[-6:]
-    # (3) THE CONNECTION ARM.
-    rel, old, new = mutant
+    # (3) THE CONNECTION ARMS: every mutant, not just one.
     import shutil
-    d = None
-    try:
-        d, applied = _mutant_tree(root, rel, old, new)
-        if not applied:
-            return label, "FAIL", [
-                f"the mutant arm could not be applied: {rel} no longer "
-                f"contains {old!r}. The document changed shape, so this gate "
-                f"cannot prove the tool is connected. Update the mutant in "
-                f"repo_check to a defect that still exists."]
-        m = subprocess.run([sys.executable, "-I", path, d], cwd=d,
-                           capture_output=True, text=True, timeout=120)
-        if m.returncode != 1:
-            return label, "FAIL", [
-                f"{tool} stayed GREEN (exit {m.returncode}) on a tree with a "
-                f"real defect injected ({rel}: removed {old!r}). Its selftest "
-                f"speaks correctly, so either the tool is disconnected from "
-                f"the docs or this mutant is no longer a defect. A gate that "
-                f"cannot fail is decoration."]
-    finally:
-        if d:
-            shutil.rmtree(d, ignore_errors=True)
-    return label, "PASS", [tail, f"mutant arm: {rel} minus one defect -> DIFFER"]
+    notes = []
+    for rel, old, new in mutants:
+        d = None
+        try:
+            d, applied = _mutant_tree(root, rel, old, new, mutate=False)
+            if not applied:
+                return label, "FAIL", [
+                    f"a mutant arm could not be applied: {rel} no longer "
+                    f"contains {old[:60]!r}. The tree changed shape, so this "
+                    f"gate cannot prove the tool is connected. Update the "
+                    f"mutant in repo_check to a defect that still exists."]
+            # CONTROL for this mutant: the SAME copy without the injection
+            # must be exit 0. Otherwise "it went red" could be the copy
+            # rather than the defect -- the confound agent-8's arm C exists
+            # for. Cheap: one extra run of a tool that takes a second.
+            clean = subprocess.run([sys.executable, "-I", path, d],
+                                   cwd=d, capture_output=True, text=True,
+                                   timeout=120)
+            if clean.returncode != 0:
+                return label, "FAIL", [
+                    f"CONTROL CONFOUND: the UNMUTATED copy of the tree "
+                    f"already fails ({tool} exit {clean.returncode}), so the "
+                    f"mutant's red would prove nothing: "
+                    f"{(clean.stdout or '').strip().splitlines()[-1:]}"]
+            tgt = os.path.join(d, rel)
+            txt = open(tgt, encoding="utf-8").read()
+            if old not in txt:
+                return label, "FAIL", [
+                    f"a mutant arm could not be applied: {rel} no longer "
+                    f"contains {old[:60]!r}. Update the mutant in repo_check "
+                    f"to a defect that still exists."]
+            open(tgt, "w", encoding="utf-8").write(txt.replace(old, new, 1))
+            m = subprocess.run([sys.executable, "-I", path, d], cwd=d,
+                               capture_output=True, text=True, timeout=120)
+            if m.returncode != 1:
+                return label, "FAIL", [
+                    f"{tool} stayed GREEN (exit {m.returncode}) on a tree "
+                    f"with a real defect injected ({rel}: the mutant rooted "
+                    f"at {old[:50]!r}). Its selftest speaks correctly, so "
+                    f"either "
+                    f"the tool is disconnected from the docs or this mutant "
+                    f"is no longer a defect. A gate that cannot fail is "
+                    f"decoration."]
+            notes.append(f"mutant arm: {rel} + {old[:40]!r} -> DIFFER")
+        finally:
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+    return label, "PASS", [tail] + notes
 
 
 def c15_portcheck(root):
@@ -1254,8 +1281,16 @@ def c15_portcheck(root):
     that cannot see it. Fixed in d791564; this makes the invariant a gate.
     """
     return _run_tool(root, "tools/portcheck.py", "C15 docs publish serve consumers",
-                     ("docs/CLOUD-DEPLOYMENT.md",
-                      "  -p 127.0.0.1:8790:8790 \\\n", ""))
+                     [("docs/CLOUD-DEPLOYMENT.md",
+                       "  -p 127.0.0.1:8790:8790 \\\n", ""),
+                      # BOTH DIRECTIONS of the same publish are injected.
+                      # Measured: removing the bridge publish gives DIFFER
+                      # naming agent/mcp-stdio.py:47 as the cut-off caller,
+                      # while removing the loopback one names
+                      # ui/control.py:432. A detector wired to only one of
+                      # them is as blind as a filter that names its tokens.
+                      ("docs/CLOUD-DEPLOYMENT.md",
+                       "  -p $docker0:8790:8790 \\\n", "")])
 
 
 def c16_tokencheck(root):
@@ -1269,9 +1304,20 @@ def c16_tokencheck(root):
     three docs to go red, so it cannot be satisfied by editing its own list.
     """
     return _run_tool(root, "tools/tokencheck.py", "C16 docs mount every bank token",
-                     ("README.md",
-                      "  -v ~/.config/docker-ai/agent0-transfer-token:"
-                      "/app/agent0-transfer-token:ro \\\n", ""))
+                     [("README.md",
+                       "  -v ~/.config/docker-ai/agent0-transfer-token:"
+                       "/app/agent0-transfer-token:ro \\\n", ""),
+                      # THE FOURTH TOKEN. agent-8's v4 attack filtered its
+                      # findings to the three token names every shipped arm
+                      # uses, so it was blind to a token nobody had named and
+                      # indistinguishable from a working detector on the one
+                      # mutant above. A mutant the tool's author never saw is
+                      # the only mutant that cannot have been special-cased.
+                      ("bank/bank.py",
+                       'AGENT0_TOKEN_FILE = _token_file(',
+                       'AUDIT_TOKEN_FILE = _token_file("/run/secrets/audit-'
+                       'token", "/app/audit-token")\nAGENT0_TOKEN_FILE = '
+                       '_token_file(')])
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
