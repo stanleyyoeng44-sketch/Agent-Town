@@ -51,7 +51,7 @@ jobs:
       # Assert the DISCOVERED COUNT that check.py prints instead.
       - name: the suites run, and the count is asserted
         run: |
-          set -o pipefail
+          set -euo pipefail
           python3 tools/check.py | tee /tmp/check.log
           n=$(grep -oE 'check: [0-9]+ suite' /tmp/check.log | grep -oE '[0-9]+' | head -1)
           test -n "$n" || { echo "::error::check.py printed no suite count"; exit 1; }
