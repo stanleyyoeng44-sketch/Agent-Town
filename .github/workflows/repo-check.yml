@@ -1,0 +1,30 @@
+name: repo check
+
+# The repo checks itself on every push. The point is not the green tick;
+# the point is that the tick cannot be green without having run.
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # FULL HISTORY is required: C3 scans every blob reachable from every
+          # ref, and a shallow clone would make it scan almost nothing. C3
+          # refuses to report PASS on a walk that inspected almost nothing, so
+          # a shallow checkout would show up as WARN, not as a false green --
+          # but there is no reason to pay that: fetch it all.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: the checks can fail (negative controls)
+        run: python3 tools/repo_check.py --selftest
+
+      - name: the repo passes its own checks
+        run: python3 tools/repo_check.py .
