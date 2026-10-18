@@ -197,7 +197,15 @@ class Handler(BaseHTTPRequestHandler):
 
         with _lock:
             ticks = decay_ticks()
-            s_bal, s_new = ensure_account(sender)
+            # A sender must already exist. Auto-creating the SENDER of a
+            # transfer funds a name that has never been seen, which lets any
+            # caller mint START_MONEY per fresh name and move it out. Accounts
+            # are still created on first touch for the recipient, for
+            # GET /balance, and for the operator paths -- but not for a
+            # transfer's sender.
+            if sender not in _accounts:
+                return self._send(400, {"error": "unknown sender"})
+            s_bal, s_new = _accounts[sender], False
             r_bal, r_new = ensure_account(recipient)
             if ticks or s_new or r_new:
                 save()
