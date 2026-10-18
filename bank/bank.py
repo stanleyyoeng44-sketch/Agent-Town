@@ -32,7 +32,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("PORT", "8790"))
 START_MONEY = int(os.environ.get("START_MONEY", "1000"))
 DECAY_SECONDS = int(os.environ.get("DECAY_SECONDS", "60"))
-DATA = "/data/accounts.json"
+# DATA is env-configurable so a reader can run a second bank, or verify the
+# README bank section, without editing source. Default unchanged, so the
+# container path is identical to before.
+DATA = os.environ.get("DATA", "/data/accounts.json")
 MAILBOX = "/shared/mailbox"
 ADMIN_TOKEN_FILE = "/run/secrets/bank-admin-token"
 AGENT0_TOKEN_FILE = "/run/secrets/agent0-transfer-token"
