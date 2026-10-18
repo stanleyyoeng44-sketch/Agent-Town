@@ -139,6 +139,8 @@ def replay(root, readme_text, verbose=False):
     proc = subprocess.Popen([sys.executable, "bank/bank.py"], cwd=root, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True)
+    # bank.py sets its decay origin at import, so this is the tick origin.
+    seen_at = time.time()
     fails = []
     try:
         # Wait for the server, not for a sleep: connections are the fact.
@@ -173,6 +175,16 @@ def replay(root, readme_text, verbose=False):
             return fails
 
         snapshot = None
+        # WHICH READ, NOT WHICH VALUE.
+        # MEASURED DEFECT (agent-2, 2026-10-18): the old branch below tested
+        # the README's OWN value -- `quoted.get("money") != 1000` -- to decide
+        # whether a /balance/agent-2 line was the seed read or the decay read.
+        # So a README that quoted 999, 1001 or 0 for the FIRST balance took the
+        # decay path, and the shipped check returned PASS for every one of
+        # them (reproduced on master 1ee34ea before this change). A check whose
+        # behaviour is selected by the value it is checking cannot reject that
+        # value. The selector has to be the POSITION in the transcript.
+        balance_seen = 0
         for cmd, quoted in pairs:
             if verbose:
                 print(f"    replay: {cmd}")
@@ -231,8 +243,45 @@ def replay(root, readme_text, verbose=False):
             m = re.search(r"localhost:\d+(/\S+)", cmd)
             if m:
                 path = m.group(1)
-                if path.startswith("/balance/agent-2") and quoted and \
-                        quoted.get("money") != 1000:
+                is_balance = path.startswith("/balance/agent-2")
+                if is_balance:
+                    balance_seen += 1
+                if is_balance and balance_seen == 1:
+                    # FIRST READ: the README claims a SEED -- a freshly seeded
+                    # agent starts at 1000. The value is on a clock, so compare
+                    # against the clock and not against a literal.
+                    # MEASURED: the old literal comparison failed 1 run in 10
+                    # on master 1ee34ea (README 1000, bank 999) because the
+                    # harness starts the bank with DECAY_SECONDS=1 and its own
+                    # startup is 0.38-0.72 s; a read landing after 1 s was
+                    # blamed on the README. Deterministic confirmation: same
+                    # tree, read at 0.81 s -> 1000, at 1.70 s -> 999.
+                    # The README must still say 1000; only the BANK's tick is
+                    # allowed to move the number, and only by whole ticks.
+                    got = http(port, "GET", path)
+                    cur = got.get("money")
+                    elapsed = time.time() - seen_at
+                    low = 1000 - int(elapsed // 1) - 1
+                    if quoted is None or quoted.get("money") != 1000:
+                        fails.append(
+                            f"{cmd}\n      README: {quoted}\n"
+                            f"      the FIRST balance in the transcript is the "
+                            f"SEED and must read 1000; a different value is a "
+                            f"claim about the bank, not a claim about decay")
+                    elif cur is None or not (low <= cur <= 1000):
+                        fails.append(
+                            f"{cmd}\n      README: {quoted}\n"
+                            f"      bank:   {got}\n"
+                            f"      {elapsed:.2f}s after the bank started, at "
+                            f"DECAY_SECONDS=1, the decayed seed can only be "
+                            f"{low}..1000 -- this is outside that")
+                    elif cur != 1000:
+                        print(f"    NOTE: first balance read {cur}; "
+                              f"{elapsed:.2f}s elapsed explains "
+                              f"{1000 - cur} tick(s) (allowed "
+                              f"{int(elapsed // 1) + 1})")
+                    continue
+                if is_balance and quoted and quoted.get("money") != 1000:
                     # The decay assertion: wait until the balance has moved,
                     # then require it moved by whole ticks, not by a constant.
                     before = http(port, "GET", path)["money"]
@@ -287,7 +336,47 @@ def main():
         else:
             print(f"  {'PASS' if not ok_bad else 'FAIL'}  a mutated quoted "
                   f"response is caught")
-        return 0 if (ok_real and built and not ok_bad) else 1
+
+        # THE FIRST-BALANCE ARMS, which the arm above does not reach.
+        # MEASURED (agent-2, 2026-10-18) on the previous version: rewriting the
+        # FIRST quoted balance to 999, to 1001 and even to 0 all left this
+        # selftest and the real run GREEN, because the branch was selected by
+        # the README's own value -- any non-1000 number took the decay path.
+        # The arm above mutates the refusal in the SECOND block, so it could
+        # never have caught that. Each arm below is a different lie and each
+        # must be rejected; the pristine read must stay green (ok_real above).
+        first_lies = [
+            ('{"agent": "agent-2", "money": 1000, "exists": true}',
+             '{"agent": "agent-2", "money": 999, "exists": true}',
+             "a first balance of 999 (a WRONG seed, not decay)"),
+            ('{"agent": "agent-2", "money": 1000, "exists": true}',
+             '{"agent": "agent-2", "money": 1001, "exists": true}',
+             "a first balance of 1001 (a mint decay cannot explain)"),
+            ('{"agent": "agent-2", "money": 1000, "exists": true}',
+             '{"agent": "agent-2", "money": 0, "exists": true}',
+             "a first balance of 0 (an empty account reported as seeded)"),
+        ]
+        first_results = []
+        for old, new, label in first_lies:
+            mutated = text.replace(old, new, 1)
+            if mutated == text:
+                print(f"  FAIL  could not build the lie: {label}; the README "
+                      f"no longer carries the line this arm mutates")
+                first_results.append(False)
+                continue
+            # replay() returns the LIST OF FAILURES, so a caught lie is a
+            # NON-EMPTY list. Writing `not replay(...)` here -- my first
+            # version -- inverts the meaning and prints FAIL for every arm
+            # that works. The arm above (`ok_bad = not replay(...)`) reads
+            # correctly only because it is tested with another `not`. A label
+            # is not a measurement: this arm reported all three lies as
+            # missed while the replayer was rejecting each of them.
+            caught = bool(replay(ROOT, mutated))
+            print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
+            first_results.append(caught)
+
+        all_ok = (ok_real and built and not ok_bad and all(first_results))
+        return 0 if all_ok else 1
 
     fails = replay(ROOT, text, verbose="--verbose" in args)
     if fails:
