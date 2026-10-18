@@ -238,6 +238,18 @@ def selftest():
             except OSError:
                 pass
 
+    # L7: A DEAD EXCLUSION IS A SILENT HOLE (agent-10). EXCLUDE is keyed by
+    # exact path; if a file is renamed, its entry stops matching anything and
+    # whatever it pointed at either runs as a normal suite or vanishes, with no
+    # line saying so. The table must describe files that EXIST.
+    dead = [rel for rel in EXCLUDE
+            if not os.path.exists(os.path.join(ROOT, rel))]
+    ok = ok and not dead
+    print("  %-5s %-44s %s" % ("PASS" if not dead else "FAIL",
+                               "L7 no dead EXCLUDE entries",
+                               "all point at real files" if not dead
+                               else "dead: %s" % ", ".join(dead)))
+
     # L4: the aggregate verdict must follow the worst suite.
     verdict = verdict_of(["PASS", "WARN", "FAIL"])
     good_case = verdict == "FAIL"
