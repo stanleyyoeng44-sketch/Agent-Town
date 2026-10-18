@@ -221,6 +221,32 @@ def unit_simulation():
     check("CURRENT marker exists where the UI looks for it",
           os.path.isfile(os.path.join(tr_dir, "CURRENT")),
           "UI would show no current life")
+
+    # A clean sleep must REMOVE the marker (agent-0's review: the comment
+    # claimed this and the code did not do it, so the UI showed a finished
+    # life as running). The daemon's Death cleanup is a source fact we can
+    # check without running the CLI; assert the removal is present next to
+    # the session-file removal it travels with.
+    dsrc = open(os.path.join(REPO, "agent", "agent-daemon.py")).read()
+    death = dsrc[dsrc.index("except Death:"):]
+    death = death[:death.index("finally:")]
+    check("a clean sleep removes CURRENT, not just session-id",
+          "os.remove(CURRENT_LIFE_FILE)" in death and
+          "os.remove(SESSION_FILE)" in death,
+          "the marker outlives the life it names")
+    check("the docstring's claim about CURRENT matches the code",
+          "removed on a clean sleep" not in dsrc
+          or "os.remove(CURRENT_LIFE_FILE)" in dsrc,
+          "a comment promises behaviour the code does not have")
+
+    # The UI must not render lives[0] unconditionally.
+    csrc = open(os.path.join(REPO, "ui", "control.py")).read()
+    check("the UI selects the life marked current, not merely the newest",
+          "lives.filter(l => l.current)" in csrc,
+          "the current flag is computed and then ignored")
+    check("the UI says so when no life is current",
+          "no current life reported" in csrc,
+          "absence would be presented as if a life were running")
     os.makedirs(os.path.join(records), exist_ok=True)
 
     shutil.rmtree(tmp, ignore_errors=True)

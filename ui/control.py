@@ -752,16 +752,26 @@ function renderEvents(evs){
   return out.join('');
 }
 
+let currentLifeKnown = false;
+
 async function loadConvo(){
   if (!current) { $('#view').innerHTML = '<div class="statusline">select an agent</div>'; return; }
   const lives = await (await api(`/api/agent/${current}/lives`)).json();
   if (!lives.length) { $('#view').innerHTML = '<div class="statusline">no lives yet</div>'; return; }
-  // render the newest life (could be extended to a life dropdown)
-  const life = lives[0];
+  // Show the CURRENT life when the daemon says one is running; otherwise the
+  // newest. Showing lives[0] unconditionally was the other half of Stanley's
+  // "my UI won't show the context": after a restart the newest transcript is
+  // the life that was INTERRUPTED, not the one running.
+  const cur = lives.filter(l => l.current);
+  let life = cur.length ? cur[0] : lives[0];
+  currentLifeKnown = cur.length > 0;
   const evs = await (await api(`/api/agent/${current}/life/${life.id}`)).json();
   if (evs.length === lastLen) return;
   lastLen = evs.length;
-  $('#title').textContent = `${current} · life ${life.id} · ${evs.length} events`;
+  $('#title').textContent = `${current} · life ${life.id} · ${evs.length} events`
+    + (life.current ? ' · running now'
+       : (currentLifeKnown ? ' · finished (agent sleeping)'
+          : ' · no current life reported'));
   const v = $('#view');
   const atBottom = v.scrollHeight - v.scrollTop - v.clientHeight < 60;
   v.innerHTML = renderEvents(evs) || '<div class="statusline">empty</div>';

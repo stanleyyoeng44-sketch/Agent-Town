@@ -585,6 +585,15 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 os.remove(SESSION_FILE)
             except OSError:
                 pass
+            # The CURRENT marker means "a life is running now". After a clean
+            # sleep none is, and leaving the marker would make the UI show a
+            # finished life as the current one -- the exact lie it exists to
+            # prevent. (agent-0, review of 718d278: the comment said this was
+            # done; it was not.)
+            try:
+                os.remove(CURRENT_LIFE_FILE)
+            except OSError:
+                pass
         finally:
             tasks = [feed, watcher, chat] + ([human] if human else [])
             for t in tasks:
