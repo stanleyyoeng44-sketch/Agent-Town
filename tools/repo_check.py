@@ -1638,12 +1638,145 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
+def _workflow_run_lines(text):
+    """Every COMMAND line a workflow executes, including block scalars.
+
+    A step written as `run: python3 tools/check.py` is one line, but the same
+    step written as a `run: |` block puts its commands on following indented
+    lines. Testing only `line.startswith("run:")` misses the block form --
+    and the block form is what any step asserting a count has to use.
+    """
+    out = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        st = line.strip()
+        # A step is a list item: "- run: ..." and "- name: ..." are the same
+        # indentation as "run: ..." once the dash is stripped. Missing the
+        # dash was why a minimal workflow found ZERO run lines while the
+        # repo's own file parsed -- caught by C17's own PASS arm, which is
+        # exactly what the arm is for.
+        if st.startswith("- "):
+            st = st[2:]
+        if st.startswith("run:"):
+            rest = st[4:].strip()
+            if rest and rest not in ("|", ">", "|-", ">-"):
+                out.append(rest)
+            else:
+                base = len(line) - len(line.lstrip())
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i]
+                    if not nxt.strip():
+                        i += 1
+                        continue
+                    if len(nxt) - len(nxt.lstrip()) <= base:
+                        break
+                    out.append(nxt.strip())
+                    i += 1
+                continue
+        i += 1
+    return out
+
+
+def c17_ci_runs_the_suites(root):
+    """CI must invoke the SUITE RUNNER, and must assert its COUNT.
+
+    TWO DEFECTS, both measured before this check existed:
+
+    (1) DISJUNCTION. tools/check.py discovers and runs the repo's test suites.
+        The workflow ran only tools/repo_check.py, which names NONE of them.
+        agent-6 demonstrated it: severing wake_prompt = read_wake_prompt()
+        left both CI steps exit 0 and "REPO CHECK: PASS". So GitHub-green
+        proved the docs, not the code.
+
+    (2) THE NAIVE FIX LIES. tools/check.py exits 0 on WARN as well as PASS
+        ("CHECK: WARN (16 pass, 1 warn, 0 fail)", exit 0, measured on a clean
+        export; on a runner with docker the dispatched paths change and it is
+        still exit 0). A CI step wired to the EXIT CODE therefore reproduces
+        the defect one level up: a step that runs 0 suites and a step that
+        runs 16 are indistinguishable. The step must assert the DISCOVERED
+        SUITE COUNT that check.py prints -- that is the only line in its
+        output that changes when suites stop being found.
+
+    WHAT THIS CHECK DOES NOT DO: it does not run the suites (that is CI's
+    job, and this check must stay cheap and offline). It asserts the step
+    EXISTS and that it is wired to a COUNT. A workflow that has the right
+    shape and runs the wrong thing is a different defect with a different
+    instrument -- the same boundary C14 states about gutted bodies.
+    """
+    wf_dir = os.path.join(root, ".github", "workflows")
+    if not os.path.isdir(wf_dir):
+        return ("C17 CI runs the test suites", "FAIL",
+                [".github/workflows/ is missing, so nothing runs the suites "
+                 "in CI. A test runner nobody invokes enforces nothing."])
+    files = sorted(f for f in os.listdir(wf_dir)
+                   if f.endswith((".yml", ".yaml")))
+    if not files:
+        return ("C17 CI runs the test suites", "FAIL",
+                [".github/workflows/ holds no workflow file."])
+    findings = []
+    invoked = []
+    for name in files:
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        for st in _workflow_run_lines(text):
+            # tools/check.py, NOT tools/repo_check.py -- a substring test on
+            # "check.py" matches BOTH, and an earlier draft of this check
+            # reported the workflow as invoking the suite runner when it
+            # invoked only the repo checks. That is the "accuses a correct
+            # line" failure this repo deletes checks for; found by running
+            # it on a correct tree before trusting it.
+            # It must be an INVOCATION, not a mention. The step that asserts
+            # the count also ECHOES "check.py" inside its error strings, and
+            # a bare substring test counted those as three extra steps. Require
+            # an interpreter/executable position: the line must start with a
+            # command and the path must be an argument to it, not text after
+            # "echo".
+            if st.lstrip().startswith(("echo", "test ", "#", "printf")):
+                continue
+            if re.search(r"(?:^|[\s|;&])(?:python3?|bash|sh|\.\/)?\s*"
+                         r"(?<![\w-])tools/check\.py\b", st):
+                invoked.append((name, st))
+    if not invoked:
+        return ("C17 CI runs the test suites", "FAIL",
+                ["no workflow step invokes tools/check.py. The suites exist "
+                 "and CI names none of them: GitHub-green proves the repo's "
+                 "invariants, not that its code works (agent-6)."])
+    # A step that only runs check.py and trusts its exit code is not enough:
+    # check.py exits 0 on WARN, so a run that discovered 0 suites passes.
+    # Require the workflow to assert the printed suite COUNT.
+    for name, st in invoked:
+        window = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        # The assertion must be ABOUT the line check.py prints ("check: N
+        # suite(s)"), not merely contain the word "suite". A bare `grep suite`
+        # over some other file satisfied the earlier pattern and proved
+        # nothing -- the same "well-spoken control" defect this repo keeps
+        # finding. Accept either the literal output prefix check.py emits, or
+        # a grep whose pattern mentions the suite-count phrase.
+        _count_re = (r"check:\s*[0-9]+\s+suite"
+                     r"|grep[^\n]*suite[^\n]*log"
+                     r"|grep[^\n]*log[^\n]*suite")
+        if not re.search(_count_re, window):
+            findings.append(
+                "%s runs check.py but never asserts the DISCOVERED SUITE COUNT. "
+                "check.py exits 0 on WARN, so a step wired to the exit code "
+                "passes when it runs 0 suites and when it runs 16 -- which is "
+                "the same defect one level up. Assert the '<N> suite(s)' line."
+                % name)
+    if findings:
+        return ("C17 CI runs the test suites", "FAIL", findings)
+    return ("C17 CI runs the test suites", "PASS",
+            ["%d workflow step(s) invoke tools/check.py and assert its suite "
+             "count: %s" % (len(invoked), ", ".join(sorted({n for n, _ in invoked})))])
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck]
+          c15_portcheck, c16_tokencheck, c17_ci_runs_the_suites]
 
 
 def _is_git_tree(root):
@@ -2566,6 +2699,47 @@ def selftest():
         CHECKS[:] = _saved
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
+
+    # C17 arms. Each builds a MINIMAL temp tree with a workflow file, because
+    # the check reads a directory rather than a source string. Three states,
+    # each asserted separately: no step (the shipped defect), a naive step
+    # that trusts the exit code (the fix that lies), and a step that asserts
+    # the printed suite count (the fix that works).
+    import tempfile as _tf
+
+    def _c17_on(workflow_text):
+        d = _tf.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, ".github", "workflows"))
+            if workflow_text is not None:
+                open(os.path.join(d, ".github", "workflows", "ci.yml"),
+                     "w").write(workflow_text)
+            return c17_ci_runs_the_suites(d)[1]
+        finally:
+            import shutil as _sh
+            _sh.rmtree(d, ignore_errors=True)
+
+    outcomes.append((
+        "C17 FAILs when no step invokes tools/check.py",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: python3 tools/repo_check.py .\n") == "FAIL"))
+    outcomes.append((
+        "C17 FAILs on a step that trusts check.py's exit code",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: python3 tools/check.py\n") == "FAIL"))
+    outcomes.append((
+        "C17 PASSes only when the workflow asserts the suite COUNT",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          python3 tools/check.py | tee /tmp/c.log\n"
+                "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log)\n"
+                "          test -n \"$n\"\n") == "PASS"))
+    outcomes.append((
+        "C17 does NOT mistake repo_check.py for the suite runner",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          python3 tools/repo_check.py .\n"
+                "          echo check.py\n") == "FAIL"))
 
     bad = 0
     for label, passed in outcomes:
