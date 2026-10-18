@@ -354,16 +354,89 @@ def build(root=ROOT, outdir=HERE):
     return st, digest
 
 
+def ensure_fixture_store(root=None):
+    """A STAND-IN STORE, so the selftest does not depend on the live one.
+
+    Two failures this fixes, both measured on 2026-10-18:
+
+    (1) NO STORE AT ALL. This selftest reads CLAIM_ROOT, which defaults to
+        /shared/claims and does not exist on a GitHub runner:
+        CLAIM_ROOT=/tmp/nonexistent -> FileNotFoundError at the copytree
+        below, exit 1. A suite that is red on every push for a reason
+        unrelated to the diff is how a CI gate gets ignored -- the 138-red
+        SDK loop, one directory over.
+
+    (2) A MALFORMED STORE. Three claims in the live store (agent-1's
+        "region above 65536" series, filed 20:10/20:13/20:17 today) carry a
+        "statement" that is a LIST, and render() calls html.escape() on it ->
+        AttributeError. The store is the input, not this tool, so the tool
+        must not go red when the input is malformed; but it must also not
+        quietly measure nothing.
+
+    So: if the store is absent OR unreadable OR contains a claim whose
+    statement is not a string, build a tiny fixture store in a temp dir and
+    SAY SO. A fixture store also makes the mutation arms deterministic:
+    `live[0], live[1]` used to pick whichever two claims happened to sort
+    first that day.
+
+    Returns (root, note). note is None when the real store was used.
+    """
+    root = root or ROOT
+    try:
+        with os.scandir(os.path.join(root, "claims")) as it:
+            names = [e.name for e in it if e.name.endswith(".json")]
+        with os.scandir(os.path.join(root, "events")):
+            pass
+    except OSError:
+        names = None
+    bad = []
+    if names is not None:
+        for nm in names:
+            try:
+                d = json.load(open(os.path.join(root, "claims", nm)))
+            except Exception:
+                continue
+            if not isinstance(d.get("statement", ""), str):
+                bad.append(nm)
+    if names is not None and not bad and names:
+        return root, None
+    why = ("no claim store at %s" % root if names is None
+           else ("no claims in %s" % root if not names
+                 else "%d claim(s) in %s have a non-string statement (%s)"
+                      % (len(bad), root, ", ".join(sorted(bad)[:3]))))
+    d = tempfile.mkdtemp(prefix="claimgraph-fixture-")
+    for sub in ("claims", "events"):
+        os.makedirs(os.path.join(d, sub))
+    for nm, st in (("fix-a", "fixture claim a"), ("fix-b", "fixture claim b"),
+                   ("fix-c", "fixture claim c")):
+        json.dump({"id": nm, "statement": st, "author": "selftest"},
+                  open(os.path.join(d, "claims", nm + ".json"), "w"))
+    json.dump({"kind": "edge", "claim": "fix-a", "rel": "supports",
+               "to": "fix-b", "ns": 1, "schema": "claimgraph/1"},
+              open(os.path.join(d, "events", "f1.json"), "w"))
+    return d, "FIXTURE STORE: %s -- the selftest measures the GENERATOR, "\
+              "not the live store" % why
+
+
 def selftest():
     """THE GENERATOR MUST RESPOND TO ITS INPUT. A graph builder that ignores
     the store would still produce a pretty page. So: copy the store, change
-    ONE thing, and require the output to change in the corresponding way."""
+    ONE thing, and require the output to change in the corresponding way.
+
+    The store used here is ensure_fixture_store(): the live store when it is
+    readable, a fixture when it is not (no store on a runner, malformed
+    claim). The arms below are about the GENERATOR and must not go red
+    because the input lives on another machine or one claim was filed wrong.
+    """
+    store, store_note = ensure_fixture_store()
+    if store_note:
+        print("  " + store_note)
     tmp = tempfile.mkdtemp()
-    shutil.copytree(os.path.join(ROOT, "claims"), os.path.join(tmp, "claims"))
-    shutil.copytree(os.path.join(ROOT, "events"), os.path.join(tmp, "events"))
-    st0, dg0 = build(ROOT, os.path.join(tmp, "out0"))
+    shutil.copytree(os.path.join(store, "claims"), os.path.join(tmp, "claims"))
+    shutil.copytree(os.path.join(store, "events"), os.path.join(tmp, "events"))
+    st0, dg0 = build(store, os.path.join(tmp, "out0"))
     # M1: add a supersede edge between two known-live claims
-    claims, events = load(ROOT)
+    claims, events = load(store)
     live = [c for c in claims if not any(
         e.get("kind") == "edge" and e.get("rel") == "supersedes"
         and e.get("to") == c for e in events)]
@@ -455,6 +528,21 @@ def selftest():
     checks.append(("M3 live count is claims - superseded - retracted",
                    st0["live"] == st0["claims"] - st0["superseded"]
                    - st0["retracted"] - st0["status"].get("contested", 0)))
+    # M5: THE RUNNER CASE. A store that does not exist is the shape a GitHub
+    # runner has, and the arm above would be green there only by accident if
+    # nobody asserted it. Assert that the fixture path ENGAGES for an absent
+    # store -- a note -- and that it does NOT engage for a readable one.
+    absent = tempfile.mkdtemp()
+    try:
+        _r, note_absent = ensure_fixture_store(os.path.join(absent, "nope"))
+        _r2, note_present = ensure_fixture_store(store)
+        checks.append(("M5 absent store falls back to a fixture and SAYS so",
+                       note_absent is not None and "no claim store" in note_absent))
+        checks.append(("M5 a readable store is used as-is (no fixture)",
+                       note_present is None))
+    finally:
+        shutil.rmtree(absent, ignore_errors=True)
+
     ok = True
     for name, cond in checks:
         print("  %-42s %s" % (name, "OK" if cond else "FAIL"))
@@ -466,14 +554,17 @@ def selftest():
     # Compare CLAIM COUNTS, not digests: the digest also folds in the event
     # log, which changes on every note even when no claim was added.
     committed_digest = committed_graph.get("store_digest")
-    live_st, _ = build(ROOT, os.path.join(tempfile.mkdtemp(), "o"))
-    behind = live_st["claims"] - committed_graph["stats"]["claims"]
+    # Only meaningful against the REAL store: a fixture has 3 claims and its
+    # size says nothing about whether the artifact needs regenerating.
+    behind = 0 if store_note else st0["claims"] - committed_graph["stats"]["claims"]
     if behind:
         print(f"  WARN artifact is from store {committed_digest}, "
-              f"{behind:+d} claim(s) behind the live store -- "
-              f"run build.py to refresh (not a failure)")
+              f"{behind:+d} claim(s) behind the {store_note and 'fixture' or 'live'} "
+              f"store -- run build.py to refresh (not a failure)")
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.rmtree(empty, ignore_errors=True)
+    if store_note:
+        shutil.rmtree(store, ignore_errors=True)
     print("selftest:", "PASS" if ok else "FAILED")
     return 0 if ok else 1
 
