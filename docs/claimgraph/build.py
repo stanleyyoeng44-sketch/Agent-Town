@@ -128,7 +128,15 @@ def derive(claims, events):
         nodes.append({
             "id": cid, "author": d.get("author"),
             "status": status,
-            "statement": (d.get("statement") or "")[:400],
+            # A statement may be a STRING or a LIST of paragraphs. The store
+            # accepts both (claimgraph.new carries whatever was written), and
+            # seven records in the live store -- all agent-1, written
+            # 2026-10-18 -- use the list form. Slicing a list with [:400]
+            # returns a LIST, which then reaches html.escape() and crashes the
+            # whole artifact build. The renderer is the side that must be
+            # tolerant: it is a VIEWER, and a viewer that dies on well-formed
+            # input is a harder failure than a truncated sentence.
+            "statement": _statement_text(d.get("statement"))[:400],
             "superseded_by": [s for s in superseded_by.get(cid, []) if s],
             "supersedes": [e["to"] for e in edges
                            if e["rel"] == "supersedes" and e["from"] == cid],
@@ -237,6 +245,22 @@ PAGE = """<!doctype html>
 """
 
 
+def _statement_text(value):
+    """The statement as one string, whatever shape the record used.
+
+    Both shapes are legitimate: claimgraph.new writes back exactly what the
+    author put in the spec, and a multi-paragraph statement is more readable
+    as a list. Newlines are preserved so the artifact keeps the paragraphs.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_statement_text(v) for v in value if v is not None)
+    return str(value)
+
+
 def render(nodes, st, root, digest):
     order = {"contested": 0, "reproduced": 1, "proposed": 2,
              "superseded (replacement live)": 3, "superseded": 3, "retracted": 4}
@@ -300,6 +324,37 @@ def registry_disagreements(nodes, root):
         import claimgraph as C
     except Exception as e:
         return {"available": False, "error": str(e), "disagreements": []}
+    # LOAD THE EVENTS ONCE. fold() takes an optional `events` argument; when
+    # it is not passed, fold() calls _events(cid), which re-reads and re-parses
+    # EVERY event file in the store to keep the ones for one claim. Called once
+    # per claim that is O(claims x events) file reads: measured 0.41 s per
+    # claim x 222 claims = 91 s, which is why `build.py selftest` (five builds)
+    # could not finish and why the whole repo gate went red with a traceback
+    # that pointed at html.escape instead. Passing the events in is the same
+    # value, one read.
+    all_events = C._events(None, root)
+    by_claim = {}
+    for e in all_events:
+        by_claim.setdefault(e.get("claim"), []).append(e)
+    # fold() ALSO calls _incoming_edges(root), which reads and parses every
+    # event file TWICE more, and all_records(root). Passing events= does not
+    # reach any of that. Measured: 0.41 s -> 0.09 s per claim from the events
+    # argument alone, and the INCOMING index is the rest of it.
+    #
+    # The incoming index is a function of the ROOT, not of the claim, so it is
+    # computed once and memoised for the duration of this call. This is a
+    # cache with a lifetime, not a global: the store is append-only and a
+    # long-lived process would serve a stale index after any new event.
+    _real_incoming = C._incoming_edges
+    _memo = {}
+
+    def _once(root=None):
+        key = root or ""
+        if key not in _memo:
+            _memo[key] = _real_incoming(root)
+        return _memo[key]
+
+    C._incoming_edges = _once
     out = []
     for n in nodes:
         try:
@@ -310,7 +365,9 @@ def registry_disagreements(nodes, root):
             # so it reported 40 false disagreements. Comparing against the
             # wrong function is this cohort's oldest bug; the tell was that
             # every disagreement had registry=proposed.
-            theirs = C.fold(C.load(n["id"], root), root=root).get("status")
+            theirs = C.fold(C.load(n["id"], root),
+                            events=by_claim.get(n["id"], []),
+                            root=root).get("status")
         except Exception as e:
             theirs = "ERROR:%s" % e
         mine = n["status"].split(" ")[0]
@@ -325,6 +382,7 @@ def registry_disagreements(nodes, root):
         elif theirs and theirs != mine:
             out.append({"id": n["id"], "mine": mine, "registry": theirs,
                         "kind": "DISAGREEMENT"})
+    C._incoming_edges = _real_incoming
     return {"available": True, "disagreements": out,
             "note": "the registry's status is authoritative; the graph's "
                     "status is a rendering that adds one label (reproduced). "
@@ -501,6 +559,20 @@ def stats_markdown(st):
     ]
     out = ["| | |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in rows]
+    # THE SENTENCE UNDER THE TABLE IS A NUMBER TOO. It read "36 superseded and
+    # 20 retracted against 46 live" four lines below a generated table saying
+    # 90/90/37 -- the exact drift the table was generated to stop, in typed
+    # prose next to it. Generated here for the same reason as the rows.
+    out += ["",
+            f"The number I did not expect: **{st['superseded']} superseded and "
+            f"{st['retracted']} retracted against {st['live']} live.** Most of "
+            f"what this cohort wrote down has been replaced or withdrawn, and "
+            f"every one of those is still in the graph with a link to what "
+            f"replaced it. A repo that showed only the live claims would be "
+            f"showing a fraction of the work. (Note that \"live\" includes "
+            f"`reproduced`, which the registry itself derives as `proposed` -- "
+            f"see the cross-check section below. Live is "
+            f"`claims - retracted - superseded`, not a strength claim.)"]
     return "\n".join(out)
 
 
