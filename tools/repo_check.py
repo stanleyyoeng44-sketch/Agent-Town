@@ -228,8 +228,9 @@ SH_BLOCK = re.compile(r"```(?:sh|bash|console)\n(.*?)```", re.S)
 # reported as skipped WITH ITS REASON -- never silently dropped.
 RUNNABLE = ("python3 ", "python ", "bash -n ", "sh -n ", "test ", "[ ")
 ENV_LIMITED = ("docker ", "docker-compose ", "make ")   # no docker daemon here
-# a leading VAR=value is environment, not the command; look through it
-ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
+# A leading VAR=value is environment, not the command; _strip_env_prefix
+# looks through it. It used to be a single regex here whose \S* stopped at
+# the first space INSIDE a $( ) substitution -- see _strip_env_prefix.
 
 
 def _looks_like_server(body, root="."):
@@ -308,12 +309,79 @@ def _probe_safe(cmd: str) -> bool:
     return False
 
 
+def _strip_env_prefix(line):
+    """Strip leading VAR=value assignments from a command line.
+
+    MEASURED DEFECT THIS REPLACES (agent-2, reproduced by agent-4): the old
+    form was ENV_PREFIX = r"^[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+", and \\S* stops
+    at the first whitespace INSIDE a command substitution. On the line
+    docs/CLOUD-DEPLOYMENT.md actually ships:
+
+        docker0=$(ip -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)
+
+    it consumed 'docker0=$(ip' and returned '-o addr show docker0 | ...'.
+    That value is what C5 CLASSIFIES and what it SHOWS as the skip reason, so
+    the checker reported a fragment of a command as the command.
+
+    IT WAS REPORTED AS COSMETIC AND IT WAS NOT. MEASURED on ede3310, same
+    parser, a block that is ONE shell assignment:
+
+        X=$(env python3 -c "open('/tmp/.../SIDE_EFFECT','w').write('ran')")
+
+    parsed as first='python3 -c "open(...)...")', matched RUNNABLE, and THE
+    WHOLE LINE WAS EXECUTED -- the file appeared and the run said PASS. So a
+    garbled parse is not a garbled label: it decides WHETHER A DOCUMENT'S CODE
+    RUNS. The arm ("C5 does not EXECUTE a block that is only an assignment")
+    asserts the positive artifact, and the old parser fails it.
+
+    Rules, in order:
+      * VAR=$( ... )  consume to the MATCHING ')' (quotes respected), then
+        strip the whitespace after it
+      * VAR=value     consume the value to the first unquoted whitespace
+      * if nothing is left, the line was ONLY assignments -- return the line
+        unchanged rather than "", so it is still visible as a skipped block
+    """
+    s = line
+    while True:
+        m = re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s)
+        if not m:
+            return s
+        rest = s[m.end():]
+        if rest.startswith("$("):
+            depth, i = 0, 0
+            quote = None
+            while i < len(rest):
+                c = rest[i]
+                if quote:
+                    if c == quote:
+                        quote = None
+                elif c in ("'", '"'):
+                    quote = c
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            tail = rest[i:]
+        else:
+            mm = re.match(r"\S*", rest)
+            tail = rest[mm.end():]
+            if not tail:
+                return s          # bare NAME=value: still the whole line
+        tail = tail.lstrip()
+        if not tail:
+            return s              # assignment(s) only
+        s = tail
+
+
 def _first_cmd(body):
     for line in body.splitlines():
         s = line.strip()
         if s and not s.startswith("#"):
-            while ENV_PREFIX.match(s):
-                s = ENV_PREFIX.sub("", s, count=1)
+            s = _strip_env_prefix(s)
             return s
     return ""
 
@@ -353,16 +421,40 @@ def c5_doc_commands(root, timeout=60):
     whether it exits 0. If a doc block has an effect outside the tree, that
     is a defect in the block, and fixing the block is what makes this check
     read-only in practice.
+
+    WHAT IT DOES NOT MEASURE, stated because the summary line used to imply
+    otherwise. It counts blocks, not COMMANDS: a 12-line block with one
+    runnable first line and eleven unrunnable ones is "executed". It does not
+    run docker, so a docker doc can only ever be UNVERIFIED here. And it
+    classifies by the FIRST WORD, so a compound line is judged by what it
+    starts with -- the 'cd <dir> &&' form is the one exception, and it is
+    there so the WHERE of a command is not mistaken for the WHAT.
     """
     findings, ran, skipped, warnings = [], 0, [], []
+    # PER-FILE COVERAGE, because the summary line was not one.
+    # MEASURED on master 633d62e: "executed 5 block(s), skipped 40" while
+    # docs/CLOUD-DEPLOYMENT.md -- 11 fenced blocks, the file README.md calls a
+    # verified migration transcript -- appeared ZERO times in either bucket's
+    # visible output (the skip list is capped at 20 and nothing asked for it by
+    # file). A total cannot tell a reader that one document is entirely
+    # unexecuted; that fact only exists per file, so it is reported per file.
+    per_file = {}          # f -> [blocks, executed, {reason: count}]
     for f in _tracked(root):
         if not f.endswith(DOC_SUFFIXES):
             continue
+        counts = per_file.setdefault(f, [0, 0, {}])
+
+        def did_not_run(reason):
+            """Record why THIS file's block did not execute, then keep going."""
+            counts[2][reason] = counts[2].get(reason, 0) + 1
+
         text = open(os.path.join(root, f), encoding="utf-8", errors="replace").read()
         for block in SH_BLOCK.finditer(text):
+            counts[0] += 1
             body = block.group(1).strip()
             first = _first_cmd(body)
             if not first:
+                did_not_run("no command line")
                 continue
             # The SKIP marker may appear two ways and BOTH must mean the same
             # thing:
@@ -416,23 +508,28 @@ def c5_doc_commands(root, timeout=60):
                     else:
                         skipped.append(f"{f}: {inner[:60]} (marked SKIP; probe "
                                        f"declined -- not safe to run twice)")
+                        did_not_run("SKIP-marked, probe declined")
                         continue
                 if probe == 0:
                     warnings.append(
                         f"{f}: `{inner[:60]}` marked SKIP but runs fine here "
                         f"-- the doc is opting out of a check it could pass")
                 else:
-                    why = ("exits %s without its environment" % probe
-                           if probe is not None else "not runnable here")
-                    skipped.append(f"{f}: {inner[:60]} (marked SKIP; {why})")
+                    reason = ("exits %s without its environment" % probe
+                              if probe is not None else "not runnable here")
+                    skipped.append(f"{f}: {inner[:60]} (marked SKIP; {reason})")
+                    did_not_run("SKIP-marked: " + reason)
                 continue
             if first.startswith(ENV_LIMITED):
                 skipped.append(f"{f}: {first[:60]} (no docker/make on this box)")
+                did_not_run("needs docker/make (absent here)")
                 continue
             if not first.startswith(RUNNABLE):
                 skipped.append(f"{f}: {first[:60]} (not a command this check runs)")
+                did_not_run("first word is not a command this check runs")
                 continue
             ran += 1
+            counts[1] += 1
             try:
                 r = subprocess.run(body, shell=True, cwd=root, text=True,
                                    capture_output=True, timeout=timeout)
@@ -454,8 +551,37 @@ def c5_doc_commands(root, timeout=60):
                                 f"{err[:200]}")
 
     note = [f"executed {ran} block(s), skipped {len(skipped)}"]
+    # A DOCUMENT NOTHING RUNS IS NAMED. The single total could not express
+    # this, and that is how it hid a whole file: MEASURED on master 633d62e,
+    # "executed 5 block(s), skipped 40" over a tree where
+    # docs/CLOUD-DEPLOYMENT.md -- 11 fenced blocks, the file README.md calls a
+    # verified migration transcript -- did not appear in either bucket's
+    # VISIBLE output (the skip list is capped at 20). A total is a fact about
+    # the checker; "this document has never run" is a fact about the document,
+    # and it only exists per file.
+    # Reasons are reported, not just the count, because they are different
+    # facts: a block needing docker may run on a machine that has it, while
+    # "first word is not a command this check runs" is a limit of the checker.
+    uncovered = []
+    for f in sorted(per_file):
+        blocks, executed, reasons = per_file[f]
+        if blocks and not executed:
+            detail = "; ".join(f"{n} x {r}" for r, n in sorted(reasons.items(),
+                                                               key=lambda kv: -kv[1]))
+            uncovered.append(f"{f}: 0 of {blocks} block(s) executed "
+                             f"-- UNVERIFIED here ({detail})")
+    note.extend(uncovered)
     # skips are always visible; they are never silently absorbed
     note.extend("skipped " + s for s in skipped[:20])
+    if uncovered:
+        # NOT a PASS, and NOT silent. WARN rather than FAIL for the same reason
+        # the existing no-runnable-block case is WARN: the blocks may
+        # legitimately need docker, and WARN never claims the docs are correct.
+        # Verified: on a tree where every block executes, this arm does not
+        # fire (the C5 selftest arms assert both sides).
+        warnings = warnings + [
+            "a tracked doc with 0 executed blocks is UNVERIFIED, not verified "
+            "-- named per file above"]
     if findings:
         return "C5 doc commands run", "FAIL", findings + warnings + note
     if warnings:
@@ -1593,6 +1719,89 @@ def selftest():
     outcomes.append(("C5 catches a doc command that fails",
                      dict((n, o) for n, o, _ in r)["C5 doc commands run"] == "FAIL"))
     shutil.rmtree(d)
+
+    # C5a: a DOCUMENT nothing executes must be NAMED, not folded into a total.
+    # MEASURED defect (agent-2): master printed "executed 5 block(s), skipped
+    # 40" while docs/CLOUD-DEPLOYMENT.md -- 11 blocks -- ran zero of them and
+    # was nowhere in the visible output. The control is a two-document fixture:
+    # one doc executes a block, another doc is entirely unrunnable. The check
+    # must name the SECOND BY FILE while staying green about the first, so this
+    # arm cannot be satisfied by printing every filename unconditionally.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\npython3 -c \"print(1)\"\n```\n")
+    os.makedirs(os.path.join(d, "docs"))
+    open(os.path.join(d, "docs", "DEPLOY.md"), "w").write(
+        "# x\n\nsentence one\n\n```sh\nsudo scp somewhere\n```\n\n"
+        "```sh\nexport PATH=/x\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "one covered doc, one not")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    blob = "\n".join(str(x) for x in c5[1])
+    outcomes.append(("C5 names a document with zero executed blocks",
+                     "docs/DEPLOY.md: 0 of 2 block(s) executed" in blob
+                     and "README.md: 0 of" not in blob))
+    shutil.rmtree(d)
+
+    # C5a2: and a doc that DOES execute is not named, so the line is a
+    # measurement and not a banner. Same fixture as C5a's first half alone.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\npython3 -c \"print(1)\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "all covered")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 does not name a document it did execute",
+                     c5[0] == "PASS" and "0 of" not in "\n".join(map(str, c5[1]))))
+    shutil.rmtree(d)
+
+    # C5a3: _first_cmd must not eat a command substitution. The shipped line
+    # in docs/CLOUD-DEPLOYMENT.md classified as "-o addr show docker0 ..."
+    # because ENV_PREFIX's \S* stopped at the first space INSIDE $( ). This
+    # calls the helper directly, so it fails on the regex and nothing else.
+    # The SECOND assertion is the ordinary case, so a fix that simply never
+    # strips an env prefix cannot pass both.
+    got = _first_cmd("docker0=$(ip -o addr show docker0 | awk '{print $4}' "
+                     "| cut -d/ -f1)")
+    outcomes.append(("C5 _first_cmd keeps a $(...) assignment whole",
+                     got.startswith("docker0=$(ip -o addr show docker0")
+                     and got.endswith("cut -d/ -f1)")))
+    outcomes.append(("C5 _first_cmd still strips an ordinary VAR=value",
+                     _first_cmd("PYTHONPATH=/x python3 -c 'print(1)'")
+                     == "python3 -c 'print(1)'"))
+
+    # C5a4: THE CONSEQUENCE, as an artifact rather than a status word.
+    # The parse bug was reported as cosmetic -- a garbled skip REASON. It was
+    # not: the fragment is what C5 hands to subprocess. MEASURED on ede3310,
+    # a doc block consisting of ONE shell assignment
+    #     X=$(env python3 -c "open('<path>','w').write('ran')")
+    # was parsed as first='python3 -c "open(...)...")', matched RUNNABLE, and
+    # THE WHOLE LINE WAS EXECUTED: the marker file appeared, and the run
+    # reported PASS. That is the docstring's own courier rule -- a doc command
+    # is a new courier -- defeated by a parser. The evidence is the positive
+    # artifact, inside the fixture's own temp directory.
+    d = farm()
+    leak = os.path.join(d, "SIDE_EFFECT")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\nX=$(env python3 -c \"open(%r,'w').write('ran')\")\n```\n"
+        % leak)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "assignment block")
+    _, r = run(d)
+    written = os.path.exists(leak)
+    # Leave no artifact behind even when the arm FAILS, so the failure is
+    # about the checker and not about the fixture.
+    shutil.rmtree(d)
+    outcomes.append(("C5 does not EXECUTE a block that is only an assignment",
+                     not written))
 
     # C5b: SKIP must not silence a command that would have PASSED.
     # "SKIP" used to be a universal silencer: any doc could disable its own
