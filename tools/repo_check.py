@@ -1383,7 +1383,7 @@ def _publisher_docs(root):
     two, so the tree has three and a tool that reads one file sees one.
 
     KNOWN LIMIT, measured: docs/guide.md publishes the bank INLINE on the
-    docker run line (`... agent-bank -p 8790:8790 \`), which this predicate
+    docker run line ('... agent-bank -p 8790:8790 \\'), which this predicate
     does not count and portcheck does not appear to either. If that is a real
     coverage gap it should be found by reading guide.md, not by this number
     quietly including it.
