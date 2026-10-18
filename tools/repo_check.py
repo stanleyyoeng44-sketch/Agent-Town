@@ -1786,12 +1786,46 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
+def c19_demo_image_matches_demo(root):
+    """The README's picture must match what the demo actually prints.
+
+    README.md says of docs/img/demo-run.png: "The image is generated from the
+    program's own stdout by docs/img/make_terminal.py, so it cannot drift from
+    what the code prints." The first half is true and enforced by the
+    generator; the second half was true of nothing. Nothing ran the
+    generator -- not a suite, not CI, not a check -- and the generator needs
+    matplotlib, which the agent image does not have, so the people most able
+    to notice drift were the people least able to regenerate.
+
+    The README even states the rule: re-run demo and generator IN THE SAME
+    COMMIT. A rule with no check is a request. This is the check, and it needs
+    no matplotlib: the generator's SVG carries the demo's own stdout as <text>
+    lines, normalised for the temp dir and the port, so the SVG is a
+    byte-comparable transcript.
+
+    Runs as a SUBPROCESS, and a missing tool or image is a FAIL rather than a
+    skip -- otherwise deleting the artifact turns the check off.
+    """
+    tool = os.path.join(root, "tools/check_demo_image.py")
+    if not os.path.exists(tool):
+        return "C19 demo image matches", "FAIL", [
+            "tools/check_demo_image.py is absent, so the README's image is "
+            "compared to nothing"]
+    r = subprocess.run([sys.executable, "-I", tool], cwd=root, text=True,
+                       capture_output=True, timeout=180)
+    out = (r.stdout + r.stderr).strip().splitlines()
+    if r.returncode != 0:
+        return "C19 demo image matches", "FAIL", out[:12] or ["comparer failed"]
+    return "C19 demo image matches", "PASS", [out[-1] if out else "match"]
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck]
+          c15_portcheck, c16_tokencheck,
+          c19_demo_image_matches_demo]
 
 
 def _is_git_tree(root):
@@ -2618,6 +2652,61 @@ def selftest():
     outcomes.append(("C13 catches the edge count moving, not just stats keys",
                      c13_on(cg_readme, top_readme, json.dumps(moved_edges))
                      == "FAIL"))
+    # C19 controls: the README's demo image must be compared to a real demo
+    # run. Two arms, because the check can fail in two opposite ways and only
+    # one of them is "it found drift".
+    #   arm 1  a stale image (one demo line edited, image not regenerated)
+    #   arm 2  a DELETED image -- must be FAIL, not a skip, or removing the
+    #          artifact is the way to silence the check
+    # Both run the REAL demo (twice, ~2s) rather than a fixture: a fixture
+    # would prove the parser works and not that the comparison is against the
+    # shipped code. That cost is the reason this arm is at the end.
+    _demo = os.path.join(ROOT, "demo", "town.py")
+    if not os.path.exists(_demo):
+        outcomes.append(("C19 can be exercised (demo/town.py present)", False))
+    else:
+        d = farm()
+        # bank/bank.py is REQUIRED: demo/town.py drives the real bank in the
+        # tree, and without it the demo does not exit 0. My first fixture
+        # omitted it and the arm failed for that reason, which is the arm
+        # doing its job -- a fixture that cannot run is not a clean control.
+        for rel in ("demo/town.py", "bank/bank.py", "docs/img/demo-run.svg",
+                    "tools/check_demo_image.py"):
+            dst = os.path.join(d, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), dst)
+        open(os.path.join(d, ".gitignore"), "w").write("__pycache__\n")
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c19 fixture")
+        # the clean direction, from the fixture, so a red is about the image
+        _ok, r = run(d)
+        outcomes.append(("C19 passes on the artifacts as shipped",
+                         dict((n, o) for n, o, _ in r)
+                         .get("C19 demo image matches") == "PASS"))
+        # arm 1: edit a line the demo prints, leave the SVG alone
+        svg = os.path.join(d, "docs/img/demo-run.svg")
+        raw = open(svg, encoding="utf-8").read()
+        stale = raw.replace("seeded agents start at 100",
+                            "seeded agents start at 999", 1)
+        if stale == raw:
+            outcomes.append(("C19 catches a stale image", False))
+        else:
+            open(svg, "w", encoding="utf-8").write(stale)
+            _git(d, "add", "-f", ".")
+            _git(d, "commit", "-qm", "stale image")
+            _ok, r = run(d)
+            outcomes.append(("C19 catches a stale image",
+                             dict((n, o) for n, o, _ in r)
+                             .get("C19 demo image matches") == "FAIL"))
+        # arm 2: delete the image entirely
+        os.remove(svg)
+        _git(d, "add", "-A", ".")
+        _git(d, "commit", "-qm", "no image")
+        _ok, r = run(d)
+        outcomes.append(("C19 catches a DELETED image instead of skipping",
+                         dict((n, o) for n, o, _ in r)
+                         .get("C19 demo image matches") == "FAIL"))
+        shutil.rmtree(d)
 
     outcomes.append(("the tool's own source contains no secret", not own))
     outcomes.append(("C2 would catch it if it did (fixtures use SYNTHETIC)",
