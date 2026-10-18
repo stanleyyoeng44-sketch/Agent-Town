@@ -82,9 +82,21 @@ def build(fixed, seed=""):
                              "how to redirect; the ledger would be shared")
     assert ledger in src, "ledger redirect did not take effect"
 
+    # MAILBOX became env-configurable (demo-mailbox-isolation): both shapes
+    # must be supported, exactly like DATA above. Pinning only the literal made
+    # this suite die with "mailbox literal not found" the moment the fix
+    # landed -- a test that breaks on a GOOD change is a test that will be
+    # deleted rather than updated.
     box = os.path.join(work, "mailbox")
-    assert 'MAILBOX = "/shared/mailbox"' in src, "mailbox literal not found"
-    src = src.replace('MAILBOX = "/shared/mailbox"', 'MAILBOX = %r' % box)
+    mailbox_env = 'MAILBOX = os.environ.get("MAILBOX", "/shared/mailbox")'
+    mailbox_lit = 'MAILBOX = "/shared/mailbox"'
+    if mailbox_env in src:
+        src = src.replace(mailbox_env, "MAILBOX = %r" % box)
+    elif mailbox_lit in src:
+        src = src.replace(mailbox_lit, "MAILBOX = %r" % box)
+    else:
+        raise AssertionError("bank.py has no MAILBOX assignment this test "
+                             "knows how to redirect; live mail would be written")
     assert box in src, "mailbox redirect did not take effect"
 
     # --- choose the behaviour under test -----------------------------------
