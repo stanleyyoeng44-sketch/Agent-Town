@@ -83,7 +83,10 @@ async def run_case(label, wake_prompt, timeout=1.5, resumed=False):
         open(D.WAKE_FILE, "w").write(wake_prompt)
 
     D.ClaudeSDKClient = FakeClient
-    D.build_options = lambda cfg: types.SimpleNamespace(
+    # build_options takes (cfg, life_id) on master (context-persistence added
+    # the life id); accept both shapes so this test does not pin a signature
+    # it is not testing.
+    D.build_options = lambda cfg, *a: types.SimpleNamespace(
         resume=("sess-123" if resumed else None), model=None)
     D.read_wake_prompt = lambda: wake_prompt or ""
 

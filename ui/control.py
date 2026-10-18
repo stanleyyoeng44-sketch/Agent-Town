@@ -95,9 +95,67 @@ def prompt_path(name):
     return os.path.join(PROMPTS_DIR, name, "system-prompt.txt")
 
 
+# Docker volumes are GLOBAL, not scoped to this stack. Two cohorts on one
+# host with the same agent names would otherwise share memory. Set
+# AGENT_COHORT to anything stable for this deployment; the default keeps the
+# names readable for a single cohort.
+WORKSPACE_VOLUME_PREFIX = os.environ.get("AGENT_COHORT", "agent-workspace")
+
+
+def workspace_volume(name, part):
+    """Docker named volume holding one per-agent durable directory.
+
+    One volume per part (self / transcripts / claude) rather than one for all
+    of /workspace: /workspace/inbox and /workspace/replies are transient
+    hand-off directories, and mounting all of /workspace would also make an
+    old container's scratch files reappear in a new one.
+
+    Collisions: volume names are global on the host, so the prefix carries a
+    cohort name (AGENT_COHORT) -- two deployments with agent-1 each get their
+    own memory instead of silently sharing it.
+    """
+    return f"{WORKSPACE_VOLUME_PREFIX}-{name}-{part}"
+
+
+def agent_volumes(name):
+    """Durable paths the container currently has mounted, from docker."""
+    ok, out, _ = run_docker(
+        ["inspect", name, "--format", "{{range .Mounts}}{{.Destination}} {{end}}"])
+    return set(out.split()) if ok else set()
+
+
+def missing_workspace_volumes(name):
+    """Durable destinations this agent does NOT have mounted.
+
+    A pre-fix container keeps its memory in the writable layer; attaching
+    volumes requires re-creating it, which is destructive. So start_agent
+    REFUSES instead of silently starting an agent the fix does not apply to
+    -- the operator gets the migration command rather than an agent that
+    looks fine and still loses context.
+    """
+    mounted = agent_volumes(name)
+    return [d for d in ("/workspace/self", "/workspace/transcripts",
+                        "/workspace/.claude") if d not in mounted]
+
+
 def start_agent(name, model="deepseek-v4.1-flash"):
     if not NAME_RE.match(name):
         return False, "bad name"
+    # An existing container without the durable mounts is not fixed by this
+    # code path: docker run would fail on the name anyway. Say what to do.
+    ok, out, _ = run_docker(["ps", "-a", "--filter", f"name=^{name}$",
+                             "--format", "{{.Names}}"])
+    if ok and out.strip() == name:
+        missing = missing_workspace_volumes(name)
+        if missing:
+            return False, (
+                "container %r predates the durable-volume fix and is missing "
+                "%s. Its memory is in the container's writable layer; copying "
+                "it into the volumes is the destructive step, so it is not "
+                "automatic. Run: python3 tools/migrate_agent_volumes.py "
+                "--agent %s   (then re-create the container)"
+                % (name, ", ".join(missing), name))
+        return False, "container %r already exists" % name
     os.makedirs(os.path.dirname(prompt_path(name)), exist_ok=True)
     if not os.path.exists(prompt_path(name)):
         # seed from the template next to this project, if present
@@ -117,6 +175,17 @@ def start_agent(name, model="deepseek-v4.1-flash"):
         "-e", f"AGENT_MODEL={model}",
         "-v", "agent-mailbox:/shared",
         "-v", f"{prompt_path(name)}:/app/system-prompt.txt:ro",
+        # The agent's memory and the records its context resumes from. These
+        # are per-agent named volumes, so `docker stop/start` keeps them and
+        # a re-created container gets the same identity back. Without them
+        # /workspace lives in the writable layer and is wiped on restart:
+        # session-id, diary.md, wake.md and every transcript disappear
+        # together, the agent wakes as a first-boot stranger, and the
+        # daemon's crash-resume path is unreachable.
+        "-v", f"{workspace_volume(name, 'self')}:/workspace/self",
+        "-v", f"{workspace_volume(name, 'transcripts')}:/workspace/transcripts",
+        "-v", f"{workspace_volume(name, 'claude')}:/workspace/.claude",
+        "-e", "CLAUDE_CONFIG_DIR=/workspace/.claude",
     ]
     if name == "agent-0":
         transfer_token = PRIVATE_DIR / "agent0-transfer-token"
@@ -237,18 +306,34 @@ def list_inbox(name, cursor=None, limit=30):
 
 
 def list_lives(name):
+    """Lives of this agent, newest first, with the CURRENT one marked.
+
+    Two facts are needed and only one is in the filenames: the transcript
+    list, and which life is running now. The newest file is NOT the current
+    life -- after a container restart it is the life that was interrupted.
+    The daemon writes /workspace/transcripts/CURRENT at every life start, so
+    the UI reads that instead of guessing.
+    """
     ok, out, err = run_docker(
         ["exec", name, "sh", "-c",
-         "cd /workspace/transcripts 2>/dev/null && wc -l life-*.jsonl 2>/dev/null"])
+         "cd /workspace/transcripts 2>/dev/null && "
+         "wc -l life-*.jsonl 2>/dev/null; "
+         "cat CURRENT 2>/dev/null"])
     if not ok:
         return []
+    current = None
     lives = []
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].startswith("life-"):
             lives.append({"id": parts[1][len("life-"):-len(".jsonl")],
                           "events": int(parts[0])})
+        elif len(parts) == 1 and not parts[0].startswith("life-"):
+            # the `cat CURRENT` line: a bare life id
+            current = parts[0]
     lives.sort(key=lambda x: x["id"], reverse=True)
+    for life in lives:
+        life["current"] = (life["id"] == current)
     return lives
 
 
@@ -675,16 +760,26 @@ function renderEvents(evs){
   return out.join('');
 }
 
+let currentLifeKnown = false;
+
 async function loadConvo(){
   if (!current) { $('#view').innerHTML = '<div class="statusline">select an agent</div>'; return; }
   const lives = await (await api(`/api/agent/${current}/lives`)).json();
   if (!lives.length) { $('#view').innerHTML = '<div class="statusline">no lives yet</div>'; return; }
-  // render the newest life (could be extended to a life dropdown)
-  const life = lives[0];
+  // Show the CURRENT life when the daemon says one is running; otherwise the
+  // newest. Showing lives[0] unconditionally was the other half of Stanley's
+  // "my UI won't show the context": after a restart the newest transcript is
+  // the life that was INTERRUPTED, not the one running.
+  const cur = lives.filter(l => l.current);
+  let life = cur.length ? cur[0] : lives[0];
+  currentLifeKnown = cur.length > 0;
   const evs = await (await api(`/api/agent/${current}/life/${life.id}`)).json();
   if (evs.length === lastLen) return;
   lastLen = evs.length;
-  $('#title').textContent = `${current} · life ${life.id} · ${evs.length} events`;
+  $('#title').textContent = `${current} · life ${life.id} · ${evs.length} events`
+    + (life.current ? ' · running now'
+       : (currentLifeKnown ? ' · finished (agent sleeping)'
+          : ' · no current life reported'));
   const v = $('#view');
   const atBottom = v.scrollHeight - v.scrollTop - v.clientHeight < 60;
   v.innerHTML = renderEvents(evs) || '<div class="statusline">empty</div>';

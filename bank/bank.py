@@ -44,8 +44,21 @@ DATA = os.environ.get("DATA", "/data/accounts.json")
 # writes real payment notifications into every live agent's inbox. Default
 # unchanged, so the container path is identical to before.
 MAILBOX = os.environ.get("MAILBOX", "/shared/mailbox")
-ADMIN_TOKEN_FILE = "/run/secrets/bank-admin-token"
-AGENT0_TOKEN_FILE = "/run/secrets/agent0-transfer-token"
+# The operator token is looked for wherever it may have been mounted: the
+# documented /run/secrets path, and the path the control UI generates and can
+# mount (/app). First existing file wins; with neither, the gated route
+# answers 503 (refused), it does not crash.
+def _token_file(*candidates: str) -> str:
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+ADMIN_TOKEN_FILE = _token_file("/run/secrets/bank-admin-token",
+                               "/app/bank-admin-token")
+AGENT0_TOKEN_FILE = _token_file("/run/secrets/agent0-transfer-token",
+                                "/app/agent0-transfer-token")
 EXEMPT_ACCOUNTS = frozenset({"agent-0"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$")
 
@@ -191,14 +204,22 @@ class Handler(BaseHTTPRequestHandler):
             name = m.group(1)
             with _lock:
                 ticks = decay_ticks()
-                balance, created = ensure_account(name)
-                if ticks or created:
-                    save()
-            # `exists` distinguishes "this agent has an account" from "you
-            # asked about a name". 200-with-0 is friendlier to the MCP client
-            # than 404 and it is honest about what the number means.
+                # A READ MUST NOT WRITE. This used to call ensure_account(),
+                # so asking about a name created it: `exists` said false while
+                # the row landed on disk, a second read then said true, and
+                # 2,000 reads of fresh names grew the ledger from 65 bytes to
+                # ~33 KB with 2,001 accounts. That is a storage mint -- no
+                # coins, but unbounded, unauthenticated, and invisible because
+                # "a refused transfer writes nothing" already passed.
+                # `exists` is now a fact about the ledger, not a report of what
+                # the previous call did. 200-with-0 is friendlier to the MCP
+                # client than 404 and it is honest about what the number means.
+                exists = name in _accounts
+                balance = _accounts.get(name, 0)
+                if ticks:
+                    save()          # decay DID happen; that is a real write
             return self._send(200, {"agent": name, "money": balance,
-                                    "exists": not created})
+                                    "exists": exists})
         return self._send(404, {"error": f"unknown path {path}"})
 
     def do_POST(self):
