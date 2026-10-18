@@ -216,26 +216,21 @@ def parse_publish(spec):
     return hostport, set(), ip
 
 
-def read_publishers(root):
-    """({doc: {port: (covered_set, [lines])}}, {doc: [unattributed binds]}).
+def scan_publish_lines(lines):
+    """({port: (covered_set, [(lineno, raw, ip)])}, [(lineno, ip, cov)]).
 
-    The second return is a REPORTED GAP, not a silent one: a `--bind` names an
-    interface but no port, so it cannot be joined to a consumer's port without
-    guessing. It is printed when non-empty so a MATCH is never read as
-    `everything was measured`.
+    ONE predicate, called from BOTH sides of the supply assertion: the tool's
+    own read of PUBLISHER_DOCS, and publishing_docs_in_tree() which is what
+    the gate compares it against. They were nearly two predicates before this
+    -- the gate hand-rolled its own census -- and a hand-copied predicate
+    drifts silently (agent-2 measured exactly that in C12 today). If the
+    tool's notion of a publish changes, the census changes with it, which is
+    the right coupling: the assertion asks whether the tool READ the docs
+    that publish BY ITS OWN DEFINITION of publish.
     """
-    out = {}
-    unattributed = {}
-    for rel in PUBLISHER_DOCS:
-        path = os.path.join(root, rel)
-        try:
-            with open(path, encoding="utf-8") as f:
-                lines = f.readlines()
-        except OSError:
-            continue
-        ports = {}
-        binds = []
-        for i, line in enumerate(lines, 1):
+    ports = {}
+    binds = []
+    for i, line in enumerate(lines, 1):
             if line.lstrip().startswith("#"):
                 continue
             for m in PUBLISH_RE.finditer(line):
@@ -265,6 +260,70 @@ def read_publishers(root):
                        else {"loopback", "bridge"} if ip in ("0.0.0.0",)
                        else {"loopback"} if ip in LOOPBACK_HOSTS else set())
                 binds.append((i, ip, cov))
+    return ports, binds
+
+
+def has_publish(lines):
+    """True iff these lines contain a publish this tool would act on.
+
+    The SAME parser decides, so the census below cannot disagree with the
+    read above about what "publishes" means.
+    """
+    ports, _ = scan_publish_lines(lines)
+    return bool(ports)
+
+
+def publishing_docs_in_tree(root, skip_dirs=()):
+    """SET of docs in the tree that publish, by this file's own parser.
+
+    Walked with os.walk, NOT `git ls-files`. Measured reason: pipeline.py's
+    `_mutant_tree` copies the tree WITHOUT `.git`, so every connection arm
+    runs the tool in a directory where a git-based census returns 0 -- and
+    `tool_read >= 0` is satisfied by a tool that read nothing. A ground truth
+    that is absent exactly where the assertion is exercised is not a ground
+    truth. 0 from this function on a tree that HAS docs is an error in the
+    caller's hands, not a pass: see the reach check in repo_check.py.
+    """
+    found = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not d.startswith(".") and d != "__pycache__"
+            and os.path.normpath(os.path.join(rel_dir, d)) not in skip_dirs
+            and os.path.normpath(os.path.join(rel_dir, d)) != ".")
+        for fn in filenames:
+            if not fn.endswith(".md"):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            if has_publish(lines):
+                found.add(os.path.relpath(full, root).replace(os.sep, "/"))
+    return found
+
+
+def read_publishers(root):
+    """({doc: {port: (covered_set, [lines])}}, {doc: [unattributed binds]}).
+
+    The second return is a REPORTED GAP, not a silent one: a `--bind` names an
+    interface but no port, so it cannot be joined to a consumer's port without
+    guessing. It is printed when non-empty so a MATCH is never read as
+    `everything was measured`.
+    """
+    out = {}
+    unattributed = {}
+    for rel in PUBLISHER_DOCS:
+        path = os.path.join(root, rel)
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        ports, binds = scan_publish_lines(lines)
         out[rel] = ports
         unattributed[rel] = binds
     return out, unattributed
@@ -335,8 +394,12 @@ def run(root="."):
     for g in gaps:
         print("  GAP (not measured):", g)
     if findings:
-        print("PORTCHECK: DIFFER (%d publish site(s) checked; %d doc(s) read)"
-              % (checked, len(docs_read)))
+        # THE NAMES ARE PRINTED ON BOTH VERDICTS. A gate that compares SETS
+        # can only do that for verdicts whose message carries the set, and
+        # reading only the MATCH line would make the assertion absent exactly
+        # on the trees that are failing -- the same reach bug one level up.
+        print("PORTCHECK: DIFFER (%d publish site(s) checked; %d doc(s) read: "
+              "%s)" % (checked, len(docs_read), ", ".join(docs_read)))
         for f in findings:
             print("  -", f)
         return 1
@@ -357,7 +420,7 @@ def selftest():
         'UI = "http://127.0.0.1:8790" + path\n')
     results = []
 
-    def fixture(publish_lines):
+    def fixture(publish_lines, docs=None):
         d = tempfile.mkdtemp()
         for rel, text in (("agent/mcp-stdio.py",
                            'BANK_URL = os.environ.get("BANK_URL", '
@@ -375,7 +438,12 @@ def selftest():
         for pl in publish_lines:
             body += "  -p %s \\\n" % pl
         body += "  agent-bank\n```\n"
-        for rel in PUBLISHER_DOCS:
+        # `docs` lets an arm build a tree whose publisher set is KNOWN TO THE
+        # ARM. Reading the module-level PUBLISHER_DOCS here made the H and J
+        # arms fail with a perfectly legal edit to that constant -- an arm
+        # that bites correct code. Measured on a tree where REBUILD.md had
+        # been substituted in.
+        for rel in (docs if docs is not None else PUBLISHER_DOCS):
             p = os.path.join(d, rel)
             open(p, "w").write(body)
         return d
@@ -421,6 +489,91 @@ def selftest():
     print("  %-44s %s  (%d -> %d doc(s) read)"
           % ("G docs read shrinks when a publisher doc is dropped",
              "PASS" if g_ok else "FAIL", full_n, narrow_n))
+    # H: the census and the tool must agree as SETS on a tree that publishes.
+    # A COUNT is a lossy projection of a set: agent-8's round-3 attack
+    # substituted a non-publishing doc for a publishing one and the count was
+    # unchanged (3 read, 3 in the tree, guide.md never opened). This arm
+    # asserts the thing the gate will assert.
+    # H: on a tree where the constant names exactly the publishers, the sets
+    # are EQUAL. (The first version of this arm added a fourth doc to the
+    # fixture and asserted equality anyway -- it went red on a correct
+    # census. An arm that bites correct code is not an arm.)
+    _h_docs = ("README.md", "docs/CLOUD-DEPLOYMENT.md", "docs/guide.md")
+    d_h = fixture(["0.0.0.0:8790:8790"], docs=_h_docs)
+    _h_saved = PUBLISHER_DOCS
+    try:
+        globals()["PUBLISHER_DOCS"] = _h_docs
+        r_h, _e3 = evaluate(d_h)
+        read_h = set(r_h[3]) if r_h else set()
+        tree_h = publishing_docs_in_tree(d_h)
+    finally:
+        globals()["PUBLISHER_DOCS"] = _h_saved
+        import shutil as _sh
+        _sh.rmtree(d_h, ignore_errors=True)
+    h_ok = read_h == tree_h and len(tree_h) == len(_h_docs)
+    ok &= h_ok
+    print("  %-44s %s  (read %s, tree %s)"
+          % ("H census matches the read set on a clean tree",
+             "PASS" if h_ok else "FAIL", sorted(read_h), sorted(tree_h)))
+    # J: THE ROUND-3 ATTACK ITSELF. Substitute a non-publishing doc for a
+    # publishing one in PUBLISHER_DOCS. The COUNT is unchanged (3 read, 3 in
+    # the tree) -- so a count assertion passes -- while the SETS differ and
+    # the unread publisher is named. This is the arm that proves the gate's
+    # assertion is connected to the defect agent-8 measured.
+    # Build the fixture with an arm-local doc list, so the arm does not depend
+    # on which names the shipped constant happens to carry.
+    _j_docs = ("README.md", "docs/CLOUD-DEPLOYMENT.md", "docs/guide.md")
+    d_j = fixture(["0.0.0.0:8790:8790"], docs=_j_docs)
+    _j_saved = PUBLISHER_DOCS
+    try:
+        # Drop docs/guide.md from the constant and substitute a tracked doc
+        # that publishes NOTHING for it. guide.md keeps its real publish, so
+        # the tree still has three publishers while the tool opens
+        # {README, CLOUD, SUBST} -- count 3 on both sides, set difference
+        # {docs/guide.md}. Using the LAST entry instead would have removed a
+        # real publish and made the count move, which is the cheap case.
+        dropped = "docs/guide.md"
+        open(os.path.join(d_j, "SUBST.md"), "w").write("# docker build only\n")
+        globals()["PUBLISHER_DOCS"] = (tuple(d for d in _j_docs
+                                             if d != dropped)
+                                       + ("SUBST.md",))
+        try:
+            r_j, _e5 = evaluate(d_j)
+        finally:
+            globals()["PUBLISHER_DOCS"] = _j_saved
+        read_j = set(r_j[3]) if r_j else set()
+        tree_j = publishing_docs_in_tree(d_j)
+    finally:
+        import shutil as _sh3
+        _sh3.rmtree(d_j, ignore_errors=True)
+    j_ok = (len(read_j) == len(tree_j) and read_j != tree_j
+            and dropped in tree_j - read_j)
+    ok &= j_ok
+    print("  %-44s %s  (count %d==%d, unread %s)"
+          % ("J substitution keeps the COUNT and moves the SET",
+             "PASS" if j_ok else "FAIL", len(read_j), len(tree_j),
+             sorted(tree_j - read_j)))
+    # I: and the census must SEE an unlisted doc that publishes. The tool
+    # does not read it -- that is the defect -- so the difference has to show
+    # as a set difference, which is the only message the gate has.
+    d_i = fixture(["0.0.0.0:8790:8790"], docs=_h_docs)
+    _i_saved = PUBLISHER_DOCS
+    try:
+        globals()["PUBLISHER_DOCS"] = _h_docs
+        open(os.path.join(d_i, "STRAY.md"), "w").write(
+            "```\ndocker run --name agent-bank -p 8792:8792 img\n```\n")
+        r_i, _e4 = evaluate(d_i)
+        read_i = set(r_i[3]) if r_i else set()
+        tree_i = publishing_docs_in_tree(d_i)
+    finally:
+        globals()["PUBLISHER_DOCS"] = _i_saved
+        import shutil as _sh2
+        _sh2.rmtree(d_i, ignore_errors=True)
+    i_ok = "STRAY.md" in tree_i and "STRAY.md" not in read_i
+    ok &= i_ok
+    print("  %-44s %s  (unread: %s)"
+          % ("I an unlisted publishing doc is VISIBLE to the census",
+             "PASS" if i_ok else "FAIL", sorted(tree_i - read_i)))
     print("PORTCHECK SELFTEST:", "PASS" if ok else "FAILED")
     return 0 if ok else 1
 

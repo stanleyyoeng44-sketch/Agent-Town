@@ -1403,44 +1403,46 @@ def _publisher_docs(root):
     return sites
 
 
-def _publisher_docs_read(root):
-    """How many DOCS publish a docker -p for the bank, counted from the TREE.
+def _publisher_docs_in_tree(root):
+    """SET of .md files that publish, by portcheck's OWN parser.
 
-    agent-8's attack on C15, measured on ce5497b: narrow PUBLISHER_DOCS to
-    drop docs/guide.md, then add ONE inline "-p 8787:8787" to a doc that is
-    still listed. portcheck's `checked` is a count of (doc, port) PAIRS a
-    consumer needs, so a new publish in a listed doc returns it to 3 while a
-    third of the SUPPLY side is unread -- and because re.match requires the
-    line to START with -p, the inline publish is invisible to the tree-side
-    SITE counter too. Both numbers the gate had were padable.
-
-    A DOC count is not: you cannot add coverage by editing a doc you already
-    read. Counted as "distinct tracked .md files containing a bank docker run
-    block with at least one -p", which is the supply side stated in the terms
-    the tool claims to read.
+    Two deliberate choices:
+      - The parser is portcheck's scan_publish_lines(), imported rather than
+        re-derived. agent-2 measured today what a hand-copied predicate does
+        (C12's escape set drifted from the tool it mirrors). If the tool's
+        idea of a publish changes, this census changes with it.
+      - The walk is over the FILESYSTEM, not `git ls-files`. MEASURED: on an
+        exported tree with no .git this function's git-based predecessor
+        returned 0, and 0 is indistinguishable from "no doc publishes" --
+        the assertion it fed was satisfied by a tool that read nothing. The
+        gate itself refuses to run outside a work tree, so `root` always has
+        .git today and the old version was not wrong there; this one is
+        chosen so the SAME census is usable where portcheck's selftest runs
+        (fixtures, no .git) and so a future caller cannot inherit the 0.
+        The caller must still treat an empty census as ERROR, not as a pass.
     """
-    import subprocess
-    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
-                           capture_output=True, text=True).stdout.split("\0")
-    n = 0
-    for f in filter(None, files):
-        try:
-            text = open(os.path.join(root, f), encoding="utf-8",
-                        errors="replace").read()
-        except OSError:
-            continue
-        # A doc counts only if it publishes a -p for the bank, because that
-        # is what portcheck's doc loop reports. A doc that STARTS the bank
-        # with no -p at all is a different defect (portcheck's docstring calls
-        # it "the strongest form of cutting a caller off") and must not be
-        # counted here: doing so made this reach assertion accuse a CORRECT
-        # tool of narrowing its input when the real change was that a doc
-        # stopped publishing. A check that misnames its cause gets deleted.
-        if re.search(r"^\s*docker run\b.*\bagent-bank\b", text, re.M) or \
-           re.search(r"docker run\b[^\n]*\bagent-bank\b", text):
-            if re.search(r"(?:^|\s)-p\s+\S+:\d+", text, re.M):
-                n += 1
-    return n
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location(
+        "_pc_census", os.path.join(root, "tools", "portcheck.py"))
+    pc = _iu.module_from_spec(spec)
+    spec.loader.exec_module(pc)
+    # The WALK lives in portcheck too, for the same reason the parser does:
+    # one definition, called from both sides. An earlier draft of this fix
+    # wrote the walk twice (once here, once there) within twenty minutes --
+    # which is the drift agent-2 measured in C12, reproduced by me before
+    # lunch.
+    return pc.publishing_docs_in_tree(root)
+
+
+def _publisher_docs_read(root):
+    """COUNT of the same set. One census, two projections of it.
+
+    This used to be a second, hand-rolled, git-based predicate; the set
+    version above is the one that cannot be padded by substitution, and this
+    is its cardinality so the older count assertion keeps working without a
+    second notion of "publishes" existing in the file.
+    """
+    return len(_publisher_docs_in_tree(root))
 
 
 def _required_tokens(root):
@@ -1472,7 +1474,8 @@ def _bank_blocks(root):
     return n
 
 
-def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
+def _run_tool(root, tool, label, mutants, reach=None, blocks=None,
+              docs_census=None):
     """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
 
     These two tools were built and reviewed (agent-7, portcheck+tokencheck)
@@ -1559,6 +1562,58 @@ def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
                 f"{want}. A detector that narrows its INPUT SET keeps its "
                 f"verdict and loses its coverage; the count is the only arm "
                 f"that sees it."]
+    if docs_census is not None:
+        # SET, NOT COUNT. agent-8's round-3 attack on C15, reproduced on
+        # cca62f9: narrow PUBLISHER_DOCS by dropping a doc, and SUBSTITUTE a
+        # tracked .md that publishes nothing. The tool still opens three docs
+        # and prints "3 doc(s) read"; the tree still has three publishers; a
+        # COUNT assertion is satisfied while docs/guide.md (with a real
+        # loopback-only publish in it) is never opened. Measured: gate PASS
+        # on a tree with a live defect. A count is a lossy projection of a
+        # set, and this family of attack has been won three times by padding
+        # the projection -- first an exit code, then a site count, now a doc
+        # count. So the assertion holds the NAMES the tool printed, which it
+        # now prints on both verdicts.
+        #
+        # ONE-DIRECTIONAL, for the same reason the count arm above is: the
+        # attack is FAILING TO READ a publisher. A tool that reads MORE than
+        # publishes is a different defect (over-broad input) and does not get
+        # this check's name on it. The census walks the tree with the tool's
+        # OWN parser, so the two sides cannot drift about what "publishes"
+        # means.
+        m = re.search(docs_census[0], "\n".join(out))
+        if m is None:
+            return label, "FAIL", [
+                f"{tool} printed no readable doc list, so this gate cannot "
+                f"tell WHICH docs it read. A count is padable by "
+                f"substitution; only the names are not. Last line: {tail}"]
+        got_docs = {d.strip() for d in m.group(1).split(",") if d.strip()}
+        want_docs = docs_census[1](root)
+        if not want_docs:
+            # A MISSING MEASUREMENT IS AN ERROR, NEVER A PASS. Measured: the
+            # git-based census returns 0 on a tree with no .git, and an empty
+            # census makes every set assertion trivially true. An empty result
+            # has two meanings -- "nothing publishes" (a real defect this
+            # check does not own) and "I could not look" -- and only the
+            # caller can tell them apart. It refuses rather than guess.
+            # FAIL, not a new verdict string: the reporter's status map is a
+            # hardcoded dict ({'PASS','WARN','FAIL'}) and an unknown verdict
+            # raises KeyError in the loop that prints results -- a crash
+            # instead of a verdict. Measured by reading the reporter rather
+            # than by adding the word "ERROR" and hoping.
+            return label, "FAIL", [
+                f"cannot enumerate publishing docs under {root}, so the "
+                f"supply-side set is unmeasured -- refusing to report a "
+                f"verdict. (0 is not the same answer as 'none exist'.)"]
+        unread = sorted(want_docs - got_docs)
+        if unread:
+            return label, "FAIL", [
+                f"{tool} read {len(got_docs)} doc(s) but did NOT open "
+                f"{len(unread)} that publish: {', '.join(unread)}. Its "
+                f"verdict is about the docs it opened, so it cannot be read "
+                f"as a statement about this tree. (It also read: "
+                f"{', '.join(sorted(got_docs - want_docs)) or 'nothing '
+                   'else'})"]
     if r.returncode == 2:
         return label, "WARN", [f"cannot measure here: {tail}"]
     if r.returncode != 0:
@@ -1649,7 +1704,9 @@ def c15_portcheck(root):
                       ],
                      reach=(r"(?:publish site|publish site\(s\))[^\n]*?"
                             r"(\d+) doc\(s\) read", _publisher_docs_read,
-                            "doc read"))
+                            "doc read"),
+                     docs_census=(r"doc\(s\) read: ([^)\n]+)",
+                                  _publisher_docs_in_tree))
 
 
 def c16_tokencheck(root):
