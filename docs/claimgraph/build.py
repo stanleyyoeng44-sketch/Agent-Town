@@ -322,10 +322,65 @@ def build(root=ROOT, outdir=HERE):
     return st, digest
 
 
+def _clone_only_checks():
+    """The subset of the M3 checks that need only the SHIPPED files.
+
+    A reader who cloned the repo wants to know the artifact is internally
+    consistent and that the README table describes it. They cannot know it is
+    CURRENT -- that needs the live store -- and this function does not pretend
+    otherwise.
+    """
+    checks = []
+    try:
+        committed_graph = json.load(open(os.path.join(HERE, "graph.json")))
+    except (OSError, json.JSONDecodeError) as e:
+        print("  %-42s FAIL (%s)" % ("M3 committed graph.json parses", e))
+        return 1
+    readme_path = os.path.join(HERE, "README.md")
+    try:
+        base = open(readme_path, encoding="utf-8").read()
+        committed = base.split(README_START, 1)[1].split(README_END, 1)[0]
+        checks.append(
+            ("M3 committed README table equals committed graph.json",
+             committed.strip() == stats_markdown(
+                 committed_graph["stats"]).strip()))
+    except (OSError, IndexError, KeyError) as e:
+        checks.append(("M3 committed README table equals committed graph.json",
+                       False))
+        print("  (reason: %s)" % e)
+    checks.append(("M3 committed graph.json parses and has a store digest",
+                   bool(committed_graph.get("store_digest"))))
+    ok = True
+    for name, cond in checks:
+        print("  %-42s %s" % (name, "OK" if cond else "FAIL"))
+        ok &= bool(cond)
+    print("selftest:", "PASS (clone-only: artifact consistent; currency "
+          "UNMEASURED)" if ok else "FAILED")
+    return 0 if ok else 1
+
+
 def selftest():
     """THE GENERATOR MUST RESPOND TO ITS INPUT. A graph builder that ignores
     the store would still produce a pretty page. So: copy the store, change
     ONE thing, and require the output to change in the corresponding way."""
+    # A FRESH CLONE HAS NO STORE. /shared/claims is a runtime artifact of this
+    # cohort's box, not part of the repository, so `python3 docs/claimgraph/
+    # build.py selftest` from a clone used to die on the first copytree with a
+    # traceback -- a non-zero exit that looks like a broken generator rather
+    # than an absent input, and that only exists for the person who cloned the
+    # repo instead of living in it. An absent store is a NAMED state, not a
+    # failure: the artifact is committed, so the check still has something to
+    # measure, and it says so. (agent-4.)
+    if not os.path.isdir(os.path.join(ROOT, "claims")):
+        print("  SKIP  no claim store at %s -- NOT EVALUATED, not a pass."
+              % ROOT)
+        print("        The store is a runtime artifact, not part of this "
+              "repository.")
+        print("        What CAN be checked from a clone: the committed artifact "
+              "parses and its")
+        print("        README table matches it (the M3 rows below run on the "
+              "shipped files).")
+        return _clone_only_checks()
     tmp = tempfile.mkdtemp()
     shutil.copytree(os.path.join(ROOT, "claims"), os.path.join(tmp, "claims"))
     shutil.copytree(os.path.join(ROOT, "events"), os.path.join(tmp, "events"))
