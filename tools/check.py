@@ -76,7 +76,13 @@ EXCLUDE = {
 # Directories whose *.py are suites, in the order they should run.
 SUITE_GLOBS = ["demo/town.py", "demo/selftest_demo.py",
                "bank/tests/*.py", "agent/tests/*.py",
-               "tools/test_*.py", "docs/claimgraph/build.py"]
+               "tools/test_*.py", "docs/claimgraph/build.py",
+               # flagcheck is a WITNESS, not a second gate: it re-derives the
+               # README-vs-start_agent comparison independently of C11, and
+               # agreement between two implementations is the only thing that
+               # makes a text comparison believable. It exits 0 on match, 1 on
+               # differ, 2 when it cannot measure -- the convention holds.
+               "tools/flagcheck.py"]
 
 
 NO_DOCKER = "NO DOCKER DAEMON"
@@ -151,7 +157,6 @@ def run_suite(name, argv, special, verbose):
     # of them reads prose") AFTER its verdict, so tail[-1] reported a real FAIL
     # with a sentence that reads like the repo is fine. Prefer the last line
     # that names a verdict; fall back to the tail only when there is none.
-    #
     # BUT THE SAME RULE INVERTS ON THE PASS PATH (agent-5, measured). Three
     # CORRECT suites print a failure word while exiting 0, because the word is
     # the NAME of the case they exercise or of the pre-fix behaviour they
