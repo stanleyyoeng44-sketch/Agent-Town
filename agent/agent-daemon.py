@@ -162,6 +162,114 @@ def sdk_session_records() -> str:
     return os.path.join(projects, want)
 
 
+def build_stamp() -> dict:
+    """What this process is actually running, recorded so it can be asked.
+
+    agent-9's point: the README told an operator to md5 ONE file and conclude
+    the container "is running this code". One file is not a tree -- today's
+    work touched agent/agent-daemon.py, ui/control.py and the on-disk layout,
+    so a daemon that matches while the rest does not would pass that check.
+    A process that cannot say which build it is has to be interrogated from
+    outside, and outside access is exactly what this box does not have.
+
+    Recorded at every birth: the sha256 of the code this daemon can see, so a
+    transcript answers 'was the fix running?' without docker access.
+    """
+    out = {"agent_daemon_sha256": _sha256(__file__)}
+    try:
+        out["repo_head"] = _read_head()
+    except Exception:
+        out["repo_head"] = None
+    return out
+
+
+def _sha256(path: str):
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _read_head():
+    """The commit this checkout is on, if the source tree is a git repo."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        head = os.path.join(here, ".git", "HEAD")
+        if os.path.isfile(head):
+            with open(head, encoding="utf-8") as f:
+                ref = f.read().strip()
+            if ref.startswith("ref: "):
+                ref_path = os.path.join(here, ".git", ref[5:])
+                try:
+                    with open(ref_path, encoding="utf-8") as f:
+                        return f.read().strip()
+                except OSError:
+                    return None
+            return ref or None
+        here = os.path.dirname(here)
+    return None
+
+
+def _previous_life_end():
+    """The most recent life-end event on disk, or None.
+
+    Reads the transcripts BACKWARDS (newest file first, last lines first) so
+    this stays cheap on a life with tens of thousands of events.
+    """
+    try:
+        files = sorted((f for f in os.listdir(TRANSCRIPTS)
+                        if f.startswith("life-") and f.endswith(".jsonl")),
+                       reverse=True)
+    except OSError:
+        return None
+    for name in files[:3]:
+        path = os.path.join(TRANSCRIPTS, name)
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 8192))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("kind") == "life-end":
+                return ev
+    return None
+
+
+def _birth_time(path: str):
+    """st_birthtime where the platform has it, else st_ctime; None if absent.
+
+    Linux has no st_birthtime on ext4/overlay in general, so ctime is the
+    fallback -- and ctime is NOT creation time (it updates on metadata
+    change). Recorded as what it is rather than presented as a birth time the
+    filesystem cannot give.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return getattr(st, "st_birthtime", None) or st.st_ctime
+
+
+def _birth_source() -> str:
+    """Which clock _birth_time() actually returns on this platform.
+
+    Recorded as a value, not only in a docstring: whoever debugs this at 3am
+    with no context reads the record, not the file. (agent-9.)"""
+    return "birthtime" if hasattr(os.stat("."), "st_birthtime") else "ctime"
+
+
 def session_record_path(sid: str) -> str:
     """The exact transcript file the SDK/CLI stores for this session.
 
@@ -269,8 +377,21 @@ def build_options(cfg: dict, life_id: str | None = None):
         print(f"[daemon] resuming session {resume_sid}", flush=True)
         if life_id:
             try:
-                LifeLog(life_id).log("resume", session=resume_sid,
-                                     record=session_record_path(resume_sid))
+                # agent-9: log the DECISION INPUTS at the moment of decision,
+                # not only a post-mortem afterwards. If the previous life
+                # wrote a life-end event saying slept=false / result=success,
+                # then THAT id belongs to a finished session and resuming it
+                # is wrong. That record is on disk right now, before the
+                # branch is taken, so recording it here is what would let a
+                # later change make the branch correct instead of merely
+                # explainable.
+                LifeLog(life_id).log(
+                    "resume", session=resume_sid,
+                    record=session_record_path(resume_sid),
+                    prev_life_end=_previous_life_end(),
+                    prev_ended_without_sleep=(
+                        (_previous_life_end() or {}).get("slept") is False),
+                    session_file_birth=_birth_time(SESSION_FILE))
             except Exception:
                 pass
     if "system_prompt" in cfg:
@@ -407,7 +528,8 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     except OSError:
         pass
     log.log("birth", model=cfg.get("model", AGENT_MODEL),
-            wake_file=os.path.exists(WAKE_FILE))
+            wake_file=os.path.exists(WAKE_FILE),
+            **build_stamp())
 
     wake_prompt = read_wake_prompt()
     try:
@@ -428,6 +550,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     restart_requested = False
     notice_sent = False
     saw_result = None
+    death_phase = None
 
     async with ClaudeSDKClient(options=options) as client:
         # Feed the opening message as a streaming prompt. When resuming a
@@ -622,8 +745,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     log.log("restart-flag-seen", phase="idle-watch")
                     try:
                         await client.interrupt()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # agent-9's review: returning here on a failed
+                        # interrupt() killed the guard for the rest of the
+                        # life, so a later restart call would hang -- the
+                        # exact hang this task exists to prevent. Log it and
+                        # keep polling instead.
+                        log.log("interrupt-failed", error=repr(exc))
+                        continue
                     return
 
         feed = asyncio.create_task(feed_tasks())
@@ -632,6 +761,27 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         human = asyncio.create_task(feed_human()) if AGENT_NAME == "agent-0" else None
         restart_watch = asyncio.create_task(watch_restart())
 
+        # The iterator step lives in a task; make it visible to the cleanup
+        # path so it cannot leak.
+        #
+        # agent-9's review found the task was a local inside the try, so any
+        # exit that did not clear it (an exception in the message body, a
+        # CancelledError) left the async generator open while the finally
+        # cancelled only the four pollers. Measured before the fix: one task
+        # still alive and the generator not closed after the life returned.
+        #
+        # COST OF THE LEAK, stated precisely: the client is created inside
+        # this function (`async with ClaudeSDKClient(...)`), so the stream
+        # cannot outlive the life and a second consumer is impossible.
+        # (agent-10 checked this at the source and corrected my first
+        # description, which claimed exactly that impossible consequence.)
+        # What a leak actually costs is a task alive until GC holding the
+        # generator, plus an unretrieved-task exception at loop shutdown --
+        # and, more importantly, a cleanup that does not ENFORCE the
+        # invariant, so the next exit anyone adds inherits the leak silently.
+        # That last point is the reason to fix it, and the reason the test
+        # counts live TASKS rather than just generator closure.
+        nxt: asyncio.Task | None = None
         try:
             # Start the life: feed the streaming prompt (opening message +
             # tasks), and consume the agent's messages.
@@ -663,7 +813,6 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             # A persistent task can be waited on with a timeout repeatedly
             # without being destroyed.
             messages = client.receive_messages()
-            nxt: asyncio.Task | None = None
             while True:
                 if nxt is None:
                     nxt = asyncio.ensure_future(messages.__anext__())
@@ -675,8 +824,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     # model is quiet, and an agent that answered and then
                     # called restart would otherwise never be noticed.
                     if restart_requested_flag():
+                        # phase=idle: noticed with NO message arriving. The
+                        # other path (phase absent, below) is noticed while
+                        # handling a message. They are different evidence for
+                        # the life-end record and must not be merged.
                         log.log("restart-called", phase="idle")
                         nxt.cancel()
+                        nxt = None
+                        death_phase = "idle"
                         raise Death()
                     continue
                 try:
@@ -686,7 +841,8 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     break   # the session genuinely closed
                 nxt = None
                 if restart_requested_flag():  # agent called the restart tool
-                    log.log("restart-called")
+                    log.log("restart-called", phase="after-message")
+                    death_phase = "after-message"
                     raise Death()
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
@@ -738,6 +894,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 pass
         finally:
             tasks = [feed, watcher, chat, restart_watch] + ([human] if human else [])
+            if nxt is not None:
+                # The pending __anext__ task: cancelling it closes the async
+                # generator. Without this, a non-standard exit leaks it and
+                # the next life shares this life's stream.
+                tasks.append(nxt)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -754,9 +915,20 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         LifeLog(life_id).log(
             "life-end",
             slept=bool(restart_requested),
+            death_phase=death_phase,
             result=saw_result,
             session_file_left=session_left,
-            next_life="resume" if session_left else "fresh")
+            # agent-9: existence is nearly free of information -- on a box
+            # that never restarted the file exists under every hypothesis.
+            # Its BIRTH time is what says whether the id predates the life
+            # about to read it. One stat call, and it is the fact that made
+            # this case decidable.
+            session_file_birth=_birth_time(SESSION_FILE),
+            birth_source=_birth_source(),
+            # agent-9: name the DECISION, not the outcome. "next_life: resume"
+            # invites the reader to assume a resume happened and worked; at
+            # this point all we know is which branch was taken.
+            next_life_choice="resume-chosen" if session_left else "fresh-chosen")
     except Exception:
         pass
 
