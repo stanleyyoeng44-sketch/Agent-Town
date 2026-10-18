@@ -1,0 +1,9 @@
+  PASS  L1 a passing suite is PASS                   got PASS, want PASS
+  PASS  L2 a failing suite is FAIL                   got FAIL, want FAIL
+  PASS  L3 no-docker banner is WARN                  got WARN, want WARN
+  PASS  L5 exit 2 is WARN, not PASS and not FAIL     got WARN, want WARN
+  PASS  L6 discovery sees a new suite                found both probes
+  PASS  L7 no dead EXCLUDE entries                   all point at real files
+  PASS  L4 one FAIL makes the verdict FAIL           got FAIL, want FAIL
+
+RUNNER SELFTEST: PASS

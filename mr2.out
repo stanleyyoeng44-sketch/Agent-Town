@@ -1,0 +1,36 @@
+[ok  ] C1 tracked junk
+[ok  ] C2 secrets in HEAD
+[ok  ] C3 secrets in HISTORY
+        scanned 250 distinct blob(s) across 147 commit(s)
+[ok  ] C4 .gitignore covers junk
+[ok  ] C5 doc commands run
+        executed 5 block(s), skipped 29
+        skipped README.md: python3 tools/check.py       # every suite, one line each; e (marked SKIP; probe declined -- not safe to run twice)
+        skipped README.md: docker build -t agent-glm ./agent (no docker/make on this box)
+        skipped README.md: docker volume create agent-mailbox (no docker/make on this box)
+        skipped README.md: docker run -d --name bank \ (no docker/make on this box)
+        skipped README.md: cd ui && python3 control.py        # http://localhost:8080 (not a command this check runs)
+        skipped README.md: docker run -d --name agent-1 --restart unless-stopped \ (no docker/make on this box)
+        skipped REBUILD.md: docker exec <agent> sh -c 'head -1 /workspace/transcripts/li (marked SKIP; not runnable here)
+        skipped REBUILD.md: docker exec <agent> md5sum /app/agent-daemon.py (marked SKIP; not runnable here)
+        skipped REBUILD.md: git clone https://github.com/stanleyyoeng44-sketch/docker-AI (not a command this check runs)
+        skipped REBUILD.md: docker build -t agent-bank ./bank (no docker/make on this box)
+        skipped REBUILD.md: python3 tools/migrate_agent_volumes.py --agent <name>        (marked SKIP; probe declined -- not safe to run twice)
+        ... and 9 more
+[ok  ] C6 sources parse
+[WARN] C7 sources import
+        bank/bank.py: imports only from bank/ (cwd-coupled; docs must say so)
+        agent/agent-daemon.py: imports only from agent/ (cwd-coupled; docs must say so)
+        ui/stanley_chat.py: imports only from ui/ (cwd-coupled; docs must say so)
+        agent/mcp-stdio.py: imports only from agent/ (cwd-coupled; docs must say so)
+        ui/control.py: imports only from ui/ (cwd-coupled; docs must say so)
+[ok  ] C8 readme numbers
+        recomputed 4 README numbers
+[ok  ] C9 readme transcript
+        PASS — every quoted command in the README's bank transcript replayed against bank/bank.py in this tree
+[ok  ] C10 readme links the graph
+        README.md links docs/claimgraph/index.html
+[ok  ] C11 readme docker flags
+        README block carries every durable mount and CLAUDE_CONFIG_DIR
+
+REPO CHECK: PASS (10 pass, 1 warn, 0 fail)
