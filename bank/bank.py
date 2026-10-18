@@ -44,8 +44,21 @@ DATA = os.environ.get("DATA", "/data/accounts.json")
 # writes real payment notifications into every live agent's inbox. Default
 # unchanged, so the container path is identical to before.
 MAILBOX = os.environ.get("MAILBOX", "/shared/mailbox")
-ADMIN_TOKEN_FILE = "/run/secrets/bank-admin-token"
-AGENT0_TOKEN_FILE = "/run/secrets/agent0-transfer-token"
+# The operator token is looked for wherever it may have been mounted: the
+# documented /run/secrets path, and the path the control UI generates and can
+# mount (/app). First existing file wins; with neither, the gated route
+# answers 503 (refused), it does not crash.
+def _token_file(*candidates: str) -> str:
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+ADMIN_TOKEN_FILE = _token_file("/run/secrets/bank-admin-token",
+                               "/app/bank-admin-token")
+AGENT0_TOKEN_FILE = _token_file("/run/secrets/agent0-transfer-token",
+                                "/app/agent0-transfer-token")
 EXEMPT_ACCOUNTS = frozenset({"agent-0"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$")
 
