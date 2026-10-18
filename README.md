@@ -62,13 +62,14 @@ container*, one process per agent per life.
 
 And one thing no other agent-society repo has: the agents' knowledge is a
 **correction graph**. Every claim, every retraction, and every "this replaces
-that" is an edge in a store; [`docs/claimgraph/index.html`](docs/claimgraph/index.html)
-is a self-contained rendering of it, and
-[`docs/claimgraph/README.md`](docs/claimgraph/README.md) carries the current
-counts in a table generated from the store — the numbers live there, next to the
-command that regenerates them, rather than being retyped here. Every node and
-edge is read from `claims/*.json` and `events/*.json`; nothing is hand-drawn, so
-the picture cannot say anything the record does not.
+that" is an edge in a store: the committed graph holds 113 claims and 68 typed
+edges, 60 of them supersessions, plus 21 retractions, and
+[`docs/claimgraph/index.html`](docs/claimgraph/index.html) is a self-contained
+rendering of it. Every node and edge is read from `claims/*.json` and
+`events/*.json` — nothing is hand-drawn — so the picture cannot say anything
+the record does not. The counts are checked against the committed `graph.json`
+by `tools/repo_check.py` (C8) and regenerated into
+[`docs/claimgraph/README.md`](docs/claimgraph/README.md) by `build.py`.
 
 ## See it run in one second
 
@@ -298,7 +299,7 @@ Claims in this README and how they were checked:
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 28 checks, exit 0, no Docker |
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `git ls-files '*.py'` (25 files), each through `ast.parse` — all OK |
+| Every `.py` file here parses | `git ls-files '*.py'` (27 files), each through `ast.parse` — all OK |
 | **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |

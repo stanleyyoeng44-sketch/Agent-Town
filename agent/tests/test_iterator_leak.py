@@ -1,20 +1,26 @@
-"""A leaked __anext__ task means the NEXT life reads the previous life's stream.
+"""The cleanup must ENFORCE that no iterator task outlives the life.
 
-agent-9's review of the life-boundary fix: the iterator step lives in a local
-task (`nxt`), and if the life exits by a path that does not clear it, the
-finally block cancels the four poller tasks but not `nxt`. The async
-generator stays open, and since live_one_life is called again on the SAME
-client for the next life, there are then two consumers of one stream.
+THE INVARIANT, which is what this test defends: whatever exit a life takes,
+the pending __anext__ task is cancelled by cleanup. Stated this way it stays
+true when someone adds a fourth exit. Stated as a list of the exits that
+currently leak -- which is how this defect was first described, by me and by
+agent-9 in different words -- it goes stale the moment the code changes.
 
-The failure is invisible: no exception, no hang. The next life's first turn can
-be fed from the previous life's stream. That is the class of bug that reads as
-"the agent said something odd once".
+THE DEFECT IT WAS WRITTEN FOR: the iterator step lived in a local inside the
+try, so an exit that skipped the clear left it pending while the finally
+cancelled only the four pollers. Measured before the fix: one task alive and
+the async generator not closed after the life returned.
 
-THIS TEST MEASURES IT DIRECTLY: the fake client's receive_messages() generator
-records when it is closed. After a life that ends by an exception raised
-inside the message-handling body (a path that never clears `nxt`), the
-generator must be CLOSED before live_one_life returns. If it is still open, the
-task leaked.
+WHAT IT DOES NOT COST, and the first version of this docstring got this
+wrong: the client is created inside live_one_life, so the stream cannot
+outlive the life and a second consumer is impossible. A leak costs a task
+alive until GC holding the generator, an unretrieved-task exception at
+shutdown, and a cleanup that does not enforce its invariant.
+
+HOW IT IS MEASURED: the fake client's generator records when it is closed,
+AND the test counts live tasks after the life returns. Both, because "the
+generator closed" can be a coincidence of when you look -- it still passes
+with the fix removed -- while the task count does not.
 
 Run:  python3 agent/tests/test_iterator_leak.py
 Exit: 0 no leak, 1 the iterator task outlived the life.
@@ -57,14 +63,23 @@ async def _noop_hook(*a, **k):
     return {}
 
 
-async def scenario():
+async def scenario(exit_kind):
+    """Run one life and end it by `exit_kind`, then report residue.
+
+    exit_kind:
+      "cancel"  -- the task driving the life is cancelled while an __anext__
+                   is pending (the exit the fix was first written for);
+      "raise"   -- the message-handling body raises BETWEEN messages, so no
+                   task is pending and cancelling tasks cannot help. This one
+                   caught a second, invisible leak: generator open, ZERO tasks
+                   alive. It is the case that proves the invariant has to be
+                   enforced by cleanup rather than by cancelling what happens
+                   to be pending.
+    """
     import claude_agent_sdk as sdk
     work = tempfile.mkdtemp()
     mod = load_daemon(work)
-    state = {"closed": False, "open": True}
-
-    class Boom(RuntimeError):
-        pass
+    state = {"closed": False, "closed_at": None}
 
     class FakeClient:
         def __init__(self, *a, **k):
@@ -89,22 +104,15 @@ async def scenario():
         def receive_messages(self):
             async def gen():
                 try:
-                    # Raise from INSIDE the message body: the daemon is in the
-                    # middle of handling a message, `nxt` is None at that
-                    # instant, but a CancelledError/exception elsewhere can
-                    # catch it with a task pending. Here we simulate the
-                    # harsher case: the body raises after a message, and the
-                    # generator should still be closed by cleanup.
-                    yield sdk.ResultMessage(
-                        subtype="success", duration_ms=1, duration_api_ms=1,
-                        is_error=False, num_turns=1, session_id="s",
-                        total_cost_usd=0.0, usage={})
-                    # wait to be pulled again: this is where a leaked task
-                    # would be sitting when the life exits
-                    await asyncio.sleep(3600)
+                    for _ in range(4):
+                        yield sdk.ResultMessage(
+                            subtype="success", duration_ms=1,
+                            duration_api_ms=1, is_error=False, num_turns=1,
+                            session_id="s", total_cost_usd=0.0, usage={})
+                        await asyncio.sleep(0.15)
                 finally:
                     state["closed"] = True
-                    state["open"] = False
+                    state["closed_at"] = asyncio.get_running_loop().time()
             return gen()
 
         def receive_response(self):
@@ -120,41 +128,56 @@ async def scenario():
     if hasattr(mod, "log_idle_proof"):
         mod.log_idle_proof = lambda *a, **k: None
 
+    if exit_kind == "raise":
+        # Raise from inside the message body on the second result, i.e. while
+        # NO __anext__ task is pending.
+        orig_log = mod.LifeLog.log
+        seen = {"n": 0}
+
+        def boom(self, kind, **kw):
+            if kind == "result":
+                seen["n"] += 1
+                if seen["n"] == 2:
+                    raise RuntimeError("body raised between messages")
+            return orig_log(self, kind, **kw)
+
+        mod.LifeLog.log = boom
+
     q = asyncio.Queue()
     task = asyncio.create_task(mod.live_one_life("leak", {}, q))
-
-    # Let the first result arrive and the loop start waiting on the next pull.
-    await asyncio.sleep(0.8)
-    # Now yank the life out from under the pending __anext__ task, the way a
-    # CancelledError or an exception in the body would. This is the exit that
-    # leaked: measured 1 task still alive and the generator open afterwards.
-    task.cancel()
+    await asyncio.sleep(0.5 if exit_kind == "cancel" else 0.9)
+    if exit_kind == "cancel":
+        task.cancel()
     try:
         await task
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, Exception):
         pass
-    except Exception:
-        pass
-    # Give cleanup a moment to run, then count anything still alive. The
-    # generator being closed is necessary but not sufficient: the TASK must be
-    # gone too, or the next life shares this stream.
     await asyncio.sleep(0.2)
+    state["returned_at"] = asyncio.get_running_loop().time()
     state["alive"] = [t for t in asyncio.all_tasks()
                       if not t.done() and t is not asyncio.current_task()]
     return state
 
 
 def main():
-    state = asyncio.run(scenario())
-    ok = state["closed"] and not state.get("alive")
-    print("  %-5s the async generator is CLOSED when the life returns"
-          % ("PASS" if state["closed"] else "FAIL"))
-    print("  %-5s no background task outlived the life (alive=%d)"
-          % ("PASS" if not state.get("alive") else "FAIL",
-             len(state.get("alive") or [])))
-    if not ok:
-        print("        a leaked __anext__ task means the next life on the "
-              "same client shares this life's stream")
+    ok = True
+    for kind in ("cancel", "raise"):
+        state = asyncio.run(scenario(kind))
+        closed = state["closed"]
+        # A generator that is only closed LATER was closed by the garbage
+        # collector, not by cleanup. CPython closes async generators when they
+        # are collected, which made an earlier version of this test pass with
+        # the fix removed. Closure must be AT OR BEFORE the life returning.
+        timely = (state.get("closed_at") is not None
+                  and state.get("returned_at") is not None
+                  and state["closed_at"] <= state["returned_at"] + 0.01)
+        alive = state.get("alive") or []
+        good = timely and not alive
+        ok = ok and good
+        print("  exit=%-7s %-5s closed-before-return=%-5s tasks alive=%d"
+              % (kind, "PASS" if good else "FAIL", timely, len(alive)))
+        if not good:
+            print("        cleanup did not enforce the invariant for this exit")
     print("\n%s" % ("ITERATOR-LEAK PASS" if ok else "ITERATOR-LEAK FAIL"))
     return 0 if ok else 1
 
