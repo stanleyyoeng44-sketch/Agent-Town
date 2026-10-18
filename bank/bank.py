@@ -39,7 +39,11 @@ DECAY_SECONDS = int(os.environ.get("DECAY_SECONDS", "60"))
 # README bank section, without editing source. Default unchanged, so the
 # container path is identical to before.
 DATA = os.environ.get("DATA", "/data/accounts.json")
-MAILBOX = "/shared/mailbox"
+# MAILBOX is env-configurable for the SAME reason as DATA, and it was missed
+# when DATA was fixed: a demo or test that redirects only the ledger still
+# writes real payment notifications into every live agent's inbox. Default
+# unchanged, so the container path is identical to before.
+MAILBOX = os.environ.get("MAILBOX", "/shared/mailbox")
 ADMIN_TOKEN_FILE = "/run/secrets/bank-admin-token"
 AGENT0_TOKEN_FILE = "/run/secrets/agent0-transfer-token"
 EXEMPT_ACCOUNTS = frozenset({"agent-0"})

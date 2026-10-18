@@ -45,6 +45,7 @@ Expected:
 
 ```
 ledger: /tmp/town-XXXXXXXX/accounts.json
+mailbox: /tmp/town-XXXXXXXX/bank-mailbox  (via MAILBOX env var)
 bank up on http://127.0.0.1:NNNNN
 
 1. bank
@@ -68,6 +69,8 @@ bank up on http://127.0.0.1:NNNNN
 
 3. mailbox (a directory of JSON files)
   PASS  empty inbox reads as empty list
+  PASS  bank wrote its payment notice to the DEMO mailbox, not live
+  PASS  demo wrote nothing into the real /shared/mailbox
 
 4. life cycle
   PASS  first life starts with no wake file

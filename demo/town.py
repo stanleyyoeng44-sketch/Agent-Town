@@ -143,8 +143,23 @@ def one_life(root, agent, body, turn):
 
 
 # --------------------------------------------------------------------------
+def _live_mailbox_count():
+    """Every message file under the REAL shared mailbox, or 0 if this box has
+    none (a reader without the volume). Used only to detect leakage."""
+    base = "/shared/mailbox"
+    n = 0
+    if not os.path.isdir(base):
+        return 0
+    for d in os.listdir(base):
+        inc = os.path.join(base, d, "incoming")
+        if os.path.isdir(inc):
+            n += sum(1 for _ in os.scandir(inc))
+    return n
+
+
 def main():
     work = tempfile.mkdtemp(prefix="town-")
+    _LIVE_MAILBOX_BASELINE = _live_mailbox_count()
     ledger = os.path.join(work, "accounts.json")
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -171,6 +186,25 @@ def main():
            f"os.environ.get('{cand}'" in src:
             env_name = cand
             break
+
+    # The bank also writes PAYMENT NOTIFICATIONS, and that path is a SECOND
+    # hardcoded absolute (/shared/mailbox) that the ledger fix did not cover.
+    # MEASURED CONSEQUENCE: every demo run wrote real "[bank] You received N
+    # coins" files into the LIVE inboxes of agents in this very box -- 12 per
+    # selftest run, including the guard-disabled limb's 76/10000/1000000
+    # overdraft notifications. A "sandboxed" demo that mutates live state is
+    # not sandboxed; the reader cannot tell the demo's mail from a real
+    # transfer. Redirect it to the demo's own mailbox directory: shape 1 =
+    # env override, shape 2 = patch a copy, else refuse loudly.
+    mailbox_dir = os.path.join(work, "bank-mailbox")
+    os.makedirs(mailbox_dir, exist_ok=True)
+    mailbox_env = None
+    for cand in ("BANK_MAILBOX", "MAILBOX", "MAILBOX_DIR"):
+        if f'os.environ.get("{cand}"' in src or \
+           f"os.environ.get('{cand}'" in src:
+            mailbox_env = cand
+            break
+
     if env_name:
         bank_copy = os.path.join(work, "bank_demo.py")
         with open(bank_copy, "w", encoding="utf-8") as f:
@@ -190,6 +224,29 @@ def main():
         say("      Update demo/town.py to match the new ledger configuration; "
             "do not silently run against /data.")
         return 2
+
+    if mailbox_env:
+        env = dict(env, **{mailbox_env: mailbox_dir})
+    else:
+        # Old bank shape: MAILBOX is a literal. Patch the copy we are about to
+        # run -- and assert the patch actually changed the source, because a
+        # mutation that does not mutate is the defect this repo has hit twice.
+        literal = 'MAILBOX = "/shared/mailbox"'
+        if literal not in src:
+            say("FAIL: bank.py writes notifications to a mailbox path this "
+                "demo cannot redirect, and it is NOT /shared/mailbox.")
+            say("      Refusing to run: the demo would write into live mail.")
+            return 2
+        patched = open(bank_copy, encoding="utf-8").read()
+        new = patched.replace(literal, f"MAILBOX = {mailbox_dir!r}")
+        if new == patched:
+            say("FAIL: mailbox redirect was a no-op; refusing to run.")
+            return 2
+        with open(bank_copy, "w", encoding="utf-8") as f:
+            f.write(new)
+        say(f"mailbox: {mailbox_dir}  (patched copy: MAILBOX literal -> temp)")
+    if mailbox_env:
+        say(f"mailbox: {mailbox_dir}  (via {mailbox_env} env var)")
 
     proc = subprocess.Popen([sys.executable, bank_copy], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -275,6 +332,27 @@ def main():
         box = os.path.join(work, "mailbox")
         drain = read_mail(box, "agent-1")
         check("empty inbox reads as empty list", drain == [], str(drain))
+        # The bank's OWN notification path, which is separate from the
+        # file-protocol helpers above. It must land in the demo's mailbox.
+        bank_inbox = os.path.join(mailbox_dir, "agent-2", "incoming")
+        notes = []
+        if os.path.isdir(bank_inbox):
+            for name in sorted(os.listdir(bank_inbox)):
+                try:
+                    notes.append(json.load(open(os.path.join(bank_inbox, name),
+                                                encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        check("bank wrote its payment notice to the DEMO mailbox, not live",
+              any(n.get("from") == "bank" and "25 coins" in n.get("text", "")
+                  for n in notes), f"{len(notes)} notice(s) in {bank_inbox}")
+        # THE ISOLATION INVARIANT, stated directly. If every check above
+        # passed but this failed, the demo had been mutating live agents'
+        # inboxes while printing PASS.
+        check("demo wrote nothing into the real /shared/mailbox",
+              not os.path.isdir("/shared/mailbox")
+              or _live_mailbox_count() == _LIVE_MAILBOX_BASELINE,
+              "the demo leaked notifications into live agent mailboxes")
 
         # -- 4. two lives, with memory carried in a file -------------------
         say("")
