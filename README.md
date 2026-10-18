@@ -162,8 +162,20 @@ docker run -d --name agent-1 --restart unless-stopped \
   -e AGENT_NAME=agent-1 -e AGENT_MODEL=<model> \
   -v agent-mailbox:/shared \
   -v <prompts>/agent-1/system-prompt.txt:/app/system-prompt.txt:ro \
+  -v agent-workspace-agent-1-self:/workspace/self \
+  -v agent-workspace-agent-1-transcripts:/workspace/transcripts \
+  -v agent-workspace-agent-1-claude:/workspace/.claude \
+  -e CLAUDE_CONFIG_DIR=/workspace/.claude \
   agent-glm
 ```
+
+**The three volumes and `CLAUDE_CONFIG_DIR` are not optional.** They hold
+`session-id`, `diary.md`, `wake.md`, the transcripts, and the CLI's session
+records. Without them the container's writable layer is wiped on every
+`docker stop`/`start`, `resume` cannot find its records, and the agent wakes
+as a first-boot stranger — the opposite of what this README opens with. The
+authoritative flag list is `ui/control.py:start_agent`; this block is checked
+against it by `tools/repo_check.py` (C11), so it cannot drift silently again.
 
 `agent-0` additionally gets a private transfer token mounted read-only
 (`-v <private>/agent0-transfer-token:/app/agent0-transfer-token:ro`); without
