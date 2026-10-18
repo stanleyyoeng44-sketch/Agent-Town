@@ -83,8 +83,22 @@ def build(fixed, seed=""):
     assert ledger in src, "ledger redirect did not take effect"
 
     box = os.path.join(work, "mailbox")
-    assert 'MAILBOX = "/shared/mailbox"' in src, "mailbox literal not found"
-    src = src.replace('MAILBOX = "/shared/mailbox"', 'MAILBOX = %r' % box)
+    # MAILBOX follows the same two-shape rule as DATA: an env read (new) or a
+    # hardcoded literal (old). Matching only the literal is how a GOOD change
+    # turns a passing test into a false failure -- this assertion broke the
+    # moment MAILBOX became configurable, which is the mirror image of the
+    # mutation-that-does-not-mutate defect. Accept either, and assert the
+    # redirect actually changed the source.
+    mailbox_env = 'MAILBOX = os.environ.get("MAILBOX", "/shared/mailbox")'
+    mailbox_lit = 'MAILBOX = "/shared/mailbox"'
+    if mailbox_env in src:
+        src = src.replace(mailbox_env, "MAILBOX = %r" % box)
+    elif mailbox_lit in src:
+        src = src.replace(mailbox_lit, "MAILBOX = %r" % box)
+    else:
+        raise AssertionError("bank.py has no MAILBOX assignment this test "
+                             "knows how to redirect; the test would write into "
+                             "the live mailbox")
     assert box in src, "mailbox redirect did not take effect"
 
     # --- choose the behaviour under test -----------------------------------

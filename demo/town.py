@@ -143,8 +143,28 @@ def one_life(root, agent, body, turn):
 
 
 # --------------------------------------------------------------------------
+LIVE_BOX = "/shared/mailbox"
+
+
+def live_mailbox_count():
+    """Count files in the REAL /shared/mailbox.
+
+    Only the real tree is walked. The demo's mailbox lives in its own temp
+    directory, so it is not under LIVE_BOX at all -- my first version of this
+    function skipped any path starting with LIVE_BOX, which is the entire real
+    tree, and therefore counted NOTHING while claiming to check it. The
+    negative control caught that: with the leak reintroduced the check still
+    printed PASS. A count that can only ever be 0 is not a measurement.
+    """
+    total = 0
+    for _root, _dirs, files in os.walk(LIVE_BOX):
+        total += len(files)
+    return total
+
+
 def main():
     work = tempfile.mkdtemp(prefix="town-")
+    live_before = live_mailbox_count()
     ledger = os.path.join(work, "accounts.json")
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -162,8 +182,15 @@ def main():
     # SEED funds exactly the names this demo provisions. Accounts are created
     # at 0 by design (a new balance must never be a grant -- see bank.py
     # ensure_account), so without SEED the two agents would start broke.
+    # MAILBOX is redirected for the SAME reason DATA is: the bank writes
+    # payment notices into it, and a demo that uses the real /shared/mailbox
+    # appends a "[bank] You received 25 coins from agent-1" message to the
+    # LIVE inbox of every real agent on the box. Measured before the fix:
+    # +1 file in /shared/mailbox per demo run. A test must not mutate the
+    # state it is testing around.
     env = dict(os.environ, PORT=str(port), START_MONEY="100",
-               SEED="agent-1:100,agent-2:100", DECAY_SECONDS="3600")
+               SEED="agent-1:100,agent-2:100", DECAY_SECONDS="3600",
+               MAILBOX=os.path.join(work, "mailbox"))
     src = open(BANK, encoding="utf-8").read()
     env_name = None
     for cand in ("BANK_DATA", "DATA", "LEDGER"):
@@ -314,6 +341,16 @@ def main():
         except subprocess.TimeoutExpired:
             proc.kill()
         shutil.rmtree(work, ignore_errors=True)
+
+    # A test that writes into the real mailbox is not isolated, and the
+    # message it leaves looks exactly like a payment from a real agent. The
+    # demo used to do this once per run (measured 46 -> 47 files) because
+    # bank.py hardcoded MAILBOX. MAILBOX is now an env var the demo sets, and
+    # this is the check that keeps it set.
+    live_after = live_mailbox_count()
+    check("demo wrote nothing into the real /shared/mailbox",
+          live_after == live_before,
+          f"{live_before} -> {live_after} files in /shared/mailbox")
 
     say("")
     if failures:
