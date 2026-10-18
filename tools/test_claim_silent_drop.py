@@ -13,10 +13,19 @@ indistinguishable from a successful one at every layer above it. agent-5 filed
 claims that looked fine, passed listing, and were cited as evidence, while the
 field that makes them checkable was never written.
 
+THE SECOND REQUIREMENT, same family (agent-5, found while re-filing): a claim
+that ASSERTS DETECTION cannot be expressed at all. claimgraph.py treats ANY
+nonzero exit as ERROR ("cmd exited %d"), so every negative control -- every
+"this checker catches that defect" claim -- is inexpressible. The store can
+then hold only claims whose instruments succeed, which is backwards: the
+negative controls are the ones that make the rest mean anything.
+
 THE RULE THIS TEST ENFORCES, stated so it survives a rewrite of either tool:
 a tool that cannot store a field must REFUSE the input, not accept it. Copying
 the extra keys in is one valid fix; refusing is another. Dropping them quietly
 is the only wrong answer, and it is the one that happened.
+And a claim format must be able to express a passing NEGATIVE control, or it
+can only record evidence in one direction.
 
 Run:  python3 tools/test_claim_silent_drop.py
 Exit: 0 the tool either stores the fields or refuses the spec; 1 it silently
@@ -100,10 +109,59 @@ def check_store(store):
     return True, lines
 
 
+def check_negative_control(store):
+    """Can the store express a claim whose truth is a NONZERO exit?
+
+    A negative control says "this checker catches that defect" and its
+    instrument therefore exits nonzero on success-of-detection. If the schema
+    cannot say that, the record can only hold one direction of evidence.
+
+    This does not demand a particular field name; it asks whether ANY
+    mechanism exists, by looking for an expected-exit declaration in the
+    schema the store's own tool documents.
+    """
+    schema_doc = os.path.join(store, "SPEC.md")
+    graph = os.path.join(store, "claimgraph.py")
+    text = ""
+    for path in (schema_doc, graph):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text += f.read()
+        except OSError:
+            continue
+    has_mechanism = any(k in text for k in
+                        ("expected_rc", "expect_rc", "expected_exit"))
+    src = ""
+    try:
+        with open(graph, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except OSError:
+        pass
+    unconditional = ('if p.returncode != 0:' in src
+                     and "expected" not in src.split("if p.returncode != 0:")[1][:200])
+    lines = []
+    if has_mechanism:
+        lines.append("  PASS  the schema can express an expected exit code")
+        return True, lines
+    lines.append("  FAIL  no expected_rc mechanism: a claim whose truth is a "
+                 "nonzero exit (every negative control) cannot be expressed")
+    if unconditional:
+        lines.append("        claimgraph treats ANY nonzero exit as ERROR "
+                     "unconditionally")
+    return False, lines
+
+
 def main():
     if not os.path.isdir(CLAIMS_DIR):
-        print("SKIP: no claim store at %s (it is not part of this repo)"
+        # Use the gate's own vocabulary: SKIP means "not evaluated", never
+        # "passed". A reader must not be able to mistake this for a green
+        # result. (agent-5.)
+        print("SKIP  no claim store at %s -- NOT EVALUATED, not a pass."
               % CLAIMS_DIR)
+        print("      The store is a runtime artifact, not part of this "
+              "repository;") 
+        print("      docs/claimgraph/README.md treats an absent store the "
+              "same way.")
         return 0
 
     # Always work on a COPY: the live store is other agents' evidence.
@@ -112,6 +170,9 @@ def main():
         store = os.path.join(tmp, "claims")
         shutil.copytree(CLAIMS_DIR, store)
         ok, lines = check_store(store)
+        ok2, lines2 = check_negative_control(store)
+        ok = ok and ok2
+        lines = lines + lines2
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
