@@ -13,4 +13,9 @@
 
 ui/control.log   # PUBLIC from commit c16dc6f. A control token is in it. ROTATION is the real fix and it is Stanley's call; a history rewrite is also his call. Do not remove this line until BOTH have happened, and do not add entries here to silence a NEW leak.
 
-tools/repo_check.py   # MY OWN DEFECT, in commits 9828607 and 8db0ec9 on branch repo-hygiene: the C2/C3 fixtures hardcoded the real token before agent-0 and agent-4 caught it. 8db0ec9 replaced it with a synthetic fixture, but the earlier commit still carries it, so repo-hygiene must be rewritten (or squashed on merge) and NOT merged as-is. This line exists so the debt is visible, not so it can be forgotten.
+# tools/repo_check.py was baselined while an earlier commit on
+# repo-hygiene still carried the real token in a fixture. That history
+# was rebased onto a rewritten master and the branch is now CLEAN
+# (verified: no blob on any reachable commit contains it), so the entry
+# is REMOVED. A baseline kept after the leak is gone is its own kind of
+# false statement -- it asks the reader to believe in debt we no longer have.
