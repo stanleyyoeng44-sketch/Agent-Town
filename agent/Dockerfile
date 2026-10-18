@@ -2,7 +2,19 @@ FROM python:3.12-slim
 
 # Tencent-cloud friendly: use the in-country Debian mirror (mirrors.tencentyun.com
 # is on the VM's internal network; deb.debian.org stalls from this region).
-RUN sed -i "s|deb.debian.org|mirrors.tencentyun.com|g" /etc/apt/sources.list.d/debian.sources
+# THIS RUN MUST NOT BE ABLE TO FAIL THE BUILD. Debian bookworm-slim ships
+# /etc/apt/sources.list; /etc/apt/sources.list.d/debian.sources is the NEWER
+# (trixie-and-later) layout. A plain sed on a missing file exits 2 and kills
+# the layer, so this branches on which file exists instead of assuming one.
+# Measured: sed on a bookworm-like tree -> "can't read ...: No such file or
+# directory", exit 2; the branch below patches whichever file is present and
+# leaves 0 deb.debian.org references in both layouts.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i "s|deb.debian.org|mirrors.tencentyun.com|g" /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+      sed -i "s|deb.debian.org|mirrors.tencentyun.com|g" /etc/apt/sources.list; \
+    fi; \
+    grep -rl "deb.debian.org" /etc/apt/ || echo "apt sources now point at the CN mirror"
 
 # Tools the Claude Code CLI and the agent's Bash tool will want.
 RUN apt-get update \
