@@ -162,6 +162,56 @@ def sdk_session_records() -> str:
     return os.path.join(projects, want)
 
 
+def build_stamp() -> dict:
+    """What this process is actually running, recorded so it can be asked.
+
+    agent-9's point: the README told an operator to md5 ONE file and conclude
+    the container "is running this code". One file is not a tree -- today's
+    work touched agent/agent-daemon.py, ui/control.py and the on-disk layout,
+    so a daemon that matches while the rest does not would pass that check.
+    A process that cannot say which build it is has to be interrogated from
+    outside, and outside access is exactly what this box does not have.
+
+    Recorded at every birth: the sha256 of the code this daemon can see, so a
+    transcript answers 'was the fix running?' without docker access.
+    """
+    out = {"agent_daemon_sha256": _sha256(__file__)}
+    try:
+        out["repo_head"] = _read_head()
+    except Exception:
+        out["repo_head"] = None
+    return out
+
+
+def _sha256(path: str):
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _read_head():
+    """The commit this checkout is on, if the source tree is a git repo."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        head = os.path.join(here, ".git", "HEAD")
+        if os.path.isfile(head):
+            with open(head, encoding="utf-8") as f:
+                ref = f.read().strip()
+            if ref.startswith("ref: "):
+                ref_path = os.path.join(here, ".git", ref[5:])
+                try:
+                    with open(ref_path, encoding="utf-8") as f:
+                        return f.read().strip()
+                except OSError:
+                    return None
+            return ref or None
+        here = os.path.dirname(here)
+    return None
+
+
 def _previous_life_end():
     """The most recent life-end event on disk, or None.
 
@@ -210,6 +260,14 @@ def _birth_time(path: str):
     except OSError:
         return None
     return getattr(st, "st_birthtime", None) or st.st_ctime
+
+
+def _birth_source() -> str:
+    """Which clock _birth_time() actually returns on this platform.
+
+    Recorded as a value, not only in a docstring: whoever debugs this at 3am
+    with no context reads the record, not the file. (agent-9.)"""
+    return "birthtime" if hasattr(os.stat("."), "st_birthtime") else "ctime"
 
 
 def session_record_path(sid: str) -> str:
@@ -470,7 +528,8 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     except OSError:
         pass
     log.log("birth", model=cfg.get("model", AGENT_MODEL),
-            wake_file=os.path.exists(WAKE_FILE))
+            wake_file=os.path.exists(WAKE_FILE),
+            **build_stamp())
 
     wake_prompt = read_wake_prompt()
     try:
@@ -703,14 +762,25 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         restart_watch = asyncio.create_task(watch_restart())
 
         # The iterator step lives in a task; make it visible to the cleanup
-        # path so it cannot leak. agent-9's review: it was a local inside the
-        # try, so any exit that did not clear it (an exception in the message
-        # body, a CancelledError) left the async generator OPEN while the
-        # finally cancelled only the four pollers. live_one_life is called
-        # again on the SAME client next life, so a leaked task means two
-        # consumers of one stream -- the next life's first turn could be fed
-        # from the previous life's stream. Measured before the fix: one task
+        # path so it cannot leak.
+        #
+        # agent-9's review found the task was a local inside the try, so any
+        # exit that did not clear it (an exception in the message body, a
+        # CancelledError) left the async generator open while the finally
+        # cancelled only the four pollers. Measured before the fix: one task
         # still alive and the generator not closed after the life returned.
+        #
+        # COST OF THE LEAK, stated precisely: the client is created inside
+        # this function (`async with ClaudeSDKClient(...)`), so the stream
+        # cannot outlive the life and a second consumer is impossible.
+        # (agent-10 checked this at the source and corrected my first
+        # description, which claimed exactly that impossible consequence.)
+        # What a leak actually costs is a task alive until GC holding the
+        # generator, plus an unretrieved-task exception at loop shutdown --
+        # and, more importantly, a cleanup that does not ENFORCE the
+        # invariant, so the next exit anyone adds inherits the leak silently.
+        # That last point is the reason to fix it, and the reason the test
+        # counts live TASKS rather than just generator closure.
         nxt: asyncio.Task | None = None
         try:
             # Start the life: feed the streaming prompt (opening message +
@@ -854,6 +924,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             # about to read it. One stat call, and it is the fact that made
             # this case decidable.
             session_file_birth=_birth_time(SESSION_FILE),
+            birth_source=_birth_source(),
             # agent-9: name the DECISION, not the outcome. "next_life: resume"
             # invites the reader to assume a resume happened and worked; at
             # this point all we know is which branch was taken.

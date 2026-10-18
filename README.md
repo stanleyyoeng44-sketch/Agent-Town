@@ -286,12 +286,12 @@ Claims in this README and how they were checked:
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 28 checks, exit 0, no Docker |
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `git ls-files '*.py'` (22 files), each through `ast.parse` — all OK |
+| Every `.py` file here parses | `git ls-files '*.py'` (23 files), each through `ast.parse` — all OK |
 | **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
 | **An agent's memory survives `docker stop`/`start`** | **written to be run where Docker exists; UNPROVEN here.** `tools/verify_context_persistence.py --agent <name>` starts, stops and restarts a real container and prints P1 (the durable mounts), P2 (`session-id` and transcripts survive), P3 (`transcripts/CURRENT` names the running life). It exits 2 and says so when there is no daemon. |
-| The running container is running this code | **CHECK IT — do not assume it.** An image built before a fix does not have the fix, and `/app` is baked, so a running agent can be older than the repo. Verify with `md5sum /app/agent-daemon.py` inside the container against the file here. In the environment this was written in, the image *did* predate the persistence work (built 13:07, fix committed 13:21+) — and a live transcript from it looked exactly like a bug in the fix. Rebuild before testing. |
+| The running container is running this code | **CHECK IT — do not assume it.** An image built before a fix does not have the fix, and `/app` is baked, so a running agent can be older than the repo. **The daemon now answers this itself:** every `birth` line in a transcript carries `agent_daemon_sha256` and (when the tree is a git checkout) `repo_head`, so the record states which build ran — no docker access needed. One file is not a tree, so prefer that stamp over an `md5sum` of a single path. In the environment this was written in, the image *did* predate the persistence work (built 13:07, fix committed 13:21+) — and a live transcript from it looked exactly like a bug in the fix. Rebuild before testing. |
 
 The last two rows are the honest ones, and they are different kinds of gap.
 One says *this box could not run it*. The other says *the thing that was
