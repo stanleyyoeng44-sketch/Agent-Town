@@ -193,15 +193,36 @@ def _sha256(path: str):
 
 
 def _read_head():
-    """The commit this checkout is on, if the source tree is a git repo."""
+    """The commit this checkout is on, if the source tree is a git repo.
+
+    BOUNDED ON PURPOSE. The daemon lives at /app inside the container, so
+    walking up from it reaches / and then stops -- but if /app were a bind
+    mount, walking further would read the HOST's .git. The search stops at the
+    first of: the repo root, the filesystem root, or /app itself. Reading a
+    git config is a harmless thing to do badly; reading one from outside the
+    container because a mount made it reachable is not.
+    """
     here = os.path.dirname(os.path.abspath(__file__))
+    stop = os.path.abspath("/app")
     for _ in range(4):
+        if here == os.path.dirname(here):      # filesystem root
+            break
+        if os.path.abspath(here) == stop and here != os.path.dirname(
+                os.path.abspath(__file__)):
+            # never search above the baked app directory
+            break
         head = os.path.join(here, ".git", "HEAD")
         if os.path.isfile(head):
             with open(head, encoding="utf-8") as f:
                 ref = f.read().strip()
             if ref.startswith("ref: "):
                 ref_path = os.path.join(here, ".git", ref[5:])
+                # a ref that escapes the repo is not a ref we should follow
+                if os.path.realpath(ref_path).startswith(
+                        os.path.realpath(os.path.join(here, ".git"))):
+                    pass
+                else:
+                    return None
                 try:
                     with open(ref_path, encoding="utf-8") as f:
                         return f.read().strip()
