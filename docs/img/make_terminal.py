@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
-"""Render REAL captured terminal output as a PNG (matplotlib, bundled font).
+"""Render REAL captured terminal output as a PNG.
 
-Input is literal stdout captured by running the demo. Nothing is hand-typed.
-The same file also emits an SVG with the text as real <text> (so it stays
-diffable); the PNG exists so the image can be inspected before it is shipped.
+Input is literal stdout captured by running the demo. Nothing is hand-typed:
+the colours are driven by the lines themselves, so a FAIL in the capture is
+red in the image and a check that disappears from the demo disappears from
+the picture.
+
+DEPENDENCY: matplotlib, for its bundled DejaVu Sans Mono. This agent image
+has NO system fonts and no cairo, so a rasteriser like cairosvg/resvg
+renders every glyph invisible -- use matplotlib. matplotlib is NOT in the
+base agent image (pip install --user matplotlib).
+
+NOT BYTE-REPRODUCIBLE, and it does not need to be. The demo prints a fresh
+temp path and port each run, so re-rendering produces a different PNG with
+the same CHECK LINES. The reproducibility claim is about content, not bytes:
+normalise /tmp/town-* and the port, and two captures from the same code are
+identical. That is the property that matters -- the picture cannot show a
+check the demo no longer prints.
+
+REGENERATION RULE: the demo's check count is quoted in README.md and shown
+in the image. If the demo changes, re-run it and re-run this script IN THE
+SAME COMMIT, and bump the count in the two Verification rows. They are
+generated from one run; changing one without the others is how a doc starts
+lying.
 
 Usage: python3 make_terminal.py <capture.txt> <out-basename> [title]
 """
