@@ -52,20 +52,32 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-# (name, argv, special)  -- special: None | "warn-if-no-docker" | "exit2-is-warn"
-SUITES = [
-    ("demo: a two-agent town runs", [sys.executable, "demo/town.py"], None),
-    ("demo: its checks can fail", [sys.executable, "demo/selftest_demo.py"], None),
-    ("bank: transfers and the mint", [sys.executable, "bank/tests/test_transfer_amounts.py"], None),
-    ("bank: operator token paths", [sys.executable, "bank/tests/test_token_paths.py"], None),
-    ("agent: the daemon proves life", [sys.executable, "agent/tests/test_idle_proof.py"], None),
-    ("agent: the prompt stream", [sys.executable, "tools/test_prompt_stream.py"], None),
-    ("repo: tracked junk, secrets, docs", [sys.executable, "tools/repo_check.py", "."], None),
-    ("repo: the checker can fail", [sys.executable, "tools/repo_check.py", "--selftest"], None),
-    ("claims: the graph matches the store", [sys.executable, "docs/claimgraph/build.py", "selftest"], None),
-    ("deploy: memory survives restart", [sys.executable, "tools/verify_context_persistence.py",
-                                         "--agent", "check"], "warn-if-no-docker"),
-]
+# DISCOVERY, NOT A HAND-MAINTAINED LIST. agent-10 measured that the first
+# version ran 2 of the 3 agent suites that existed on master: a hand-written
+# list is a statement about the author's memory, not about the repository, and
+# the failure is silent -- the missing suites do not fail, they vanish. Now a
+# new suite is included by EXISTING, and the only way to omit one is the
+# EXCLUDE table below, which a reviewer can argue with.
+#
+# Everything discovered is assumed to follow the convention (exit 0 = pass).
+# The exceptions are named here, once, with the reason:
+EXCLUDE = {
+    # path -> (label, special, why)
+    "tools/verify_context_persistence.py": (
+        "deploy: memory survives restart", "warn-if-no-docker",
+        "exits 0 with NO DOCKER while printing that the volume property is "
+        "unproven; PASS would be a green tick over evidence nobody gathered"),
+    "tools/migrate_agent_volumes.py": (
+        None, "skip",
+        "a TOOL, not a test: exits 2 with no arguments by design"),
+    "tools/check.py": (
+        None, "skip", "this runner"),
+}
+# Directories whose *.py are suites, in the order they should run.
+SUITE_GLOBS = ["demo/town.py", "demo/selftest_demo.py",
+               "bank/tests/*.py", "agent/tests/*.py",
+               "tools/test_*.py", "docs/claimgraph/build.py"]
+# Files that exist on master and are NOT the thing their name suggests.
 
 NO_DOCKER = "NO DOCKER DAEMON"
 A5 = "/shared/artifacts/agent-5/repo_audit"
@@ -84,6 +96,45 @@ def in_git_tree():
                               capture_output=True, text=True).returncode == 0
     except OSError:
         return False
+
+
+def discover():
+    """Every suite in the tree, plus the named exceptions. Sorted, stable."""
+    import glob
+    found = []
+    for pattern in SUITE_GLOBS:
+        paths = sorted(glob.glob(os.path.join(ROOT, pattern)))
+        for path in paths:
+            rel = os.path.relpath(path, ROOT)
+            if rel in EXCLUDE:
+                label, special, _why = EXCLUDE[rel]
+                if special == "skip":
+                    continue
+                argv = [sys.executable, rel]
+                if rel == "tools/verify_context_persistence.py":
+                    argv += ["--agent", "check"]
+                found.append((label, argv, special, rel))
+                continue
+            argv = [sys.executable, rel]
+            if rel.startswith("docs/claimgraph/"):
+                argv.append("selftest")
+            found.append((rel, argv, None, rel))
+    # Files that no glob reaches but that are suites with an argument or a
+    # special verdict: they are named in EXCLUDE and added here. A file that is
+    # neither globbed nor excluded does not exist as far as this runner is
+    # concerned, so the exclusion table is the reviewable surface.
+    seen = {rel for _n, _a, _s, rel in found}
+    for rel, (label, special, why) in EXCLUDE.items():
+        if special == "skip" or rel in seen:
+            continue
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            continue
+        argv = [sys.executable, rel]
+        if rel == "tools/verify_context_persistence.py":
+            argv += ["--agent", "check"]
+        found.append((label, argv, special, rel))
+    return found
 
 
 def run_suite(name, argv, special, verbose):
@@ -159,6 +210,34 @@ def selftest():
         ok = ok and good_case
         print("  %-5s %-44s got %s, want %s" % ("PASS" if good_case else "FAIL", label, got, want))
 
+    # L6: DISCOVERY MUST SEE A NEW SUITE. agent-10's finding was that the
+    # runner ran 2 of 3 agent suites because the list was hand-written. This
+    # control creates a file in agent/tests/ that FAILS, and requires discover()
+    # to find it and the runner to go red -- so a suite added tomorrow is in
+    # the gate without anyone editing a list.
+    import shutil
+    probes = []
+    for d in ("agent/tests", "bank/tests"):
+        target = os.path.join(ROOT, d, "test_check_runner_discovery_probe.py")
+        probes.append(target)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("import sys\nprint('DISCOVERY PROBE: this suite must be seen')\n"
+                    "sys.exit(1)\n")
+    try:
+        found = [rel for _n, _a, _s, rel in discover()]
+        seen = ("agent/tests/test_check_runner_discovery_probe.py" in found
+                and "bank/tests/test_check_runner_discovery_probe.py" in found)
+        ok = ok and seen
+        print("  %-5s %-44s %s" % ("PASS" if seen else "FAIL",
+                                   "L6 discovery sees a new suite",
+                                   "found both probes" if seen else "MISSED a probe"))
+    finally:
+        for target in probes:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+
     # L4: the aggregate verdict must follow the worst suite.
     verdict = verdict_of(["PASS", "WARN", "FAIL"])
     good_case = verdict == "FAIL"
@@ -197,9 +276,10 @@ def main():
               "`git init && git add -A && git commit -qm x` in an export." % ROOT)
         return 2
 
-    print("check: %d suite(s), from %s\n" % (len(SUITES), ROOT))
+    suites = discover()
+    print("check: %d suite(s), from %s\n" % (len(suites), ROOT))
     states = []
-    for name, argv, special in SUITES:
+    for name, argv, special, _rel in suites:
         state, detail = run_suite(name, argv, special, args.verbose)
         states.append(state)
         print("  %-5s %-38s %s" % (state, name, detail))
