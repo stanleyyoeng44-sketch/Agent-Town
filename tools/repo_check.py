@@ -284,8 +284,53 @@ def c5_doc_commands(root, timeout=60):
             first = _first_cmd(body)
             if not first:
                 continue
-            if "SKIP" in body.splitlines()[0]:
-                skipped.append(f"{f}: {first[:60]} (marked SKIP)")
+            # The SKIP marker may appear two ways and BOTH must mean the same
+            # thing:
+            #   (a) a leading comment line "# SKIP: <reason>"   (what docs use)
+            #   (b) a literal first token "SKIP <command>"
+            # The old code read body.splitlines()[0] only, so (b) worked and (a)
+            # was invisible -- a doc could write "# SKIP python3 ..." and the
+            # command still RAN, or write "SKIP python3 ..." and it was silently
+            # swallowed. Two spellings, opposite outcomes, both silent.
+            skip_lines = [l.strip() for l in body.splitlines()
+                          if l.strip() and not l.strip().startswith("#")]
+            skip_marked = (first.upper().startswith("SKIP")
+                           or any(l.strip().upper().startswith("# SKIP")
+                                  for l in body.splitlines()))
+            if skip_marked:
+                # SKIP must NOT be able to silence a command this checker can
+                # actually run. Otherwise any doc can disable its own check by
+                # writing the word SKIP in a fenced block, and the check reports
+                # a skip that looks deliberate rather than an unverified claim.
+                # SKIP is honoured only for commands that are otherwise
+                # unrunnable here (env-limited), and even then it is named with
+                # its reason. A runnable command marked SKIP is a WARN: the
+                # document asked not to be verified, which is a fact worth
+                # surfacing, not a pass.
+                inner = first[4:].strip() if first.upper().startswith("SKIP") else first
+                # A SKIP is only an opt-out if the command COULD have run here
+                # and passed. Probe it: if it exits 0 it was runnable and the
+                # SKIP was hiding a working check (WARN, and say so). If it
+                # exits non-zero it genuinely needs the environment the doc
+                # names (Docker, a daemon), and the SKIP is legitimate history.
+                # Older code never probed, so "SKIP" was a universal silencer.
+                probe = None
+                if inner.startswith(RUNNABLE):
+                    try:
+                        pr = subprocess.run(inner, shell=True, cwd=root,
+                                            text=True, capture_output=True,
+                                            timeout=timeout)
+                        probe = pr.returncode
+                    except subprocess.TimeoutExpired:
+                        probe = "TIMEOUT"
+                if probe == 0:
+                    warnings.append(
+                        f"{f}: `{inner[:60]}` marked SKIP but runs fine here "
+                        f"-- the doc is opting out of a check it could pass")
+                else:
+                    why = ("exits %s without its environment" % probe
+                           if probe is not None else "not runnable here")
+                    skipped.append(f"{f}: {inner[:60]} (marked SKIP; {why})")
                 continue
             if first.startswith(ENV_LIMITED):
                 skipped.append(f"{f}: {first[:60]} (no docker/make on this box)")
@@ -559,6 +604,43 @@ def selftest():
     _, r = run(d)
     outcomes.append(("C5 catches a doc command that fails",
                      dict((n, o) for n, o, _ in r)["C5 doc commands run"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C5b: SKIP must not silence a command that would have PASSED.
+    # "SKIP" used to be a universal silencer: any doc could disable its own
+    # check by writing it. Now a marked command is PROBED -- exit 0 means it
+    # was runnable all along and the SKIP hid a working check (WARN).
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: no reason at all\npython3 -c \"print(1)\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 will not let SKIP hide a command that would pass",
+                     c5[0] == "WARN" and any("runs fine here" in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C5c: a legitimate SKIP is still honoured -- a command that genuinely
+    # cannot run here must not be turned into a failure, or every docker block
+    # in the repo goes red. This is the control that stops the fix above from
+    # being "ignore SKIP entirely".
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs a docker daemon\n"
+        "python3 -c \"import sys; sys.exit(2)\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "env skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 still honours SKIP when the command cannot run here",
+                     c5[0] == "WARN"
+                     and any("exits 2 without its environment" in str(x) for x in c5[1])
+                     and not any("runs fine" in str(x) for x in c5[1])))
     shutil.rmtree(d)
 
     # C6: a .py that does not parse
