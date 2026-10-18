@@ -354,6 +354,7 @@ UI now refuses to start such an agent and prints the command instead of
 silently leaving it unfixed. Copy the memory into the volumes first:
 
 ```bash
+# SKIP: needs a Docker daemon; without one the tool exits 2 and says so.
 python3 tools/migrate_agent_volumes.py --agent agent-0          # dry run
 python3 tools/migrate_agent_volumes.py --agent agent-0 --apply  # stop + copy
 # then delete and re-create the container from the UI
