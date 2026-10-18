@@ -600,10 +600,37 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     except (OSError, json.JSONDecodeError):
                         continue
 
+        async def watch_restart():
+            """Notice the restart flag even when NO message is arriving.
+
+            The flag used to be checked only inside the receive loop. With
+            receive_response() that was invisible, because the loop exited
+            after every answer. With receive_messages() the loop BLOCKS when
+            the model is quiet, so an agent that answered and then called
+            restart would sit there forever -- verified: without this task the
+            life hangs (agent/tests/test_restart_while_idle.py).
+
+            Pushing a queue sentinel does NOT help: the receive loop is
+            awaiting the CLIENT, not the queue, so a sentinel cannot wake it.
+            The only thing that can unblock the client is interrupting it.
+            interrupt() is documented as 'only works with streaming mode',
+            which is exactly how this daemon drives the session.
+            """
+            while True:
+                await asyncio.sleep(0.25)
+                if restart_requested_flag():
+                    log.log("restart-flag-seen", phase="idle-watch")
+                    try:
+                        await client.interrupt()
+                    except Exception:
+                        pass
+                    return
+
         feed = asyncio.create_task(feed_tasks())
         watcher = asyncio.create_task(watch_context())
         chat = asyncio.create_task(feed_chat())
         human = asyncio.create_task(feed_human()) if AGENT_NAME == "agent-0" else None
+        restart_watch = asyncio.create_task(watch_restart())
 
         try:
             # Start the life: feed the streaming prompt (opening message +
@@ -618,7 +645,46 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
 
             send_task = asyncio.create_task(client.query(prompt_stream()))
 
-            async for message in client.receive_response():
+            # ONE LIFE = ONE SESSION, NOT ONE RESPONSE.
+            # receive_response() stops at the first ResultMessage, so every
+            # ordinary answer ended the life; the next life resumed the same
+            # session and announced a 'restart'. Measured 3x on the running
+            # container: PID 1 unchanged, every life result=success with 0
+            # restart-tool calls and 0 death events, births wake_file=False.
+            # receive_messages() yields the whole stream; the life ends on the
+            # restart tool (Death) or when the stream genuinely closes.
+            # Regression test: agent/tests/test_life_boundary.py.
+            # Drive the iterator through a background TASK, not by wrapping
+            # __anext__() in wait_for: wait_for CANCELS the awaited coroutine
+            # on timeout, which closes the async generator, so the next
+            # __anext__() raises StopAsyncIteration and the life ends after
+            # one quiet interval. (Observed: the loop returned after 0.5s of
+            # model silence with the restart flag set and no Death.)
+            # A persistent task can be waited on with a timeout repeatedly
+            # without being destroyed.
+            messages = client.receive_messages()
+            nxt: asyncio.Task | None = None
+            while True:
+                if nxt is None:
+                    nxt = asyncio.ensure_future(messages.__anext__())
+                done, _pending = await asyncio.wait({nxt}, timeout=0.5)
+                if not done:
+                    # Nothing from the model for half a second. Check the
+                    # restart flag WITHOUT needing a message to arrive; with
+                    # receive_messages() the stream simply blocks when the
+                    # model is quiet, and an agent that answered and then
+                    # called restart would otherwise never be noticed.
+                    if restart_requested_flag():
+                        log.log("restart-called", phase="idle")
+                        nxt.cancel()
+                        raise Death()
+                    continue
+                try:
+                    message = nxt.result()
+                except StopAsyncIteration:
+                    nxt = None
+                    break   # the session genuinely closed
+                nxt = None
                 if restart_requested_flag():  # agent called the restart tool
                     log.log("restart-called")
                     raise Death()
@@ -671,7 +737,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             except OSError:
                 pass
         finally:
-            tasks = [feed, watcher, chat] + ([human] if human else [])
+            tasks = [feed, watcher, chat, restart_watch] + ([human] if human else [])
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

@@ -68,6 +68,14 @@ class FakeClient:
         await asyncio.sleep(3600)
         yield  # pragma: no cover
 
+    async def receive_messages(self):
+        # The daemon drives the session with receive_messages() since the
+        # life boundary was fixed (a completed response is not a life end).
+        # A fake must implement the interface the daemon ACTUALLY calls --
+        # implementing only the old one made this test crash, not fail.
+        await asyncio.sleep(3600)
+        yield  # pragma: no cover
+
 async def run_case(label, wake_prompt, timeout=1.5, resumed=False):
     """Run one life for `timeout` seconds with an empty inbox; report lines."""
     import agent_daemon as D
