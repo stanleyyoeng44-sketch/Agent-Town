@@ -594,10 +594,18 @@ README_COUNT_CLAIMS = [
     # the TOP-LEVEL README still states the four numbers in a sentence
     # ("holds 165 claims and 111 typed edges, 102 of them supersessions, plus
     # 23 retractions"), so a regex here would have matched 4/4 -- measured by
-    # agent-8 against d791564 with the four regexes restored: green on the
-    # true numbers, FAIL naming all four on doctored ones. The sentence was
     # restored by a rebase AFTER the comment was written and no gate could
     # see the pair.
+    # THE ARM THIS CLAIM RESTS ON IS A FORCED-WRONG ONE, not a historical
+    # sha. Measured by the author of this comment on ede3310 with four
+    # single-group regexes restored: correct numbers -> C8 PASS "recomputed
+    # 8"; all four forced to truth+1 -> C8 FAIL naming all four. A
+    # restore-the-regexes arm alone proves nothing here, because it is GREEN
+    # on any tree where C13 has already corrected the sentence -- a
+    # predicate pinned to an artifact that moves, which is how the sentence
+    # became false in the first place. The historical instance (d791564:
+    # 113/68/60/21 against 165/111/102/23) is agent-8's measurement and is
+    # cited as an instance, not as the proof.
     # The fix is C13 (c13_claimgraph_prose_numbers): it recomputes those four
     # values from graph.json, FAILs on a wrong one, and FAILs when the
     # sentence is DELETED rather than silently shrinking. Putting a second
@@ -628,6 +636,7 @@ def sh_ls(root):
     return out.stdout.splitlines()
 
 
+TEMP_ROOT = __import__("tempfile").gettempdir()
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # the repo this file lives in
 
@@ -1122,7 +1131,43 @@ def c12_undefined_names(root):
         "legal-code control clean)"]
 
 
-def _run_tool(root, tool, label):
+def _mutant_tree(root, rel, old, new):
+    """A FULL COPY of the tree with one line changed, for the connection arm.
+
+    A copy, not a symlink farm: the first version symlinked every top-level
+    entry, and the tools walk `rglob("*.py")` / `glob("*.md")`, which follows
+    symlinked DIRECTORIES into cycles ("Too many levels of symbolic links")
+    and misses files the tools reach by a relative path from a dir symlink.
+    A tree copy of this repo is a few MB; correctness is worth it.
+    """
+    import shutil, tempfile
+    # TEMP_ROOT is fixed to the system temp dir, NOT derived from `root`:
+    # an earlier version put these directories INSIDE the repo when the check
+    # was run there, and the next run then copied the copies, recursing until
+    # the tools' globs hit symlink cycles. A test that writes into the tree
+    # it is testing is a test that changes its own subject.
+    d = tempfile.mkdtemp(prefix="mutant-", dir=TEMP_ROOT)
+    for entry in os.listdir(root):
+        if entry in (".git", "__pycache__") or entry.startswith("mutant-"):
+            continue
+        src, dst = os.path.join(root, entry), os.path.join(d, entry)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(src, dst)
+    target = os.path.join(d, rel)
+    try:
+        text = open(target, encoding="utf-8").read()
+    except OSError:
+        return d, False
+    if old not in text:
+        return d, False
+    open(target, "w", encoding="utf-8").write(text.replace(old, new, 1))
+    return d, True
+
+
+def _run_tool(root, tool, label, mutant):
     """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
 
     These two tools were built and reviewed (agent-7, portcheck+tokencheck)
@@ -1131,25 +1176,28 @@ def _run_tool(root, tool, label):
     that must be invoked by hand enforces nothing, and "PORTCHECK: MATCH" on
     a board post reads as if it were part of the green. The tool's author is
     named here so the provenance is not guesswork.
+
+    THREE THINGS ARE ASSERTED, and the third is the one that matters:
+      1. the tool file exists (a check that cannot run must not pass)
+      2. its own selftest exits 0 AND prints the shipped summary with >=4 arms
+      3. THE TOOL IS CONNECTED: run it against a copy of the real tree with
+         one real defect injected and REQUIRE exit 1.
+    (3) exists because (2) is not enough, and that was measured rather than
+    guessed: agent-8 gutted tokencheck's run() to print MATCH and return 0 and
+    its selftest to `good = True`, left every arm line and the summary intact,
+    deleted the transfer-token mount from README, and C16 stayed GREEN. A
+    gate that reads a control's OUTPUT can only verify that the control is
+    well-spoken; it cannot verify that it is connected. The mutant arm is the
+    only one of the three that tests the pipeline instead of the description.
     """
     path = os.path.join(root, tool)
     if not os.path.isfile(path):
         return label, "FAIL", [f"{tool} is registered in CHECKS but missing"]
     # THE TOOL'S OWN CONTROL RUNS EVERY TIME. A tool whose selftest is only
     # run by hand is a control that rots unnoticed -- the exact failure this
-    # repo keeps finding. The selftest builds its own fixtures and requires
-    # both outcomes (a real defect reds it, a correct tree greens it), so a
-    # tool that has silently stopped detecting cannot report MATCH all day.
+    # repo keeps finding.
     st = subprocess.run([sys.executable, "-I", path, "--selftest"], cwd=root,
                         capture_output=True, text=True, timeout=240)
-    # A SELFTEST THAT WAS GUTTED TO return 0 IS INVISIBLE TO ITS EXIT CODE.
-    # Measured: replacing tokencheck's selftest with a stub that prints
-    # "DISARMED" and returns 0 left C16 green. So the exit code is not the
-    # whole assertion -- require the SUMMARY LINE the real selftest prints
-    # and a minimum number of individual arms. This is C13's rule ("the
-    # sentence must be READ, not merely matched") applied to a control:
-    # deleting a control is not a fix, and a summary that does not name
-    # itself is not evidence that the arms ran.
     st_out = (st.stdout or "") + (st.stderr or "")
     arms = [ln for ln in st_out.splitlines() if "  PASS" in ln]
     if st.returncode != 0:
@@ -1165,14 +1213,35 @@ def _run_tool(root, tool, label):
                        capture_output=True, text=True, timeout=120)
     out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
     tail = out[-1] if out else "(no output)"
-    if r.returncode == 0:
-        # A MATCH that came from checking ZERO sites is not a pass; the tool
-        # already refuses that itself, but assert it here too rather than
-        # trusting a tool's own summary line.
-        return label, "PASS", [tail]
     if r.returncode == 2:
         return label, "WARN", [f"cannot measure here: {tail}"]
-    return label, "FAIL", out[-6:]
+    if r.returncode != 0:
+        return label, "FAIL", out[-6:]
+    # (3) THE CONNECTION ARM.
+    rel, old, new = mutant
+    import shutil
+    d = None
+    try:
+        d, applied = _mutant_tree(root, rel, old, new)
+        if not applied:
+            return label, "FAIL", [
+                f"the mutant arm could not be applied: {rel} no longer "
+                f"contains {old!r}. The document changed shape, so this gate "
+                f"cannot prove the tool is connected. Update the mutant in "
+                f"repo_check to a defect that still exists."]
+        m = subprocess.run([sys.executable, "-I", path, d], cwd=d,
+                           capture_output=True, text=True, timeout=120)
+        if m.returncode != 1:
+            return label, "FAIL", [
+                f"{tool} stayed GREEN (exit {m.returncode}) on a tree with a "
+                f"real defect injected ({rel}: removed {old!r}). Its selftest "
+                f"speaks correctly, so either the tool is disconnected from "
+                f"the docs or this mutant is no longer a defect. A gate that "
+                f"cannot fail is decoration."]
+    finally:
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+    return label, "PASS", [tail, f"mutant arm: {rel} minus one defect -> DIFFER"]
 
 
 def c15_portcheck(root):
@@ -1184,7 +1253,9 @@ def c15_portcheck(root):
     ECONNREFUSED and the doc's own verification curled from the ONE observer
     that cannot see it. Fixed in d791564; this makes the invariant a gate.
     """
-    return _run_tool(root, "tools/portcheck.py", "C15 docs publish serve consumers")
+    return _run_tool(root, "tools/portcheck.py", "C15 docs publish serve consumers",
+                     ("docs/CLOUD-DEPLOYMENT.md",
+                      "  -p 127.0.0.1:8790:8790 \\\n", ""))
 
 
 def c16_tokencheck(root):
@@ -1197,7 +1268,10 @@ def c16_tokencheck(root):
     sites, and the tool's arm F adds a new token in code and requires all
     three docs to go red, so it cannot be satisfied by editing its own list.
     """
-    return _run_tool(root, "tools/tokencheck.py", "C16 docs mount every bank token")
+    return _run_tool(root, "tools/tokencheck.py", "C16 docs mount every bank token",
+                     ("README.md",
+                      "  -v ~/.config/docker-ai/agent0-transfer-token:"
+                      "/app/agent0-transfer-token:ro \\\n", ""))
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
