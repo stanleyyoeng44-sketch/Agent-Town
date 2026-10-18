@@ -243,6 +243,31 @@ def _looks_like_server(body, root="."):
     return False
 
 
+def _probe_safe(cmd: str) -> bool:
+    """Is `cmd` safe to execute twice, for the SKIP probe?
+
+    Deliberately narrow. The probe runs a command a document asked NOT to run,
+    so it must not be able to do damage. Allowed:
+      * `bash -n` / `sh -n`          -- parse only, by definition side-effect free
+      * `python3 -c "..."`           -- only if the snippet imports nothing and
+                                        calls nothing (no open/exec/system/
+                                        remove/rmtree/subprocess/socket)
+      * `test ...` / `[ ... ]`       -- pure predicate
+    Everything else is declined and reported as an honoured SKIP. A declined
+    probe is visible, which is the point: silence is what this change removed.
+    """
+    c = cmd.strip()
+    if c.startswith(("bash -n ", "sh -n ", "test ", "[ ")):
+        return True
+    if c.startswith(("python3 -c", "python -c")):
+        body = c.split("-c", 1)[1].strip().strip("'\"")
+        banned = ("import ", "open(", "exec(", "eval(", "system(", "remove(",
+                  "rmtree(", "subprocess", "socket", "unlink(", "rename(",
+                  "chmod(", "chown(", "shutil", "os.")
+        return not any(b in body for b in banned)
+    return False
+
+
 def _first_cmd(body):
     for line in body.splitlines():
         s = line.strip()
@@ -316,13 +341,27 @@ def c5_doc_commands(root, timeout=60):
                 # Older code never probed, so "SKIP" was a universal silencer.
                 probe = None
                 if inner.startswith(RUNNABLE):
-                    try:
-                        pr = subprocess.run(inner, shell=True, cwd=root,
-                                            text=True, capture_output=True,
-                                            timeout=timeout)
-                        probe = pr.returncode
-                    except subprocess.TimeoutExpired:
-                        probe = "TIMEOUT"
+                    # The probe executes a command the doc explicitly asked not
+                    # to run, so it must be limited to commands that are safe to
+                    # RUN twice. `python3 <script>` is NOT automatically safe: a
+                    # doc could mark a destructive line SKIP and the probe would
+                    # execute it anyway. The allowlist therefore narrows to the
+                    # shapes this checker already runs elsewhere -- a syntax
+                    # check, a one-liner that is not an import-and-execute, or a
+                    # test/[ expression. Anything else stays an honoured SKIP
+                    # with its reason, which is the status quo and is safe.
+                    if _probe_safe(inner):
+                        try:
+                            pr = subprocess.run(inner, shell=True, cwd=root,
+                                                text=True, capture_output=True,
+                                                timeout=timeout)
+                            probe = pr.returncode
+                        except subprocess.TimeoutExpired:
+                            probe = "TIMEOUT"
+                    else:
+                        skipped.append(f"{f}: {inner[:60]} (marked SKIP; probe "
+                                       f"declined -- not safe to run twice)")
+                        continue
                 if probe == 0:
                     warnings.append(
                         f"{f}: `{inner[:60]}` marked SKIP but runs fine here "
@@ -632,15 +671,38 @@ def selftest():
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
     open(os.path.join(d, "README.md"), "w").write(
         "# x\n\n```sh\n# SKIP: needs a docker daemon\n"
-        "python3 -c \"import sys; sys.exit(2)\"\n```\n")
+        "python3 -c \"print(1/0)\"\n```\n")
     _git(d, "add", "-f", ".")
     _git(d, "commit", "-qm", "env skipper")
     _, r = run(d)
     c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
     outcomes.append(("C5 still honours SKIP when the command cannot run here",
                      c5[0] == "WARN"
-                     and any("exits 2 without its environment" in str(x) for x in c5[1])
+                     and any("exits 1 without its environment" in str(x) for x in c5[1])
                      and not any("runs fine" in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
+    # C5d: the probe must DECLINE a command it is not safe to run twice.
+    # The probe exists to catch a doc that hides a passing check behind SKIP;
+    # it must not become an execution primitive for a destructive line. A
+    # SKIP-marked command that imports or writes is reported as an honoured
+    # SKIP with "probe declined", and the file it would have created must NOT
+    # exist afterwards. Without this, "SKIP" would be a way to get the checker
+    # to run anything.
+    d = farm()
+    marker = os.path.join(d, "PROBE_SHOULD_NOT_CREATE_ME")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: destructive\n"
+        "python3 -c \"open('%s','w').write('x')\"\n```\n" % marker)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "dangerous skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 declines to PROBE a command that writes",
+                     any("probe declined" in str(x) for x in c5[1])
+                     and not os.path.exists(marker)))
     shutil.rmtree(d)
 
     # C6: a .py that does not parse
