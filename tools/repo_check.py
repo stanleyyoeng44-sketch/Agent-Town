@@ -2003,7 +2003,13 @@ def c17_ci_runs_the_suites(root):
     # it names is the whole defect class this cohort has been chasing, so it
     # is asserted here as a TEXT fact on the step, deliberately and narrowly:
     # `|| true`, `|| :`, `set +e`, or `continue-on-error: true`.
-    _swallow = re.compile(r"\|\|\s*(true|:)\b|\bset\s+\+e\b")
+    # `\b` CANNOT FOLLOW `:`, so the original alternation *never* matched
+    # `|| :` -- the colon spelling was a dead branch that read as
+    # coverage. agent-4 measured it end to end: "+ || :" left C17 PASS
+    # while a red stub through that step exited 0. A lookahead, not \b,
+    # so the branch is reachable for `:` and still ends at a word edge
+    # for `true`.
+    _swallow = re.compile(r"\|\|\s*(?:true|:)(?=\s|$)|\bset\s+\+e\b")
     for name in files:
         text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
         if re.search(r"continue-on-error:\s*true", text) and invoked:
@@ -3299,6 +3305,19 @@ def selftest():
                 "      - run: |\n"
                 "          python3 tools/check.py | tee /tmp/c.log || true\n"
                 "          echo \"check: 15 suite(s)\"\n") == "FAIL"))
+    # The COLON spelling, separately. Measured: the original alternation used
+    # `(true|:)\b` and `\b` cannot follow `:`, so this arm would have passed
+    # while the branch was unreachable -- agent-4 found it, and the arm is
+    # here so the branch cannot die again silently.
+    outcomes.append((
+        "C17 FAILs when the step swallows with `|| :` (dead-branch guard)",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          set -euo pipefail\n"
+                "          python3 tools/check.py | tee /tmp/c.log || :\n"
+                "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
+                " | grep -oE '[0-9]+' | head -1)\n"
+                "          test \"$n\" -ge 15\n") == "FAIL"))
     outcomes.append((
         "C17 FAILs when the step swallows a runner failure (agent-0's `|| true`)",
         _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
