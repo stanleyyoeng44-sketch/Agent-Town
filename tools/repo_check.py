@@ -1142,10 +1142,25 @@ def _run_tool(root, tool, label):
     # tool that has silently stopped detecting cannot report MATCH all day.
     st = subprocess.run([sys.executable, "-I", path, "--selftest"], cwd=root,
                         capture_output=True, text=True, timeout=240)
+    # A SELFTEST THAT WAS GUTTED TO return 0 IS INVISIBLE TO ITS EXIT CODE.
+    # Measured: replacing tokencheck's selftest with a stub that prints
+    # "DISARMED" and returns 0 left C16 green. So the exit code is not the
+    # whole assertion -- require the SUMMARY LINE the real selftest prints
+    # and a minimum number of individual arms. This is C13's rule ("the
+    # sentence must be READ, not merely matched") applied to a control:
+    # deleting a control is not a fix, and a summary that does not name
+    # itself is not evidence that the arms ran.
+    st_out = (st.stdout or "") + (st.stderr or "")
+    arms = [ln for ln in st_out.splitlines() if "  PASS" in ln]
     if st.returncode != 0:
         return label, "FAIL", [
             f"{tool} --selftest FAILED, so its verdict below cannot be "
-            f"trusted: " + (st.stdout or st.stderr).strip()[-400:]]
+            f"trusted: " + st_out.strip()[-400:]]
+    if "SELFTEST: PASS" not in st_out or len(arms) < 4:
+        return label, "FAIL", [
+            f"{tool} --selftest exited 0 but does not look like the shipped "
+            f"control: no 'SELFTEST: PASS' summary, or only {len(arms)} "
+            f"arm(s) ran. A gutted selftest passes its own exit code."]
     r = subprocess.run([sys.executable, "-I", path, root], cwd=root,
                        capture_output=True, text=True, timeout=120)
     out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
