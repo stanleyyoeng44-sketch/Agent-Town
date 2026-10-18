@@ -143,23 +143,8 @@ def one_life(root, agent, body, turn):
 
 
 # --------------------------------------------------------------------------
-def _live_mailbox_count():
-    """Every message file under the REAL shared mailbox, or 0 if this box has
-    none (a reader without the volume). Used only to detect leakage."""
-    base = "/shared/mailbox"
-    n = 0
-    if not os.path.isdir(base):
-        return 0
-    for d in os.listdir(base):
-        inc = os.path.join(base, d, "incoming")
-        if os.path.isdir(inc):
-            n += sum(1 for _ in os.scandir(inc))
-    return n
-
-
 def main():
     work = tempfile.mkdtemp(prefix="town-")
-    _LIVE_MAILBOX_BASELINE = _live_mailbox_count()
     ledger = os.path.join(work, "accounts.json")
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -346,13 +331,25 @@ def main():
         check("bank wrote its payment notice to the DEMO mailbox, not live",
               any(n.get("from") == "bank" and "25 coins" in n.get("text", "")
                   for n in notes), f"{len(notes)} notice(s) in {bank_inbox}")
-        # THE ISOLATION INVARIANT, stated directly. If every check above
-        # passed but this failed, the demo had been mutating live agents'
-        # inboxes while printing PASS.
-        check("demo wrote nothing into the real /shared/mailbox",
-              not os.path.isdir("/shared/mailbox")
-              or _live_mailbox_count() == _LIVE_MAILBOX_BASELINE,
-              "the demo leaked notifications into live agent mailboxes")
+        # A COUNT-OF-FILES CHECK HERE WAS VACUOUS AND I CAUGHT IT BY TESTING
+        # THE CHECK: comparing _live_mailbox_count() to a baseline passed
+        # while FIVE real notifications leaked into agent-2's inbox. The
+        # daemon consumes inbox files every 3 seconds, so a write followed by
+        # a consume leaves the count unchanged. A post-hoc count cannot see a
+        # write whose consumer deletes it -- it measures the checker's view.
+        #
+        # The sound check is the POSITIVE one above: our own bank's notice for
+        # a specific transfer is in OUR mailbox directory. If the bank had used
+        # /shared/mailbox, this directory would be empty and that check fails.
+        # So assert the exact count, which also pins that refused transfers
+        # write nothing.
+        notes_25 = [n for n in notes
+                    if n.get("from") == "bank" and "25 coins" in n.get("text", "")]
+        check("exactly one notice for the one successful transfer",
+              len(notes_25) == 1, f"{len(notes_25)} notice(s)")
+        check("the bank's mailbox is not the live one",
+              os.path.realpath(mailbox_dir) != os.path.realpath("/shared/mailbox"),
+              mailbox_dir)
 
         # -- 4. two lives, with memory carried in a file -------------------
         say("")

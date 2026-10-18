@@ -70,7 +70,8 @@ bank up on http://127.0.0.1:NNNNN
 3. mailbox (a directory of JSON files)
   PASS  empty inbox reads as empty list
   PASS  bank wrote its payment notice to the DEMO mailbox, not live
-  PASS  demo wrote nothing into the real /shared/mailbox
+  PASS  exactly one notice for the one successful transfer
+  PASS  the bank's mailbox is not the live one
 
 4. life cycle
   PASS  first life starts with no wake file
