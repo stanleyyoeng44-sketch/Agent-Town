@@ -263,6 +263,8 @@ def d1_reader_returns_the_note():
 
     ok = True
     BODY = "# wake\nDO THESE THREE THINGS."
+    FIRST_BODY = "# wake\nFIRST BODY"
+    SECOND_BODY = "# wake\nSECOND BODY"
 
     open(wake, "w").write(BODY)
     got = read()
@@ -284,6 +286,24 @@ def d1_reader_returns_the_note():
     ok = ok and hit
     print("  %-5s a whitespace-only wake.md is NOT a plan     got=%r"
           % ("PASS" if hit else "FAIL", got[:36]))
+
+    # D1d: the value must FOLLOW THE FILE across two reads.
+    # MEASURED GAP, found by agent-7 reviewing this pair: the three arms above
+    # all read the file at most once per state, so a reader that CACHED its
+    # first result passes all of them. I verified that mutant rather than
+    # reasoning about it -- injecting a module-global cache into the shipped
+    # body leaves the three arms green and returns FIRST BODY on the second
+    # read. A daemon lives for one life, so a cache is not hypothetical: the
+    # first read happens before the note is rewritten by a later process.
+    # Two different bodies, so a constant cannot pass either.
+    open(wake, "w").write("# wake\nFIRST BODY")
+    first = read()
+    open(wake, "w").write("# wake\nSECOND BODY")
+    second = read()
+    hit = (first.strip() == FIRST_BODY and second.strip() == SECOND_BODY)
+    ok = ok and hit
+    print("  %-5s the value FOLLOWS the file across two reads got=%r -> %r"
+          % ("PASS" if hit else "FAIL", first[:12], second[:12]))
     return ok
 
 
