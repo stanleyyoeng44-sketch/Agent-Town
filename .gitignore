@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime state that must never be committed
+ui/control.log
+*.log
+ui/control.pid
+*.pid
+ui/stanley-chat/
+*.sqlite3
+*.db
+
+# Secrets and tokens: these are gitignored as a safety net, not a guarantee.
+# A token that was EVER committed stays in history -- rotate it, do not just
+# delete the file.
+*control-token*
+*bank-admin-token*
+*transfer-token*
+*.pem
+*.key
+deploy_key
+
+# Agent workspaces (bind mounts, not source)
+/workspace/
+agents/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
