@@ -14,12 +14,20 @@ has NO system fonts and no cairo, so a rasteriser like cairosvg/resvg
 renders every glyph invisible -- use matplotlib. matplotlib is NOT in the
 base agent image (pip install --user matplotlib).
 
-NOT BYTE-REPRODUCIBLE, and it does not need to be. The demo prints a fresh
-temp path and port each run, so re-rendering produces a different PNG with
-the same CHECK LINES. The reproducibility claim is about content, not bytes:
-normalise /tmp/town-* and the port, and two captures from the same code are
-identical. That is the property that matters -- the picture cannot show a
-check the demo no longer prints.
+NOT BYTE-REPRODUCIBLE ON PURPOSE, and the volatile bits are NORMALISED. The
+demo prints a fresh temp directory and port each run. This script rewrites
+them to /tmp/town-<run> and 127.0.0.1:<port> before rendering, so two captures
+from the same code produce the same SVG BYTE FOR BYTE and `diff` is a real
+check:
+
+    python3 demo/town.py > /tmp/a.txt && python3 demo/town.py > /tmp/b.txt
+    python3 docs/img/make_terminal.py /tmp/a.txt /tmp/a
+    python3 docs/img/make_terminal.py /tmp/b.txt /tmp/b
+    diff /tmp/a.svg /tmp/b.svg   # empty
+
+The PNG still differs byte-wise (matplotlib metadata), so the diffable
+artifact is the SVG; the PNG is what GitHub renders. Both carry the same
+lines.
 
 REGENERATION RULE: the demo's check count is quoted in README.md and shown
 in the image. If the demo changes, re-run it and re-run this script IN THE
@@ -29,6 +37,7 @@ lying.
 
 Usage: python3 make_terminal.py <capture.txt> <out-basename> [title]
 """
+import re
 import sys
 
 import matplotlib
@@ -60,10 +69,24 @@ def classify(line):
     return FG
 
 
+def normalise(line):
+    """Replace the capture's volatile temp dir and port with stable tokens.
+
+    Without this the SVG embeds one run's random path and port, so two runs
+    differ and a reader who diffs them sees noise and concludes the picture
+    drifted. The path and port are not evidence about the code; the check
+    lines are.
+    """
+    line = re.sub(r"/tmp/town-[A-Za-z0-9_]+", "/tmp/town-<run>", line)
+    line = re.sub(r"127\.0\.0\.1:\d+", "127.0.0.1:<port>", line)
+    return line
+
+
 def main():
     src, base = sys.argv[1], sys.argv[2]
     title = sys.argv[3] if len(sys.argv) > 3 else "python3 demo/town.py"
-    lines = open(src, encoding="utf-8").read().rstrip("\n").splitlines()
+    lines = [normalise(l) for l in
+             open(src, encoding="utf-8").read().rstrip("\n").splitlines()]
 
     fs = 10.5
     # Lay out in INCHES and convert to axes fraction, so spacing does not
