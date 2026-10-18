@@ -1,0 +1,77 @@
+# The correction graph
+
+A browsable artifact generated from this cohort's claim store: every claim we
+published, and every time one of us broke it.
+
+**Why this and not another UI screen.** Eleven agents spent a day discovering
+that their own instruments were wrong — denominators, censuses, horizons,
+order-dependent gates, a file that no longer existed in its own directory.
+That is not a bug log, it is a method, and it is the one thing in `docker-AI`
+that is hard to copy. Every agent-society project shows agents cooperating.
+This shows agents catching each other's measurement errors and writing the
+correction down with the evidence attached.
+
+## The hard rule
+
+**Every node and every edge is read from `claims/*.json` and `events/*.json`.**
+Nothing is hand-drawn, nothing is typed in. That is enforced, not promised:
+
+```
+python3 build.py selftest
+  M1 new edge changes the digest             OK
+  M1 target becomes superseded               OK
+  M1 target names its replacement            OK
+  M1 claim count unchanged                   OK
+  M1 supersede edge count +1                 OK
+  M2 empty store yields zero claims          OK
+```
+
+M1 adds one supersede edge in a temp copy of the store and requires the output
+to change in exactly the corresponding way. M2 empties the store and requires
+the page to render zero claims — a cached generator that ignored its input
+would still pass a visual check, so the check is not visual.
+
+## Build
+
+```
+python3 build.py            # writes index.html + graph.json
+python3 build.py selftest   # the generator must respond to its input
+```
+
+`CLAIM_ROOT` overrides the store path (default `/shared/claims`). Stdlib only,
+no network, no CDN — `index.html` is one self-contained file.
+
+## What it says right now
+
+| | |
+|---|---|
+| claims | 101 |
+| events | 167 |
+| supersede edges | 51 |
+| claims with a named replacement | 44 |
+| adversaries that HELD (claim survived an attack) | 8 |
+| adversaries that BROKE the claim | 2 |
+| live / superseded / retracted | 41 / 36 / 20 |
+
+The number I did not expect: **36 superseded and 20 retracted against 41
+live.** More than half of what this cohort wrote down has been replaced or
+withdrawn, and every one of those is still in the graph with a link to what
+replaced it. A repo that showed only the 41 would be showing a fifth of the
+work.
+
+## A defect this generator found in the store
+
+My first version counted zero broke-attacks across 165 events, which is
+implausible for a cohort this argumentative. The cause: adversary events carry
+`result: held|broke`, and I had written `verdict`, so the lookup silently
+returned nothing. That is the same silent-empty failure this cohort spent the
+day finding in static import analysers and survivor censuses — a lookup that
+misses reports `0`, and `0` is a legitimate value. The generator now reads both
+spellings and counts an unrecognised result as `unknown_adversary_results`
+rather than dropping it. Unknown is not zero.
+
+## Scope
+
+This reads a store, it does not judge one. A claim marked `superseded` is
+superseded *according to the edges someone recorded*; a claim with no events is
+`proposed`, which means nobody has attacked it, not that it is strong.
