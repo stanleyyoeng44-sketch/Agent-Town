@@ -51,7 +51,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-# (name, argv, special)  -- special: None | "warn-if-no-docker"
+# (name, argv, special)  -- special: None | "warn-if-no-docker" | "exit2-is-warn"
 SUITES = [
     ("demo: a two-agent town runs", [sys.executable, "demo/town.py"], None),
     ("demo: its checks can fail", [sys.executable, "demo/selftest_demo.py"], None),
@@ -67,6 +67,14 @@ SUITES = [
 ]
 
 NO_DOCKER = "NO DOCKER DAEMON"
+A5 = "/shared/artifacts/agent-5/repo_audit"
+EXTERNAL = [
+    # (label, path, args) -- audits that live outside the repo but attest to it.
+    # They take the tree path as argv[1] so they measure the tree under test,
+    # not the live one.
+    ("docs: README bank transcript", os.path.join(A5, "check_readme_transcript.py")),
+    ("docs: guide and demo blocks", os.path.join(A5, "check_doc_blocks.py")),
+]
 
 
 def in_git_tree():
@@ -90,6 +98,11 @@ def run_suite(name, argv, special, verbose):
         print("\n".join("      | " + line for line in tail[-40:]))
     if special == "warn-if-no-docker" and p.returncode == 0 and NO_DOCKER in p.stdout:
         return "WARN", "unit simulation only -- no Docker daemon here"
+    if special == "exit2-is-warn" and p.returncode == 2:
+        # agent-5's convention: 2 means "cannot measure, the doc changed shape".
+        # Neither a pass nor a failure; folding it into either direction is how
+        # a gate gets ignored (exit 2 forever) or cried wolf (false STALE).
+        return "WARN", "unmeasured: %s" % (last[:90] or "the tool declined")
     if p.returncode != 0:
         return "FAIL", last[:100] or ("exit %d" % p.returncode)
     return "PASS", last[:100]
@@ -118,12 +131,15 @@ def selftest():
     good = script("good.py", "print('all good')\n")
     bad = script("bad.py", "import sys\nprint('SUITE FAILED: two plus two')\nsys.exit(1)\n")
     nodocker = script("nodocker.py", "print('NO DOCKER DAEMON: running the unit simulation only.')\n")
+    unmeasured = script("unmeasured.py", "import sys\nprint('shape not recognised')\nsys.exit(2)\n")
 
     cases = [
         ("L1 a passing suite is PASS", run_suite("t", [sys.executable, good], None, False), "PASS"),
         ("L2 a failing suite is FAIL", run_suite("t", [sys.executable, bad], None, False), "FAIL"),
         ("L3 no-docker banner is WARN", run_suite("t", [sys.executable, nodocker],
                                                   "warn-if-no-docker", False), "WARN"),
+        ("L5 exit 2 is WARN, not PASS and not FAIL",
+         run_suite("t", [sys.executable, unmeasured], "exit2-is-warn", False), "WARN"),
     ]
     for label, (got, _), want in cases:
         good_case = got == want
@@ -140,6 +156,8 @@ def selftest():
 
 
 def verdict_of(states):
+    """FAIL > WARN > PASS. SKIP is not a state of the tree, it is a state of
+    this box, so it never changes the verdict -- but it is always printed."""
     if "FAIL" in states:
         return "FAIL"
     if "WARN" in states:
@@ -172,6 +190,15 @@ def main():
         state, detail = run_suite(name, argv, special, args.verbose)
         states.append(state)
         print("  %-5s %-38s %s" % (state, name, detail))
+    for label, script in EXTERNAL:
+        if not os.path.exists(script):
+            states.append("SKIP")
+            print("  %-5s %-38s not installed on this box (%s)" % ("SKIP", label, script))
+            continue
+        state, detail = run_suite(label, [sys.executable, "-I", script, ROOT],
+                                  "exit2-is-warn", args.verbose)
+        states.append(state)
+        print("  %-5s %-38s %s" % (state, label, detail))
     verdict = verdict_of(states)
     print()
     print("CHECK: %s (%d pass, %d warn, %d fail)"

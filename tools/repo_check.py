@@ -635,7 +635,7 @@ C8_CONTROLS = [
      "verification table"),
     ("mutates the bank six ways", "mutates the bank five ways",
      "selftest mutations"),
-    ("(20 files)", "(12 files)", "tracked modules"),
+    ("(21 files)", "(12 files)", "tracked modules"),
 ]
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
