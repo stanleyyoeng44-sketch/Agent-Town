@@ -95,6 +95,20 @@ def prompt_path(name):
     return os.path.join(PROMPTS_DIR, name, "system-prompt.txt")
 
 
+WORKSPACE_VOLUME_PREFIX = "agent-workspace"
+
+
+def workspace_volume(name, part):
+    """Docker named volume holding one per-agent durable directory.
+
+    One volume per part (self / transcripts / claude) rather than one for all
+    of /workspace: /workspace/inbox and /workspace/replies are transient
+    hand-off directories, and mounting all of /workspace would also make an
+    old container's scratch files reappear in a new one.
+    """
+    return f"{WORKSPACE_VOLUME_PREFIX}-{name}-{part}"
+
+
 def start_agent(name, model="deepseek-v4.1-flash"):
     if not NAME_RE.match(name):
         return False, "bad name"
@@ -117,6 +131,17 @@ def start_agent(name, model="deepseek-v4.1-flash"):
         "-e", f"AGENT_MODEL={model}",
         "-v", "agent-mailbox:/shared",
         "-v", f"{prompt_path(name)}:/app/system-prompt.txt:ro",
+        # The agent's memory and the records its context resumes from. These
+        # are per-agent named volumes, so `docker stop/start` keeps them and
+        # a re-created container gets the same identity back. Without them
+        # /workspace lives in the writable layer and is wiped on restart:
+        # session-id, diary.md, wake.md and every transcript disappear
+        # together, the agent wakes as a first-boot stranger, and the
+        # daemon's crash-resume path is unreachable.
+        "-v", f"{workspace_volume(name, 'self')}:/workspace/self",
+        "-v", f"{workspace_volume(name, 'transcripts')}:/workspace/transcripts",
+        "-v", f"{workspace_volume(name, 'claude')}:/workspace/.claude",
+        "-e", "CLAUDE_CONFIG_DIR=/workspace/.claude",
     ]
     if name == "agent-0":
         transfer_token = PRIVATE_DIR / "agent0-transfer-token"
@@ -237,18 +262,34 @@ def list_inbox(name, cursor=None, limit=30):
 
 
 def list_lives(name):
+    """Lives of this agent, newest first, with the CURRENT one marked.
+
+    Two facts are needed and only one is in the filenames: the transcript
+    list, and which life is running now. The newest file is NOT the current
+    life -- after a container restart it is the life that was interrupted.
+    The daemon writes /workspace/transcripts/CURRENT at every life start, so
+    the UI reads that instead of guessing.
+    """
     ok, out, err = run_docker(
         ["exec", name, "sh", "-c",
-         "cd /workspace/transcripts 2>/dev/null && wc -l life-*.jsonl 2>/dev/null"])
+         "cd /workspace/transcripts 2>/dev/null && "
+         "wc -l life-*.jsonl 2>/dev/null; "
+         "cat CURRENT 2>/dev/null"])
     if not ok:
         return []
+    current = None
     lives = []
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].startswith("life-"):
             lives.append({"id": parts[1][len("life-"):-len(".jsonl")],
                           "events": int(parts[0])})
+        elif len(parts) == 1 and not parts[0].startswith("life-"):
+            # the `cat CURRENT` line: a bare life id
+            current = parts[0]
     lives.sort(key=lambda x: x["id"], reverse=True)
+    for life in lives:
+        life["current"] = (life["id"] == current)
     return lives
 
 
