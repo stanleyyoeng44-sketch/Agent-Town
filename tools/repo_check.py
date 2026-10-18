@@ -769,10 +769,120 @@ def c10_readme_links_the_artifact(root):
     return "C10 readme links the graph", "PASS", [f"README.md links {target}"]
 
 
+def c11_readme_docker_flags(root):
+    """The README's transcribed `docker run` must match what control.py builds.
+
+    THE DEFECT THIS PINS (agent-10 and agent-7, independently, 2026-10-18):
+    README step 4 says "Under the hood it runs, from ui/control.py:start_agent"
+    and then shows a block missing the three durable volumes and
+    CLAUDE_CONFIG_DIR. An operator who copies it gets an agent whose memory is
+    wiped on every stop/start -- the feature the README opens with -- and
+    nothing caught it, because C5 skips `docker run` on a box with no daemon,
+    which is every box this was written on.
+
+    A transcription of a command that another file BUILDS is a courier. This
+    compares the block's flags to the flag list in ui/control.py by parsing
+    the source, so the block cannot drift from the code without failing here.
+    The two are allowed to differ only in the VALUES that are per-agent
+    placeholders (<model>, <prompts>, agent-1) -- the FLAG SETS must match.
+    """
+    readme = os.path.join(root, "README.md")
+    ctl = os.path.join(root, "ui", "control.py")
+    try:
+        text = open(readme, encoding="utf-8").read()
+    except OSError:
+        return "C11 readme docker flags", "FAIL", ["README.md is absent"]
+    try:
+        src = open(ctl, encoding="utf-8").read()
+    except OSError:
+        return "C11 readme docker flags", "FAIL", ["ui/control.py is absent"]
+
+    # 1. What does the README claim? The FIRST bash block containing '
+# docker
+    #    run' -- the block that advertises itself as the real invocation.
+    # Only fenced blocks, and only one that STARTS a docker run line -- the
+    # architecture diagram also mentions "docker run" in passing, and picking
+    # that chunk made this check compare the wrong text (a false FAIL on a
+    # correct README, which is how a check gets deleted).
+    # The block this check is about is the one that ADVERTISES ITSELF as the
+    # agent invocation -- it cites start_agent. The README has other docker
+    # run blocks (the bank, the UI); comparing those against start_agent's
+    # flags produced a false FAIL on a correct README, which is how a check
+    # gets deleted rather than fixed.
+    # The citation sits in the PROSE BEFORE the fence ("Under the hood it
+    # runs, from ui/control.py:start_agent:"), not inside it -- so a block is
+    # the agent invocation when it starts with `docker run` and the text
+    # immediately before it names start_agent. Matching inside the block only
+    # found nothing, and "found nothing" must not read as "fine".
+    parts = text.split("```")
+    block = None
+    for i in range(1, len(parts), 2):
+        body = parts[i]
+        if not re.search(r"^\s*docker run\b", body, re.M):
+            continue
+        if "start_agent" in parts[i - 1]:
+            block = body
+            break
+    if block is None:
+        # No abridged agent block is itself a way to stop this check seeing
+        # anything -- report it, do not pass.
+        return "C11 readme docker flags", "FAIL", [
+            "README has no agent `docker run` block citing start_agent"]
+
+    # 2. What flags does the code actually pass? Every literal that follows a
+    #    '-v' / '-e' / '--label' / '--name' / '--restart' / '--label' token in
+    #    start_agent's args list.
+    default_src = src.split("def start_agent", 1)
+    if len(default_src) < 2:
+        return "C11 readme docker flags", "FAIL", [
+            "ui/control.py has no start_agent -- the check cannot locate the "
+            "command it is meant to compare"]
+    body = default_src[1].split("\ndef ", 1)[0]
+    code_flags = set(re.findall(r'"(--[a-z-]+|-[a-z])"', body))
+
+    readme_flags = set(re.findall(r"(?<!\w)(--[a-z-]+|-[a-z])(?=\s|$)", block))
+
+    # --name/--restart/--label/-e/-v are the docker-level flags both should
+    # carry. A flag the CODE passes and the README omits is the defect.
+    missing = sorted(f for f in code_flags if f in (
+        "-v", "-e", "--label", "--name", "--restart") and f not in readme_flags)
+    if missing:
+        return "C11 readme docker flags", "FAIL", [
+            f"README's docker run omits flag(s) that start_agent passes: "
+            f"{missing}. An operator copying this block gets an agent that "
+            f"loses its memory on restart."]
+
+    # 3. The volume MOUNTS are the thing that was missing, so compare the
+    #    mount TARGETS, not just the -v flag. A block with one -v and a code
+    #    path with three is still the defect.
+    code_mounts = set(re.findall(r'"([^"]*?:/[^"]*)"', body))
+    code_targets = {m.split(":")[-1].rstrip(":ro") for m in code_mounts
+                    if ":" in m}
+    readme_targets = {m.split(":")[-1].rstrip(":ro")
+                      for m in re.findall(r"-v\s+(\S+)", block) if ":" in m}
+    lost = sorted(set(code_targets) - {"/workspace/self", "/workspace/transcripts",
+                                       "/workspace/.claude"} - readme_targets)
+    missing_durable = sorted({"/workspace/self", "/workspace/transcripts",
+                              "/workspace/.claude"} - readme_targets)
+    if missing_durable:
+        return "C11 readme docker flags", "FAIL", [
+            f"README's docker run does not mount {missing_durable} -- these "
+            f"are the durable volumes; without them the agent is a first-boot "
+            f"stranger after every stop/start."]
+    if "CLAUDE_CONFIG_DIR" not in block:
+        return "C11 readme docker flags", "FAIL", [
+            "README's docker run does not set CLAUDE_CONFIG_DIR; without it "
+            "the CLI's session records are not on a volume and resume cannot "
+            "work at all."]
+    del lost
+    return "C11 readme docker flags", "PASS", [
+        "README block carries every durable mount and CLAUDE_CONFIG_DIR"]
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
-          c10_readme_links_the_artifact]
+          c10_readme_links_the_artifact, c11_readme_docker_flags]
 
 
 def _is_git_tree(root):
