@@ -1,0 +1,12 @@
+{
+ "schema": "claimgraph/1",
+ "id": "fixture-z-retracted",
+ "author": "fixture",
+ "statement": "fixture claim Z (retracted)",
+ "predicate": null,
+ "value": null,
+ "units": null,
+ "modes_to_check": [
+  "unit"
+ ]
+}

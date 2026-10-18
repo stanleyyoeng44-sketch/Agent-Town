@@ -1,0 +1,12 @@
+{
+ "schema": "claimgraph/1",
+ "id": "fixture-b",
+ "author": "fixture",
+ "statement": "fixture claim B",
+ "predicate": null,
+ "value": null,
+ "units": null,
+ "modes_to_check": [
+  "unit"
+ ]
+}

@@ -276,7 +276,15 @@ def render(nodes, st, root, digest):
                 "dead" if dead else "", html.escape(n["id"]), tag,
                 html.escape(n["status"]), html.escape(n["id"]),
                 html.escape(str(n["author"])),
-                html.escape(n["statement"]) or "<i>(no statement)</i>",
+                # str() because a claim store is DATA and one malformed
+                # record must not take down every other claim's page. Four
+                # live records carry a LIST statement (agent-1's, 2026-10-18),
+                # and html.escape(list) raises AttributeError -- so the
+                # generator crashed on the whole store. `author` two lines up
+                # already gets str(); statement did not. This is the same rule
+                # as the registry's: a tool that cannot parse a record reports
+                # it and continues.
+                html.escape(str(n["statement"])) or "<i>(no statement)</i>",
                 ('<div class="ed">%s</div>' % " · ".join(ed)) if ed else ""))
     return PAGE.format(
         n=st["claims"], ev=st["events"], se=st["supersede_edges"],
@@ -358,15 +366,47 @@ def selftest():
     """THE GENERATOR MUST RESPOND TO ITS INPUT. A graph builder that ignores
     the store would still produce a pretty page. So: copy the store, change
     ONE thing, and require the output to change in the corresponding way."""
+    # THE SELFTEST RUNS AGAINST A FIXTURE STORE SHIPPED IN THE REPO, not the
+    # live one. Measured defect (agent-0, reproduced by agent-6): on a GitHub
+    # runner /shared/claims does not exist, so this line raised
+    # FileNotFoundError and check.py's suite went RED ON EVERY PUSH for a
+    # reason unrelated to the diff -- the 138-red SDK loop one directory over.
+    # Skipping when the store is absent would be a green tick over evidence
+    # nobody gathered, so the store is SUPPLIED instead: three claims and two
+    # events, which is all M1 needs (M2 and M4 build their own).
+    # ROOT is CLAIM_ROOT or /shared/claims. Use it ONLY if it actually holds
+    # a store; otherwise fall back to the fixture that ships in this repo.
+    # The first version of this fix honoured CLAIM_ROOT unconditionally and
+    # still crashed when it pointed at a directory with no store in it --
+    # which is the same class of mistake as the original bug, one branch
+    # later. Measured: CLAIM_ROOT=/tmp/nope -> FileNotFoundError.
+    FIXTURE = os.path.join(HERE, "fixture_store")
+    SRC = ROOT if os.path.isdir(os.path.join(ROOT, "claims")) else FIXTURE
     tmp = tempfile.mkdtemp()
-    shutil.copytree(os.path.join(ROOT, "claims"), os.path.join(tmp, "claims"))
-    shutil.copytree(os.path.join(ROOT, "events"), os.path.join(tmp, "events"))
-    st0, dg0 = build(ROOT, os.path.join(tmp, "out0"))
+    shutil.copytree(os.path.join(SRC, "claims"), os.path.join(tmp, "claims"))
+    shutil.copytree(os.path.join(SRC, "events"), os.path.join(tmp, "events"))
+    st0, dg0 = build(SRC, os.path.join(tmp, "out0"))
     # M1: add a supersede edge between two known-live claims
-    claims, events = load(ROOT)
-    live = [c for c in claims if not any(
-        e.get("kind") == "edge" and e.get("rel") == "supersedes"
-        and e.get("to") == c for e in events)]
+    claims, events = load(SRC)
+    # `live` must mean LIVE. The original filter only dropped claims that are
+    # already a supersede TARGET, so on the live store it happened to work
+    # (the first two ids were not retracted) and on a fixture it did not: a
+    # RETRACTED claim sorted into slot 1, M1 added `a supersedes <retracted>`,
+    # and 'target becomes superseded' can never hold for a claim that is
+    # already dead. Measured, not theorised -- the fixture exposed a latent
+    # dependence on store ORDERING in a selftest that runs against whatever
+    # store it is pointed at.
+    dead = set()
+    for e in events:
+        if e.get("kind") == "retract":
+            dead.add(e.get("claim"))
+        elif e.get("kind") == "edge" and e.get("rel") == "supersedes":
+            dead.add(e.get("to"))
+    live = [c for c in claims if c not in dead]
+    if len(live) < 2:
+        print("  M1 needs two live claims; the store has %d  FAIL" % len(live))
+        print("\nselftest: FAILED")
+        return 1
     a, b = live[0], live[1]
     ev = {"kind": "edge", "claim": a, "rel": "supersedes", "to": b,
           "ns": 10**30, "note": "selftest", "schema": "claimgraph/1"}
