@@ -1726,9 +1726,16 @@ def c18_runner_discovery(root):
             "have the same requirement)" % g.returncode]
 
     def shaped(rel):
+        # A LEADING-SLASH TEST MISSES A TOP-LEVEL tests/ DIRECTORY. The first
+        # version tested `"/tests/" in rel`, which is true for agent/tests/x.py
+        # and FALSE for tests/x.py -- the directory that a reader is most
+        # likely to create first. Measured: shaped("tests/helper_suite.py")
+        # was False. agent-2 and agent-4 both reported it independently, and
+        # agent-4 measured that a top-level tests/ suite was invisible to
+        # C18 on this very commit.
         base = os.path.basename(rel)
-        return ("/tests/" in rel) or base.startswith("test_") \
-            or base.startswith("selftest_")
+        return (rel.startswith("tests/") or "/tests/" in rel
+                or base.startswith("test_") or base.startswith("selftest_"))
 
     tracked = [p for p in g.stdout.split() if shaped(p)]
     omitted = sorted(p for p in tracked
@@ -1747,11 +1754,15 @@ def c18_runner_discovery(root):
             "docstring promises the EXCLUDE table is the only way to omit "
             "one; this is the list that makes that promise true. Add the file "
             "to SUITE_GLOBS or to EXCLUDE with a reason." % ", ".join(unexpected)]
+    skipped = sorted(p for p in tracked if p in excluded)
     return "C18 runner discovery", "PASS", [
-        "%d suite-shaped tracked file(s); %d discovered by check.py, %d in "
-        "EXCLUDE, %d known C12 fixtures -- none omitted by accident"
+        "%d suite-shaped tracked file(s): %d discovered by check.py, %d in "
+        "EXCLUDE, %d known C12 fixtures. Every one is accounted for -- WHICH "
+        "IS NOT THE SAME AS RUNNING. This check reads EXCLUDE's KEYS, not its "
+        "reasons: a suite excluded with a fake reason passes it. Excluded: %s"
         % (len(tracked), len(discovered & set(tracked)),
-           len(excluded & set(tracked)), len(known_fixtures))]
+           len(excluded & set(tracked)), len(known_fixtures),
+           ", ".join(skipped) if skipped else "(none)")]
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
@@ -2764,6 +2775,20 @@ def selftest():
     st_e, fd_e = c18_on(_exclude_orphan) or ("?", [])
     outcomes.append(("C18 accepts a file EXCLUDED with a reason",
                      st_e == "PASS"))
+
+    # A TOP-LEVEL tests/ DIRECTORY must be shaped too. The first predicate
+    # tested "/tests/" (leading slash), which is FALSE for "tests/x.py" --
+    # agent-2 and agent-4 both found it, and agent-4 measured a top-level
+    # suite being invisible to C18 on the shipped commit.
+    def _add_toplevel(d):
+        os.makedirs(os.path.join(d, "tests"), exist_ok=True)
+        with open(os.path.join(d, "tests", "helper_suite.py"), "w") as f:
+            f.write("print('top-level tests dir')\n")
+
+    st_t, fd_t = c18_on(_add_toplevel) or ("?", [])
+    outcomes.append(("C18 sees a TOP-LEVEL tests/ directory",
+                     st_t == "FAIL" and any("tests/helper_suite.py" in x
+                                            for x in fd_t)))
 
 
     bad = 0
