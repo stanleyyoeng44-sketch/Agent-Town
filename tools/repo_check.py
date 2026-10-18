@@ -1353,6 +1353,66 @@ def selftest():
     here = os.path.abspath(__file__)
     own = scan_text(os.path.basename(here),
                     open(here, encoding="utf-8", errors="replace").read())
+    # C11 controls: the README's transcribed docker-run block must carry the
+    # volumes and env the code passes. THREE arms, because each one is a
+    # different way to lose the property, and two of them were live issues
+    # while this check was being written: comparing the wrong block (the
+    # bank's), and finding no block at all and reading silence as agreement.
+    #
+    # Without these arms, disarming c11 (returning PASS unconditionally) left
+    # selftest at 26/26 GREEN -- measured at 14:41 today. A check with no
+    # control is a comment.
+    readme_src = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    ctl_src = open(os.path.join(ROOT, "ui", "control.py"), encoding="utf-8").read()
+
+    def c11_on(readme_text, ctl_text):
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        os.makedirs(os.path.join(d, "ui"), exist_ok=True)
+        # farm has no demo scripts; C11 does not read them
+        open(os.path.join(d, "README.md"), "w", encoding="utf-8").write(readme_text)
+        open(os.path.join(d, "ui", "control.py"), "w",
+             encoding="utf-8").write(ctl_text)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c11 fixture")
+        _ok, r = run(d)
+        shutil.rmtree(d)
+        return dict((n, o) for n, o, _ in r).get("C11 readme docker flags")
+
+    # The good direction: the real files must PASS (a check that fails on the
+    # real tree is worse than none -- it gets deleted).
+    outcomes.append(("C11 passes on the real README and control.py",
+                     c11_on(readme_src, ctl_src) == "PASS"))
+
+    # Arm 1: a durable volume is dropped from the block.
+    stripped = readme_src.replace(
+        "  -v agent-workspace-agent-1-claude:/workspace/.claude \\\n", "", 1)
+    outcomes.append(("C11 catches a dropped durable volume",
+                     stripped != readme_src
+                     and c11_on(stripped, ctl_src) == "FAIL"))
+
+    # Arm 2: the env var that makes resume work is dropped.
+    noenv = readme_src.replace("  -e CLAUDE_CONFIG_DIR=/workspace/.claude \\\n",
+                               "", 1)
+    outcomes.append(("C11 catches a dropped CLAUDE_CONFIG_DIR",
+                     noenv != readme_src
+                     and c11_on(noenv, ctl_src) == "FAIL"))
+
+    # Arm 3: no agent block at all -- silence must not read as agreement.
+    parts = readme_src.split("```")
+    idx = None
+    for i in range(1, len(parts), 2):
+        if re.search(r"^\s*docker run\b", parts[i], re.M) and "start_agent" in parts[i - 1]:
+            idx = i
+            break
+    if idx is None:
+        outcomes.append(("C11 catches a README with no agent docker-run block", False))
+    else:
+        abridged = "```".join(parts[:idx - 1] + parts[idx + 2:])
+        outcomes.append(("C11 catches a README with no agent docker-run block",
+                         c11_on(abridged, ctl_src) == "FAIL"))
+
     outcomes.append(("the tool's own source contains no secret", not own))
     outcomes.append(("C2 would catch it if it did (fixtures use SYNTHETIC)",
                      any("SYNTHETIC" in l for l in
