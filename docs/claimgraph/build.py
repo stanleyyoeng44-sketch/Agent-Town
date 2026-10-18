@@ -455,6 +455,53 @@ def selftest():
     checks.append(("M3 live count is claims - superseded - retracted",
                    st0["live"] == st0["claims"] - st0["superseded"]
                    - st0["retracted"] - st0["status"].get("contested", 0)))
+
+    # M3b: THE TOP-LEVEL README MUST NOT RETYPE THESE COUNTS.
+    #
+    # Measured on master 7b84456: README.md:64 said "113 claims and 68 typed
+    # edges, 60 of them supersessions, plus 21 retractions" while the
+    # committed graph.json held 165 / 111 / 102 / 23, and the same sentence
+    # claimed those numbers were "checked ... by tools/repo_check.py (C8)".
+    # C8 has contained NO claimgraph check since f5fa43e removed the dead
+    # regexes; the sentence was written one commit later (4f10cf2) and named
+    # a gate that had just been deleted. Mutating the claims number to 999
+    # left repo_check PASS.
+    #
+    # The gate below makes the ABSENCE enforceable, which is the only form
+    # that survives a store that moves: a stale number cannot be typed wrong
+    # if it is not typed at all. It asserts, against the committed artifact:
+    #   1. the four count phrases do not appear in the top-level README, and
+    #   2. if the README still says C8 checks these counts, that sentence is
+    #      not allowed to stand alone -- it must not name a gate that does not
+    #      exist. (repo_check cannot be imported here; the assertion is on the
+    #      text, which is what a reader believes.)
+    #
+    # A CONTROL THAT CANNOT FIRE IS DECORATION. `selftest` proves both arms in
+    # main_selftest below: re-inserting a stale count makes this FAIL, and the
+    # clean tree makes it PASS.
+    top_readme = os.path.join(HERE, "..", "..", "README.md")
+    try:
+        top_text = open(top_readme, encoding="utf-8").read()
+    except OSError:
+        top_text = ""
+    # Wording-tolerant on purpose. The first version required the number to be
+    # adjacent to its noun, so it MISSED "60 of them supersessions" -- the
+    # control caught 3 of 4 phrases and reported FAIL, which looks like a pass
+    # until you read the count. A gate that fires on a subset of the thing it
+    # names is the "control that mutates but is never reached" shape one level
+    # over: it is right about the phrases it sees and silent about the rest.
+    COUNT_PHRASES = [r"\b\d+\s+claims\b",
+                     r"\b\d+\s+(?:typed\s+)?edges\b",
+                     r"\b\d+\s+(?:of\s+them\s+)?supersessions?\b",
+                     r"\b\d+\s+retractions?\b"]
+    import re as _re
+    retyped = [p for p in COUNT_PHRASES if _re.search(p, top_text)]
+    if retyped:
+        # Naming the phrases is the diagnosis, not decoration: a FAIL that
+        # says only "M3b" makes the reader go find which number drifted.
+        print("    M3b: top-level README still retypes %s" % retyped)
+    checks.append(("M3b top-level README retypes no graph counts",
+                   not retyped))
     ok = True
     for name, cond in checks:
         print("  %-42s %s" % (name, "OK" if cond else "FAIL"))
