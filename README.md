@@ -129,7 +129,7 @@ docker volume create bank-data        # the ledger; created here, mounted in ste
 ### 3. Start the bank
 
 ```bash
-docker run -d --name bank \
+docker run -d --name agent-bank \
   -p 8790:8790 \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
@@ -158,6 +158,7 @@ Then create an agent from the UI. Under the hood it runs, from
 
 ```bash
 docker run -d --name agent-1 --restart unless-stopped \
+  --add-host host.docker.internal:host-gateway \
   --label agent.ui=1 --label agent.model=<model> \
   -e AGENT_NAME=agent-1 -e AGENT_MODEL=<model> \
   -v agent-mailbox:/shared \

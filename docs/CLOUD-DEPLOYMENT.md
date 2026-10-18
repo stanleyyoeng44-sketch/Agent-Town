@@ -16,7 +16,7 @@ any agent asked to redo it. Two facts drive everything else:
    bank (:8790), and the control UI (:8080). Agents reach the first two via
    `host.docker.internal`.
 2. **Memory is volumes, not layers.** Everything an agent remembers lives in
-   named Docker volumes (`agent-mailbox`, `agent-bank-ledger`, and master's
+   named Docker volumes (`agent-mailbox`, `bank-data`, and master's
    per-agent `agent-workspace-<name>-{self,transcripts,claude}`). A naive
    `docker run` without those mounts boots a first-boot stranger.
 
@@ -88,7 +88,7 @@ Export on the old machine — one tarball per durable thing:
 # the shared mailbox volume
 docker run --rm -v agent-mailbox:/s -v /tmp:/b alpine tar czf /b/mailbox.tgz -C /s .
 # the bank ledger
-docker run --rm -v agent-bank-ledger:/d -v /tmp:/b alpine tar czf /b/bank-ledger.tgz -C /d .
+docker run --rm -v bank-data:/d -v /tmp:/b alpine tar czf /b/bank-ledger.tgz -C /d .
 # each agent's durable dirs; NOTE the two tar-listing forms differ:
 # old pre-master containers kept everything in the writable layer,
 # so export /workspace whole; the -self/-transcripts split happens below.
@@ -103,9 +103,9 @@ start containers — an agent started against an empty volume writes a
 first-boot state over it:
 
 ```bash
-docker volume create agent-mailbox && docker volume create agent-bank-ledger
+docker volume create agent-mailbox && docker volume create bank-data
 docker run --rm -v agent-mailbox:/s -v ~/agent-migration:/pkg alpine tar xzf /pkg/mailbox.tgz -C /s
-docker run --rm -v agent-bank-ledger:/d -v ~/agent-migration:/pkg alpine tar xzf /pkg/bank-ledger.tgz -C /d
+docker run --rm -v bank-data:/d -v ~/agent-migration:/pkg alpine tar xzf /pkg/bank-ledger.tgz -C /d
 
 # split each whole-workspace tarball into master's three volumes
 docker run --rm -v agent-workspace-agent-0-self:/dst -v ~/agent-migration:/pkg \
@@ -131,10 +131,13 @@ done
 docker0=$(ip -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)   # 172.17.0.1
 cd ~/proxy && setsid nohup python3 cbproxyv4.py --bind $docker0 > proxy.log 2>&1 < /dev/null &
 
-# bank
+# bank -- published on the docker0 IP, NOT loopback: agents reach it at
+# http://host.docker.internal:8790, which resolves to this same bridge
+# address. A 127.0.0.1 publish answers only the host and every agent's
+# check_money/transfer gets ECONNREFUSED.
 docker run -d --name agent-bank --restart unless-stopped \
-  -p 127.0.0.1:8790:8790 \
-  -v agent-bank-ledger:/data -v agent-mailbox:/shared \
+  -p $docker0:8790:8790 \
+  -v bank-data:/data -v agent-mailbox:/shared \
   -v ~/.config/docker-ai/bank-admin-token:/run/secrets/bank-admin-token:ro \
   -v ~/.config/docker-ai/agent0-transfer-token:/run/secrets/agent0-transfer-token:ro \
   agent-bank
@@ -154,7 +157,12 @@ Two hard-won details:
   survived.
 
 - **Verify before moving on:**
-  `curl -s http://127.0.0.1:8790/accounts` (bank ledger balances intact),
+  `curl -s http://127.0.0.1:8790/accounts` from the HOST (the UI's path), AND
+  from a throwaway container, which is the path the agents actually use:
+```bash
+docker run --rm --add-host host.docker.internal:host-gateway agent-glm \
+  python3 -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8790/accounts',timeout=10).read()[:200])"
+```
   and a one-shot model call through the proxy from a throwaway container:
   ```bash
   docker run --rm --add-host host.docker.internal:host-gateway agent-glm \
