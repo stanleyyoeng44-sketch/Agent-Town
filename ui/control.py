@@ -486,6 +486,20 @@ PAGE = """<!doctype html>
   .tab { padding:7px 14px; cursor:pointer; color:var(--dim); font-size:12.5px;
          border:1px solid transparent; border-bottom:none; border-radius:6px 6px 0 0; }
   .tab.active { color:var(--text); background:var(--bg); border-color:var(--border); }
+  /* cohort summary: one dense line of state, above the tabs. */
+  #summary { display:flex; align-items:center; gap:0; padding:7px 16px;
+             border-bottom:1px solid var(--border); background:var(--panel);
+             font-size:11.5px; color:var(--dim); white-space:nowrap;
+             overflow-x:auto; scrollbar-width:none; }
+  #summary::-webkit-scrollbar { display:none; }
+  #summary .cell { padding:0 12px; border-right:1px solid var(--border); }
+  #summary .cell:first-child { padding-left:0; }
+  #summary .cell:last-child { border-right:none; }
+  #summary .k { color:var(--faint); margin-right:6px; }
+  #summary .v { color:var(--text); font-variant-numeric:tabular-nums; }
+  #summary .v.ok { color:var(--ok); }
+  #summary .v.warn { color:var(--warn); }
+  #summary .v.muted { color:var(--faint); }
   #headbar { display:flex; justify-content:flex-end; align-items:center; padding:6px 16px;
              gap:14px; font-size:12px; color:var(--dim); }
   #view { flex:1; overflow-y:auto; padding:10px 22px 70px; }
@@ -566,6 +580,7 @@ PAGE = """<!doctype html>
   <button id="newbtn">+ New agent</button>
 </nav>
 <main id="main">
+  <div id="summary" title="cohort state, computed from the same /api/agents and /api/bank/accounts responses the rail uses"></div>
   <div id="tabs">
     <div class="tab active" data-tab="convo">Conversation</div>
     <div class="tab" data-tab="sys">System prompt</div>
@@ -653,6 +668,46 @@ function showTokenBar(){
 
 function esc(s){ const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 
+// Cohort state in one line. PURE on purpose: it takes the two API payloads
+// and returns a string, so it can be exercised without a browser (see
+// ui/test_summary.js). A summary that needs the DOM to answer "is anything
+// wrong" cannot be tested, and this is the line whose whole job is to answer
+// that question.
+//
+// Deliberate choices:
+//  - counts, never a verdict word. "9 up / 2 asleep" lets the operator decide;
+//    "healthy" is a claim the payload cannot support (an agent can be Up and
+//    wedged, and docker will still say Up).
+//  - a missing bank balance is shown as '?' and EXCLUDED from the total rather
+//    than counted as 0. Adding an unknown as zero is how a cohort looks
+//    solvent when half its accounts were never read.
+//  - sleeping is derived from the agent's own CURRENT-marker contract, not
+//    from the docker status string, because 'Exited (0) 3 hours ago' and
+//    'Up 3 hours' are the same operator fact: nobody is working.
+function renderSummary(agents, balances){
+  const rows = (agents || []).filter(a => a && !a.error);
+  if (!rows.length) {
+    return '<span class="cell"><span class="k">cohort</span>'
+         + '<span class="v muted">no agents</span></span>';
+  }
+  const up = rows.filter(a => String(a.status || '').startsWith('Up')).length;
+  const asleep = rows.length - up;
+  let known = 0, unknown = 0;
+  for (const a of rows) {
+    const b = (balances || {})[a.name];
+    if (typeof b === 'number' && isFinite(b)) known += b; else unknown++;
+  }
+  const money = unknown === rows.length
+    ? '<span class="v muted">unknown</span>'
+    : '<span class="v">' + known.toLocaleString('en-US') + '\u24D2</span>'
+      + (unknown ? ' <span class="v muted">+' + unknown + ' ?</span>' : '');
+  const cell = (k, v) => '<span class="cell"><span class="k">' + k + '</span>' + v + '</span>';
+  return cell('agents', '<span class="v">' + rows.length + '</span>')
+       + cell('up', '<span class="v' + (up ? ' ok' : ' muted') + '">' + up + '</span>')
+       + cell('asleep', '<span class="v' + (asleep ? ' warn' : ' muted') + '">' + asleep + '</span>')
+       + cell('coins', money);
+}
+
 async function loadAgents(){
   agents = await (await api('/api/agents')).json();
   // balances for the whole crowd in one call; failure is non-fatal —
@@ -686,6 +741,8 @@ async function loadAgents(){
     d.onclick = () => select(a.name);
     box.appendChild(d);
   }
+  const sum = $('#summary');
+  if (sum) sum.innerHTML = renderSummary(agents, balances);
   if (!current && agents.length && !agents[0].error) select(agents[0].name);
 }
 
@@ -717,7 +774,12 @@ function renderEvents(evs){
       i++; continue;
     }
     if (e.kind === 'assistant') {
-      out.push(`<div class="msg agent"><div class="hd">glm-5.3 · ${esc(e.time)}</div><div class="bd">${esc(e.text)}</div></div>`);
+      // The model comes from the life's OWN birth event, which the daemon
+      // writes (agent-daemon.py: log.log("birth", model=..., **build_stamp())).
+      // This used to be the literal string 'glm-5.3', which no agent here
+      // runs -- every agent defaults to deepseek-v4.1-flash (start_agent,
+      // control.py:141). A label nobody measured is worse than no label.
+      out.push(`<div class="msg agent"><div class="hd">${esc(MODEL_LABEL)} · ${esc(e.time)}</div><div class="bd">${esc(e.text)}</div></div>`);
       i++; continue;
     }
     if (e.kind === 'assistant-block' && e.name) {
@@ -764,6 +826,9 @@ function renderEvents(evs){
 }
 
 let currentLifeKnown = false;
+// Set from the birth event of the life being displayed; 'agent' when the
+// transcript carries no model (older lives predate build_stamp).
+let MODEL_LABEL = 'agent';
 
 async function loadConvo(){
   if (!current) { $('#view').innerHTML = '<div class="statusline">select an agent</div>'; return; }
@@ -779,6 +844,8 @@ async function loadConvo(){
   const evs = await (await api(`/api/agent/${current}/life/${life.id}`)).json();
   if (evs.length === lastLen) return;
   lastLen = evs.length;
+  const birth = evs.find(x => x && x.kind === 'birth' && x.model);
+  MODEL_LABEL = birth ? birth.model : 'agent';
   $('#title').textContent = `${current} · life ${life.id} · ${evs.length} events`
     + (life.current ? ' · running now'
        : (currentLifeKnown ? ' · finished (agent sleeping)'
