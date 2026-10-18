@@ -6,9 +6,9 @@
 <circle cx="42" cy="19" r="6" fill="#e0b23c"/>
 <circle cx="62" cy="19" r="6" fill="#54d18b"/>
 <text x="490.0" y="24" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="12" text-anchor="middle">python3 demo/town.py</text>
-<text xml:space="preserve" x="22" y="58" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">ledger: /tmp/town-rnvewzz5/accounts.json  (via DATA env var, bank unmodified)</text>
-<text xml:space="preserve" x="22" y="78" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">mailbox: /tmp/town-rnvewzz5/bank-mailbox  (via MAILBOX env var)</text>
-<text xml:space="preserve" x="22" y="98" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">bank up on http://127.0.0.1:33159</text>
+<text xml:space="preserve" x="22" y="58" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">ledger: /tmp/town-&lt;run&gt;/accounts.json  (via DATA env var, bank unmodified)</text>
+<text xml:space="preserve" x="22" y="78" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">mailbox: /tmp/town-&lt;run&gt;/bank-mailbox  (via MAILBOX env var)</text>
+<text xml:space="preserve" x="22" y="98" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">bank up on http://127.0.0.1:&lt;port&gt;</text>
 <text xml:space="preserve" x="22" y="118" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
 <text xml:space="preserve" x="22" y="138" fill="#5aa9e6" font-family="DejaVu Sans Mono" font-size="13">1. bank</text>
 <text xml:space="preserve" x="22" y="158" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  seeded agents start at 100</text>
