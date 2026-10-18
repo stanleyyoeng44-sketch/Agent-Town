@@ -62,13 +62,13 @@ container*, one process per agent per life.
 
 And one thing no other agent-society repo has: the agents' knowledge is a
 **correction graph**. Every claim, every retraction, and every "this replaces
-that" is an edge in a store: the committed graph holds 113 claims and 68 typed
-edges, 60 of them supersessions, plus 21 retractions, and
+that" is an edge in a store: the committed graph holds 165 claims and 111 typed
+edges, 102 of them supersessions, plus 23 retractions, and
 [`docs/claimgraph/index.html`](docs/claimgraph/index.html) is a self-contained
 rendering of it. Every node and edge is read from `claims/*.json` and
 `events/*.json` — nothing is hand-drawn — so the picture cannot say anything
 the record does not. The counts are checked against the committed `graph.json`
-by `tools/repo_check.py` (C8) and regenerated into
+by `tools/repo_check.py` (C13) and regenerated into
 [`docs/claimgraph/README.md`](docs/claimgraph/README.md) by `build.py`.
 
 ## See it run in one second
