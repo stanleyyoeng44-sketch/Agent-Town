@@ -74,10 +74,23 @@ async def run_case(label, wake_prompt, timeout=1.5, resumed=False):
 
     work = tempfile.mkdtemp()
     D.TRANSCRIPTS = work
+    # CURRENT_LIFE_FILE is derived from TRANSCRIPTS AT IMPORT TIME, so
+    # reassigning TRANSCRIPTS alone leaves it pointing at the real
+    # /workspace/transcripts. Without this line, running this test writes a
+    # 'test' life id into the LIVE container's transcripts/CURRENT -- observed
+    # on this box at 13:42, inside an agent that was mid-conversation. Every
+    # module-level path derived from another must be redirected too, and the
+    # assertion below is what makes a missed one fail loudly instead of
+    # silently polluting state.
+    D.CURRENT_LIFE_FILE = os.path.join(work, "CURRENT")
     D.SELF_DIR = os.path.join(work, "self")
     D.WAKE_FILE = os.path.join(D.SELF_DIR, "wake.md")
     D.SESSION_FILE = os.path.join(D.SELF_DIR, "session-id")
     D.RESTART_FLAG = os.path.join(work, "restart")
+    _leaks = [n for n in ("TRANSCRIPTS", "CURRENT_LIFE_FILE", "SELF_DIR",
+                          "WAKE_FILE", "SESSION_FILE", "RESTART_FLAG")
+              if not str(getattr(D, n)).startswith(work)]
+    assert not _leaks, ("test would write outside its temp dir: %s" % _leaks)
     os.makedirs(D.SELF_DIR, exist_ok=True)
     if wake_prompt is not None:
         open(D.WAKE_FILE, "w").write(wake_prompt)
