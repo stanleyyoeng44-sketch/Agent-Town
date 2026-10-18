@@ -1024,11 +1024,84 @@ def c13_claimgraph_prose_numbers(root):
     return "C13 claimgraph prose numbers", "PASS", checked
 
 
+def c12_undefined_names(root):
+    """A name LOADED but never bound -- the defect class that stopped the daemon.
+
+    WHY THIS CHECK EXISTS, stated as the incident, because the incident is the
+    specification:
+      master fcb2458 could not boot. Commit 718d278 inserted
+      CURRENT_LIFE_FILE directly above `WAKE_NOTICE_TOKENS = int(...)` and, in
+      the same hunk, deleted the assignment while leaving four uses of it.
+
+      C6 (ast.parse) passed: `f"{WAKE_NOTICE_TOKENS}"` is valid syntax. A
+      NameError is not a SyntaxError.
+      C7 (import) passed: the uses are inside main_loop() and watch_context(),
+      and importing a module does not call its functions.
+      The daemon died at the first print() in main_loop(), BEFORE the life
+      loop -- so it wrote no transcript, no birth event, no error file. A
+      container built from that tree restart-loops with the traceback on
+      stderr only. It survived two hours and about a dozen human-visible boot
+      events because it is invisible to every check this repo had.
+
+    The check is a stdlib-only subset of pyflakes (tools/undefined_names.py)
+    rather than a pyflakes dependency: the image does not ship it, and a check
+    that needs a package the image lacks is a check that does not run.
+
+    FALSE POSITIVES ARE THE FAILURE MODE THAT MATTERS. A check that bites
+    correct code gets disabled, and then it catches nothing. So the module
+    stays SILENT wherever it cannot prove a load is unsafe: star imports,
+    globals()/locals()/eval/exec, a caught NameError. Its own suites are run
+    here as the control, in both directions:
+      - tools/tests/undefined_names_cases.py  (10 snippets that MUST be caught)
+      - tools/tests/undefined_names_legal.py  (legal Python that MUST NOT be)
+    A check with a negative control but no positive one is this cohort's most
+    repeated mistake; this one asserts both.
+    """
+    tool = os.path.join(root, "tools", "undefined_names.py")
+    if not os.path.isfile(tool):
+        return "C12 undefined names", "FAIL", [
+            "tools/undefined_names.py is missing; C12 cannot run. This is a "
+            "FAIL and not a skip: C6 and C7 both pass on a daemon that cannot "
+            "boot, and this is the only check that sees that class."]
+    findings = []
+    # 1. the repo itself
+    r = subprocess.run([sys.executable, "-I", tool], cwd=root,
+                       capture_output=True, text=True)
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("UNDEFINED "):
+            findings.append(line[len("UNDEFINED "):])
+    # 2. both controls, run every time. A tool that silently stopped detecting
+    #    would otherwise report PASS on every tree forever.
+    cases = os.path.join(root, "tools", "tests", "undefined_names_cases.py")
+    legal = os.path.join(root, "tools", "tests", "undefined_names_legal.py")
+    if not os.path.isfile(cases) or not os.path.isfile(legal):
+        findings.append("C12's own control suites are missing "
+                        "(tools/tests/undefined_names_{cases,legal}.py); the "
+                        "check is unverified without them")
+        return "C12 undefined names", "FAIL", findings
+    rc = subprocess.run([sys.executable, "-I", cases], cwd=root,
+                        capture_output=True, text=True)
+    if rc.returncode != 0:
+        findings.append("DETECTION CONTROL FAILED: a snippet that uses an "
+                        "undefined name was not reported -- "
+                        + (rc.stdout or rc.stderr).strip().splitlines()[-1])
+    rl = subprocess.run([sys.executable, "-I", tool, legal], cwd=root,
+                        capture_output=True, text=True)
+    if rl.returncode != 0:
+        findings.append("FALSE-POSITIVE CONTROL FAILED: legal Python was "
+                        "reported -- " + (rl.stdout or "").strip()[-300:])
+    if findings:
+        return "C12 undefined names", "FAIL", findings
+    return "C12 undefined names", "PASS", [
+        "no unbound name in any tracked .py (10/10 detection cases, "
+        "legal-code control clean)"]
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
-          c13_claimgraph_prose_numbers]
+          c13_claimgraph_prose_numbers, c12_undefined_names]
 
 
 def _is_git_tree(root):
@@ -1689,6 +1762,49 @@ def selftest():
     outcomes.append(("C2 would catch it if it did (fixtures use SYNTHETIC)",
                      any("SYNTHETIC" in l for l in
                          open(here, encoding="utf-8").read().splitlines())))
+
+    # C12 controls: THE ACTUAL INCIDENT, reproduced. A fixture containing the
+    # real shape of master fcb2458 -- a module constant deleted while its
+    # uses remain -- must FAIL, and the same fixture with the line restored
+    # must PASS. This is the control that matters: a mutation of the shape
+    # that stopped the daemon, not a mutation I invented.
+    def c12_on(body):
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        os.makedirs(os.path.join(d, "tools", "tests"), exist_ok=True)
+        # C12 runs the tool from the TREE, so the fixture must carry it and
+        # its two control suites, or C12 would fail for the wrong reason
+        # (missing tool) and the control would pass vacuously.
+        for rel in ("tools/undefined_names.py",
+                    "tools/tests/undefined_names_cases.py",
+                    "tools/tests/undefined_names_legal.py"):
+            shutil.copyfile(os.path.join(ROOT, rel), os.path.join(d, rel))
+        open(os.path.join(d, "daemon.py"), "w").write(body)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c12 fixture")
+        _ok, r = run(d)
+        shutil.rmtree(d)
+        return dict((n, o) for n, o, _ in r).get("C12 undefined names")
+
+    BOOT = ("import os\n"
+            "LIMIT = int(os.environ.get('LIMIT', '5'))\n"
+            "def main_loop():\n"
+            "    print(f'[daemon] up, threshold {LIMIT}')\n")
+    outcomes.append(("C12 passes on a module whose constant is defined",
+                     c12_on(BOOT) == "PASS"))
+    deleted = BOOT.replace("LIMIT = int(os.environ.get('LIMIT', '5'))\n", "")
+    outcomes.append(("C12 catches the deleted-constant boot crash "
+                     "(the fcb2458 shape)",
+                     deleted != BOOT and c12_on(deleted) == "FAIL"))
+    # And it must ALSO catch a definition deleted from a function body, which
+    # is the more common everyday shape and a different scope branch.
+    FN = ("def watch(total):\n"
+          "    threshold = 5\n"
+          "    return total >= threshold\n")
+    fn_bad = FN.replace("    threshold = 5\n", "")
+    outcomes.append(("C12 catches a deleted local in a function body",
+                     fn_bad != FN and c12_on(fn_bad) == "FAIL"))
 
     bad = 0
     for label, passed in outcomes:
