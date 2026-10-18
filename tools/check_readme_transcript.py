@@ -119,15 +119,37 @@ def replay(root, readme_text, verbose=False):
     if not pairs:
         return ["the transcript blocks contain no '$ command' lines to replay"]
 
-    # THE README'S OWN CLOCK, read from the README rather than assumed. A decay
-    # claim is meaningless without units; these two numbers are what turn a
-    # quoted balance into an equation. `stated` is None when either is absent,
-    # and the second-balance branch FAILs on None instead of skipping -- an
-    # unreadable claim is the defect, not a reason to pass.
-    decay_m = re.search(r"DECAY_SECONDS=(\d+)", readme_text)
-    later_m = re.search(r"(\d+)\s+seconds?\s+later", readme_text)
-    stated = ((int(decay_m.group(1)), int(later_m.group(1)))
-              if decay_m and later_m else None)
+    # THE README'S OWN CLOCK, read from THE BLOCK UNDER TEST, not from the
+    # document. A decay claim is meaningless without units; these two numbers
+    # turn a quoted balance into an equation.
+    #
+    # MEASURED DEFECT IN MY OWN FIRST VERSION (agent-2, found by attacking the
+    # surface I said reviewers should attack): I read both numbers with
+    # re.search over the WHOLE README, so the match came from the FIRST
+    # occurrence anywhere -- which is a PROSE sentence above the transcript
+    # ("with DECAY_SECONDS=2 to make..."), not the transcript's launch line.
+    # Consequences, both repro'd: editing the launch line to DECAY_SECONDS=1
+    # passed (the prose still said 2), and DELETING it from the launch line
+    # passed too (falls back to the prose). The transcript's own claim was
+    # never read. Same disease as everything else tonight: the value that
+    # drives the check was selected from somewhere other than the object
+    # under test.
+    #
+    # So: parse the block that CONTAINS the launch line, and require the
+    # launch line to be in the same block as the balances it explains.
+    stated = None
+    for b in blocks:
+        block_text = "\n".join(b)
+        if "bank/bank.py" not in block_text:
+            continue
+        decay_m = re.search(r"DECAY_SECONDS=(\d+)", block_text)
+        later_m = re.search(r"(\d+)\s+seconds?\s+later", block_text)
+        if decay_m and later_m:
+            stated = (int(decay_m.group(1)), int(later_m.group(1)))
+        break
+    # `stated` stays None when either is absent, and the second-balance branch
+    # FAILs on None instead of skipping -- an unreadable claim is the defect,
+    # not a reason to pass.
 
     port = free_port()
     # DATA is a FILE path, not a directory (bank.py:41 defaults to
@@ -495,6 +517,36 @@ def main():
              '"ok": true, "money": 900, "recipient": "agent-3", '
              '"recipient_balance": 7',
              "a transfer result of 900 after a 7-coin transfer (93 vanished)"))
+        # THE CLOCK ARMS. MEASURED (agent-2, on the first version of this fix):
+        # both clock numbers were read with re.search over the WHOLE README, so
+        # the match came from a PROSE sentence above the transcript rather than
+        # from the launch line in the block being replayed. Editing the launch
+        # line to DECAY_SECONDS=1 PASSED, and DELETING it also PASSED (it fell
+        # back to the prose). The arms above could not catch either: they
+        # mutate the balances, and these mutate the UNITS. Each must be
+        # rejected; the pristine read (ok_real) must stay green.
+        clock_lies = [
+            ("DECAY_SECONDS=2 python3 bank/bank.py",
+             "DECAY_SECONDS=1 python3 bank/bank.py",
+             "a launch line stating DECAY_SECONDS=1 (the balances are for 2)"),
+            (" DECAY_SECONDS=2 python3 bank/bank.py",
+             " python3 bank/bank.py",
+             "a launch line with NO DECAY_SECONDS (the decay claim has no "
+             "units)"),
+            ("   ... 5 seconds later ...", "   ... 10 seconds later ...",
+             "an ellipsis of '10 seconds later' (the balance is for 5)"),
+        ]
+        clock_results = []
+        for old, new, label in clock_lies:
+            mutated = text.replace(old, new, 1)
+            if mutated == text:
+                print(f"  FAIL  could not build the lie: {label}; the README "
+                      f"no longer carries the line this arm mutates")
+                clock_results.append(False)
+                continue
+            caught = bool(replay(ROOT, mutated))
+            print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
+            clock_results.append(caught)
         later_results = []
         for old, new, label in later_lies:
             mutated = text.replace(old, new, 1)
@@ -510,7 +562,7 @@ def main():
             later_results.append(caught)
 
         all_ok = (ok_real and built and not ok_bad and all(first_results)
-                  and all(later_results))
+                  and all(clock_results) and all(later_results))
         return 0 if all_ok else 1
 
     fails = replay(ROOT, text, verbose="--verbose" in args)
