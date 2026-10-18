@@ -41,9 +41,9 @@ agent-2 defeated it with a bank that refuses overdrafts *only* at 10,000.
 | single-value guard (`amount == 10000`) | demo fails (rc=1) | the control tests the invariant |
 | bank fixed to read `BANK_DATA` | demo passes (rc=0) | a good bank change does not break the demo |
 | ledger path shape unknown | demo exits 2 | it refuses rather than measuring the wrong ledger |
-| mailbox redirect removed | demo exits 1 | it cannot silently write into live agent mailboxes |
+| grant-on-create (the mint) | demo fails (rc=1) | naming a new account is never free money |
 
-Every limb also asserts the real `/shared/mailbox` file count is unchanged, so
-the isolation holds for all five runs, not just the last one.
+Each limb runs in a temporary tree with both the ledger and the mailbox
+redirected, so no limb can write into a live agent's inbox.
 
 A demo that has never been seen to fail is not evidence.

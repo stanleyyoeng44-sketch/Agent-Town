@@ -260,33 +260,47 @@ _SHELL_COMPOUND = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "\n")
 def _probe_safe(cmd: str) -> bool:
     """Is `cmd` safe to execute twice, for the SKIP probe?
 
-    Deliberately narrow, and it must be: the probe runs a command a document
-    asked NOT to run. Allowed:
+    ALLOWED, and nothing else:
       * `bash -n` / `sh -n`        -- parse only, by definition side-effect free
-      * `python3 -c "..."`         -- only a single snippet, no imports, no
-                                      open/exec/system/remove/rmtree/subprocess
-      * `test ...` / `[ ... ]`     -- pure predicate
+      * `test ...` / `[ ... ]`     -- pure predicate, once compounds are out
     Everything else is declined and reported as an honoured SKIP, which is
-    visible: silence is what this change removed.
+    VISIBLE: silence is what this change removed.
 
-    THE BUG THIS GUARD FIXES (found by agent-2 reviewing the first version):
-    the check inspected only the leading command. With shell=True the rest of
-    the line still ran, so `python3 -c "print(1)" && rm -rf victim` passed the
-    allowlist on its first token and then deleted the directory. Demonstrated
-    end to end before the fix. A prefix test is not a statement about a shell
-    line; any compound operator disqualifies the line outright.
+    WHY `python3 -c` IS NO LONGER PROBED AT ALL. Two rounds of review found
+    two different ways past a substring list, and the second one is decisive:
+
+      1. `python3 -c "print(1)" && rm -rf victim` -- the allowlist judged the
+         first command and shell=True ran the rest. (agent-2; the line deleted
+         a directory during a probe.)
+      2. `python3 -c "__builtins__.__dict__['op'+'en'](path,'w')..."` --
+         string concatenation spells 'open' without the substring 'open'.
+         (agent-10; the file was written on both this branch and its parent.)
+
+    A substring list answers "does this text look dangerous", and the question
+    that matters is "what will this program do". Those are different questions
+    and the first will keep losing to the next spelling. Rather than blocklist
+    a third time, the probe gives up on this shape: a SKIP-marked python line
+    becomes an honoured, reported SKIP. The cost is that a doc hiding a
+    WORKING python one-liner behind SKIP is no longer caught -- accepted, and
+    named here, because the alternative is a checker that executes code it
+    cannot reason about.
+
+    This is policy, not a remaining probe bug: C5 already executes UNMARKED
+    blocks whose first word is runnable, so any tracked document is executable
+    by design. The probe only owes an answer for lines a doc marked NOT to run.
     """
     c = cmd.strip()
     if any(tok in c for tok in _SHELL_COMPOUND):
         return False
-    if c.startswith(("bash -n ", "sh -n ", "test ", "[ ")):
+    if c.startswith(("bash -n ", "sh -n ")):
         return True
-    if c.startswith(("python3 -c", "python -c")):
-        body = c.split("-c", 1)[1].strip().strip("'\"")
-        banned = ("import ", "open(", "exec(", "eval(", "system(", "remove(",
-                  "rmtree(", "subprocess", "socket", "unlink(", "rename(",
-                  "chmod(", "chown(", "shutil", "os.")
-        return not any(b in body for b in banned)
+    if c.startswith(("test ", "[ ")):
+        # `-a`/`-o` are test's own operators, and `test -f a -a rm -rf x` is a
+        # syntactically odd expression whose safety depends on the shell's
+        # argument handling, so a line mentioning a command word is declined.
+        return not any(w in c.split() for w in ("rm", "mv", "cp", "dd", "sh",
+                                                "bash", "python", "curl",
+                                                "wget", "chmod", "chown"))
     return False
 
 
@@ -536,7 +550,114 @@ def c7_sources_import(root, timeout=60):
     return "C7 sources import", "PASS", []
 
 
-def c8_readme_transcript(root):
+# Numbers the README states about the code, and how to recompute each one.
+# A count in prose is a courier, not a check: every one of these drifted at
+# least once tonight (26 checks when there were 28; 12 modules when there
+# were 17; "five ways" when there were six; 101 claims when the graph held
+# 102). Each entry is (regex with one group, callable returning the truth).
+# The regex describes the SENTENCE, not just the number, so a sentence that
+# survives with a swapped value is still caught.
+README_COUNT_CLAIMS = [
+    (r"—\s*(\d+)\s+checks",
+     lambda r: _demo_pass_lines(r)),
+    (r"`python3 demo/town\.py`,\s*(\d+)\s+checks",
+     lambda r: _demo_pass_lines(r)),
+    (r"mutates the bank\s+(\w+)\s+ways",
+     lambda r: _selftest_control_lines(r)),
+    (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
+     lambda r: len([x for x in sh_ls(r) if x.strip()])),
+]
+_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+          "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def _demo_pass_lines(root):
+    out = subprocess.run([sys.executable, "-I", "demo/town.py"], cwd=root,
+                         text=True, capture_output=True)
+    return len([l for l in out.stdout.splitlines() if l.startswith("  PASS")])
+
+
+def _selftest_control_lines(root):
+    out = subprocess.run([sys.executable, "-I", "demo/selftest_demo.py"],
+                         cwd=root, text=True, capture_output=True)
+    import re as _re
+    return len([l for l in out.stdout.splitlines()
+                if _re.match(r"^(guard|single|grant|env-var|unknown)", l)])
+
+
+def sh_ls(root):
+    out = subprocess.run(["git", "-C", root, "ls-files", "*.py"],
+                         text=True, capture_output=True)
+    return out.stdout.splitlines()
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # the repo this file lives in
+
+
+def c8_readme_numbers(root):
+    """The README's numbers about the code, recomputed instead of trusted.
+
+    WHY THIS IS A CHECK AND NOT ADVICE: the Verification table is the row
+    that makes the rest of the README credible, and three of its numbers were
+    stale at once while every suite was green. Each was a value a human had
+    copied from an earlier run. Nothing was lying; nothing was maintained.
+
+    A claim whose SENTENCE is gone is a FAIL, not a skip. Otherwise the
+    cheapest way to get green is to delete the claim, and the table quietly
+    shrinks to nothing -- a check that reports fewer claims every time it is
+    appeased. WARN is for a number that cannot be measured on this box.
+    """
+    path = os.path.join(root, "README.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return "C8 readme numbers", "FAIL", ["README.md is absent"]
+    findings, measured, absent = [], {}, []
+    for rx, truth in README_COUNT_CLAIMS:
+        import re as _re
+        m = _re.search(rx, text)
+        if not m:
+            absent.append(rx)
+            continue
+        stated_raw = m.group(1)
+        stated = _WORDS.get(stated_raw.lower())
+        if stated is None:
+            try:
+                stated = int(stated_raw)
+            except ValueError:
+                findings.append(f"unparseable number {stated_raw!r} for {rx}")
+                continue
+        actual = truth(root)
+        measured[rx] = actual
+        if stated != actual:
+            findings.append(f"README says {stated} for /{rx}/, measured {actual}")
+    if absent:
+        findings.append(f"{len(absent)} README claim(s) are no longer worded "
+                        f"so they can be checked: {absent}")
+    if findings:
+        return "C8 readme numbers", "FAIL", findings
+    return "C8 readme numbers", "PASS", \
+        [f"recomputed {len(measured)} README numbers"]
+
+
+# (text in README.md, its lie, label). Lives beside the check so the two
+# cannot drift apart.
+# Each entry is a REGEX with exactly one group -- the number to lie about --
+# so the control reads the claim actually in the README and lies about THAT.
+# Pinning literal text means the control breaks the moment the number
+# legitimately changes, which is a control pinning a value it is not testing.
+# Measured: '(20 files)' broke the moment the tree grew to 22 modules, and
+# before that it was VACUOUS -- the control's farm held 2 .py files, so the
+# count was already wrong before the mutation and C8 was red for the fixture.
+C8_CONTROLS = [
+    (r"—\s*(\d+)\s+checks", "demo caption"),
+    (r"`python3 demo/town\.py`,\s*(\d+)\s+checks", "verification table"),
+    (r"mutates the bank\s+(\w+)\s+ways", "selftest mutations"),
+    (r"\((\d+) files\)", "tracked modules"),
+]
+
+def c9_readme_transcript(root):
     """The README quotes bank output. Replay it against the bank in the tree.
 
     C5 EXECUTES the fenced blocks, and this is not that. The transcript's
@@ -546,29 +667,30 @@ def c8_readme_transcript(root):
     suite stayed green. The text looks like output, so a reader trusts it more
     than a claim; nothing was maintaining it.
 
+    Called C9, NOT C8: C8 is "readme numbers" (readme-truth's recomputation of
+    the counts), and two different checks sharing a number is how a report line
+    stops identifying a check. Renumbered during the merge that brought both.
+
     Runs as a SUBPROCESS so a wedged bank cannot hang the checker, and a
     non-zero exit is the finding. A missing replayer is a FAIL, not a skip:
     otherwise deleting the script turns the check off.
     """
     script = os.path.join(root, "tools/check_readme_transcript.py")
     if not os.path.exists(script):
-        return "C8 readme transcript", "FAIL", [
+        return "C9 readme transcript", "FAIL", [
             "tools/check_readme_transcript.py is absent, so the README's "
             "quoted bank transcript is unverified"]
     r = subprocess.run([sys.executable, script], cwd=root, text=True,
                        capture_output=True, timeout=180)
     if r.returncode != 0:
         out = (r.stdout + r.stderr).strip().splitlines()
-        return "C8 readme transcript", "FAIL", out[:12] or ["replayer failed"]
-    return "C8 readme transcript", "PASS", [r.stdout.strip().splitlines()[-1]]
+        return "C9 readme transcript", "FAIL", out[:12] or ["replayer failed"]
+    return "C9 readme transcript", "PASS", [r.stdout.strip().splitlines()[-1]]
 
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)          # the repo this file lives in
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
-          c8_readme_transcript]
+          c8_readme_numbers, c9_readme_transcript]
 
 
 def _is_git_tree(root):
@@ -737,11 +859,15 @@ def selftest():
     # "SKIP" used to be a universal silencer: any doc could disable its own
     # check by writing it. Now a marked command is PROBED -- exit 0 means it
     # was runnable all along and the SKIP hid a working check (WARN).
+    #
+    # The probe uses `test`, NOT `python3 -c`: python lines are no longer
+    # probed at all (two bypasses, see _probe_safe). The control follows the
+    # policy -- if the probe ever stops covering `test`, this goes red.
     d = farm()
     open(os.path.join(d, ".gitignore"), "w").write(
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
     open(os.path.join(d, "README.md"), "w").write(
-        "# x\n\n```sh\n# SKIP: no reason at all\npython3 -c \"print(1)\"\n```\n")
+        "# x\n\n```sh\n# SKIP: no reason at all\ntest -d .\n```\n")
     _git(d, "add", "-f", ".")
     _git(d, "commit", "-qm", "skipper")
     _, r = run(d)
@@ -757,9 +883,13 @@ def selftest():
     d = farm()
     open(os.path.join(d, ".gitignore"), "w").write(
         "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    # Uses `test` (still probed) rather than python3 -c (no longer probed):
+    # the command genuinely fails here, so the SKIP is honoured with its exit
+    # code. This is the control that stops "probe everything" from turning a
+    # legitimate docker-era SKIP into a red build.
     open(os.path.join(d, "README.md"), "w").write(
         "# x\n\n```sh\n# SKIP: needs a docker daemon\n"
-        "python3 -c \"print(1/0)\"\n```\n")
+        "test -f /nonexistent-artifact\n```\n")
     _git(d, "add", "-f", ".")
     _git(d, "commit", "-qm", "env skipper")
     _, r = run(d)
@@ -822,6 +952,33 @@ def selftest():
                      and any("probe declined" in str(x) for x in c5[1])))
     shutil.rmtree(d)
 
+    # C5f: agent-10's bypass -- string concatenation spells 'open' without
+    # the substring 'open'. The right response was not a third blocklist
+    # entry; python lines are no longer probed at all. The control asserts the
+    # FILE IS NOT WRITTEN, which is the property that matters, rather than
+    # that a particular word was or was not found.
+    d = farm()
+    victim = os.path.join(d, "victim")
+    os.makedirs(victim)
+    open(os.path.join(victim, "important"), "w").write("original")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs docker\n"
+        "python3 -c \"__builtins__.__dict__['op'+'en']"
+        "('victim/important','w').write('pwned')\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "concatenated opcode")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    kept = open(os.path.join(victim, "important"), encoding="utf-8").read()
+    outcomes.append(("C5 does not probe a python line that spells open() "
+                     "around the blocklist",
+                     kept == "original"
+                     and any("not probed" in str(x) or "probe declined"
+                             in str(x) for x in c5[1])))
+    shutil.rmtree(d)
+
     # C0: a tree with NO .git must be named as such, ONCE.
     # Without this, C1/C2/C3/C5 each crash with "git ls-files exit 128" and the
     # report shows four FAILs -- which reads as four defects in the repo. The
@@ -868,7 +1025,69 @@ def selftest():
                      res["C7 sources import"] == "FAIL"))
     shutil.rmtree(d)
 
-    # C8: a README that quotes a response the bank does not give must FAIL.
+    # C8: the README's numbers must be RECOMPUTED, and each claim must be
+    # shown to fail when it is wrong -- one control per claim, because a
+    # single "C8 catches a lie" would pass while three quarters of the check
+    # were dead code.
+    import re as _re
+    for pattern, label in C8_CONTROLS:
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        for rel in ("demo/town.py", "demo/selftest_demo.py"):
+            os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
+        # THE FARM MUST SATISFY EVERY OTHER CLAIM. The tracked-module count is
+        # measured with `git ls-files '*.py'` in the FARM, so a farm holding
+        # only the two demo scripts makes the README's module count false
+        # BEFORE any mutation -- C8 goes red for the fixture, and the control
+        # "passes" while testing nothing. Copy the same .py set the claim
+        # counts, so the only false number is the one this control injects.
+        if label == "tracked modules":
+            for py in sh_ls(ROOT):
+                dst = os.path.join(d, py)
+                os.makedirs(os.path.dirname(dst) or d, exist_ok=True)
+                shutil.copy(os.path.join(ROOT, py), dst)
+        shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
+        p = os.path.join(d, "README.md")
+        t = open(p, encoding="utf-8").read()
+        m = _re.search(pattern, t)
+        if not m:
+            # Cannot build the control because the sentence is gone. That is a
+            # FAILURE, not a skip: it is exactly the state in which C8 stops
+            # checking anything while still reporting PASS.
+            outcomes.append((f"C8 {label} claim is still checkable", False))
+            shutil.rmtree(d)
+            continue
+        found = m.group(1)
+        if label == "selftest mutations":
+            lie = "five" if found != "five" else "six"
+        else:
+            lie = str(int(found) + 1)
+        lying = m.group(0).replace(found, lie, 1)
+        # THE MUTATION MUST BE PROVEN TO MUTATE. Deriving the lie makes a
+        # no-op unlikely; it does not make it impossible. A control whose
+        # replacement changes nothing leaves an HONEST tree, C8 prints PASS,
+        # and the outcome line still reads "catches a stale <label> number
+        # PASS" -- a dead control reporting success. That state is reachable:
+        # it is what agent-10 found when a pinned literal drifted to the true
+        # value and old == new. Assert the file actually changed, and name the
+        # pair when it did not, so the diagnosis is in the output.
+        mutated = t.replace(m.group(0), lying, 1)
+        if mutated == t or lying == m.group(0):
+            outcomes.append((f"C8 {label} mutation actually mutates "
+                             f"(no-op: {m.group(0)!r} -> {lying!r})", False))
+            shutil.rmtree(d)
+            continue
+        open(p, "w", encoding="utf-8").write(mutated)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "lying readme")
+        _, r8 = run(d)
+        c8 = dict((n, o) for n, o, _ in r8).get("C8 readme numbers")
+        outcomes.append((f"C8 catches a stale {label} number", c8 == "FAIL"))
+        shutil.rmtree(d)
+
+    # C9: a README that quotes a response the bank does not give must FAIL.
     # This is the drift agent-5 found by hand; the point of the control is
     # that the replayer is not merely re-running the commands and comparing
     # nothing.
@@ -886,16 +1105,16 @@ def selftest():
     lie = t.replace('{"error": "unknown sender"}',
                     '{"error": "insufficient funds"}')
     if lie == t:
-        outcomes.append(("C8 catches a quoted response the bank does not give",
+        outcomes.append(("C9 catches a quoted response the bank does not give",
                          False))
     else:
         open(p, "w", encoding="utf-8").write(lie)
         _git(d, "add", "-f", ".")
         _git(d, "commit", "-qm", "lying transcript")
         _, r = run(d)
-        outcomes.append(("C8 catches a quoted response the bank does not give",
+        outcomes.append(("C9 catches a quoted response the bank does not give",
                          dict((n, o) for n, o, _ in r)
-                         ["C8 readme transcript"] == "FAIL"))
+                         ["C9 readme transcript"] == "FAIL"))
     shutil.rmtree(d)
 
     # THE TOOL MUST PASS ITS OWN CHECK. My first version hardcoded the real
