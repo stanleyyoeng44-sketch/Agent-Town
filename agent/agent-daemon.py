@@ -162,6 +162,56 @@ def sdk_session_records() -> str:
     return os.path.join(projects, want)
 
 
+def _previous_life_end():
+    """The most recent life-end event on disk, or None.
+
+    Reads the transcripts BACKWARDS (newest file first, last lines first) so
+    this stays cheap on a life with tens of thousands of events.
+    """
+    try:
+        files = sorted((f for f in os.listdir(TRANSCRIPTS)
+                        if f.startswith("life-") and f.endswith(".jsonl")),
+                       reverse=True)
+    except OSError:
+        return None
+    for name in files[:3]:
+        path = os.path.join(TRANSCRIPTS, name)
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 8192))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("kind") == "life-end":
+                return ev
+    return None
+
+
+def _birth_time(path: str):
+    """st_birthtime where the platform has it, else st_ctime; None if absent.
+
+    Linux has no st_birthtime on ext4/overlay in general, so ctime is the
+    fallback -- and ctime is NOT creation time (it updates on metadata
+    change). Recorded as what it is rather than presented as a birth time the
+    filesystem cannot give.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return getattr(st, "st_birthtime", None) or st.st_ctime
+
+
 def session_record_path(sid: str) -> str:
     """The exact transcript file the SDK/CLI stores for this session.
 
@@ -269,8 +319,21 @@ def build_options(cfg: dict, life_id: str | None = None):
         print(f"[daemon] resuming session {resume_sid}", flush=True)
         if life_id:
             try:
-                LifeLog(life_id).log("resume", session=resume_sid,
-                                     record=session_record_path(resume_sid))
+                # agent-9: log the DECISION INPUTS at the moment of decision,
+                # not only a post-mortem afterwards. If the previous life
+                # wrote a life-end event saying slept=false / result=success,
+                # then THAT id belongs to a finished session and resuming it
+                # is wrong. That record is on disk right now, before the
+                # branch is taken, so recording it here is what would let a
+                # later change make the branch correct instead of merely
+                # explainable.
+                LifeLog(life_id).log(
+                    "resume", session=resume_sid,
+                    record=session_record_path(resume_sid),
+                    prev_life_end=_previous_life_end(),
+                    prev_ended_without_sleep=(
+                        (_previous_life_end() or {}).get("slept") is False),
+                    session_file_birth=_birth_time(SESSION_FILE))
             except Exception:
                 pass
     if "system_prompt" in cfg:
@@ -756,7 +819,16 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             slept=bool(restart_requested),
             result=saw_result,
             session_file_left=session_left,
-            next_life="resume" if session_left else "fresh")
+            # agent-9: existence is nearly free of information -- on a box
+            # that never restarted the file exists under every hypothesis.
+            # Its BIRTH time is what says whether the id predates the life
+            # about to read it. One stat call, and it is the fact that made
+            # this case decidable.
+            session_file_birth=_birth_time(SESSION_FILE),
+            # agent-9: name the DECISION, not the outcome. "next_life: resume"
+            # invites the reader to assume a resume happened and worked; at
+            # this point all we know is which branch was taken.
+            next_life_choice="resume-chosen" if session_left else "fresh-chosen")
     except Exception:
         pass
 
