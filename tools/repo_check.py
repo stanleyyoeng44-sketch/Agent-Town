@@ -1410,7 +1410,29 @@ def _required_tokens(root):
     return len(re.findall(r"^\w+_TOKEN_FILE = _token_file\(", src, re.M))
 
 
-def _run_tool(root, tool, label, mutants, reach=None):
+def _bank_blocks(root):
+    """How many tracked .md files contain a `docker run ... agent-bank` line.
+
+    Counted from the TREE. This is the supply side tokencheck has to read; the
+    first version of this gate asserted only the token count, which is the
+    DEMAND side, so narrowing the doc list stayed invisible.
+    """
+    import subprocess
+    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
+                           capture_output=True, text=True).stdout.split("\0")
+    n = 0
+    for f in filter(None, files):
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        if re.search(r"docker run[^\n]*agent-bank", text):
+            n += 1
+    return n
+
+
+def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
     """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
 
     These two tools were built and reviewed (agent-7, portcheck+tokencheck)
@@ -1462,6 +1484,22 @@ def _run_tool(root, tool, label, mutants, reach=None):
     # being blind to the same defect in docs/guide.md. A narrowed INPUT SET is
     # invisible in a verdict and visible in a count. agent-8's attack, mine to
     # fix.
+    # THE SUPPLY SIDE IS ASSERTED TOO, and this is agent-8's finding: tokencheck
+    # reads its DEMAND (which tokens) from bank.py, but its SUPPLY (which docs)
+    # from a hand-typed BANK_DOCS tuple that no arm grows. Dropping a doc from
+    # that tuple keeps every arm -- including the one that adds a token to
+    # code -- and loses coverage invisibly. The tool prints how many blocks it
+    # read; compare that to the tree.
+    if blocks is not None:
+        m = re.search(blocks[0], "\n".join(out))
+        got_b = int(m.group(1)) if m else None
+        want_b = blocks[1](root)
+        if got_b != want_b:
+            return label, "FAIL", [
+                f"{tool} read {got_b} doc block(s) but this tree has "
+                f"{want_b} that run the bank. A typed supply-side list is the "
+                f"same defect as a narrowed input set: the verdict survives "
+                f"and the coverage does not."]
     if reach is not None:
         m = re.search(reach[0], "\n".join(out))
         got = int(m.group(1)) if m else None
@@ -1576,7 +1614,10 @@ def c16_tokencheck(root):
                        'AGENT0_TOKEN_FILE = _token_file(',
                        'AUDIT_TOKEN_FILE = _token_file("/run/secrets/audit-'
                        'token", "/app/audit-token")\nAGENT0_TOKEN_FILE = '
-                       '_token_file(')])
+                       '_token_file(')],
+                     reach=(r"MATCH \((\d+) token", _required_tokens,
+                            "token"),
+                     blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
