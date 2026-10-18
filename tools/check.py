@@ -151,13 +151,25 @@ def run_suite(name, argv, special, verbose):
     # of them reads prose") AFTER its verdict, so tail[-1] reported a real FAIL
     # with a sentence that reads like the repo is fine. Prefer the last line
     # that names a verdict; fall back to the tail only when there is none.
-    def diagnosis(lines):
-        pat = re.compile(r"RESULT|FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
+    # THE SUMMARY LINE MUST AGREE WITH THE EXIT STATUS, never with the text
+    # alone. Two defects preceded this one, in opposite directions:
+    #   tail[-1] reported an agent-5 doc audit's reassurance as the diagnosis
+    #     of a FAIL (the reassurance prints AFTER the verdict).
+    #   then a scan for FAIL|STALE|ERROR reported a PASSING suite's *test name*
+    #     as a failure -- demo/selftest_demo.py prints 'FAIL: bank.py has ...'
+    #     from the limb whose EXPECTED rc is 2, and test_transfer_amounts
+    #     prints 'before=FAIL(mint visible)' as the NAME of the pre-fix state.
+    # The exit status is the fact; the regex is only a hint about where to look.
+    BAD_WORDS = re.compile(r"\b(FAIL|FAILED|STALE|DIFFER|ERROR|TIMEOUT)\b", re.I)
+    GOOD_WORDS = re.compile(r"RESULT|PASS|HOLDS|MATCH|OK\b", re.I)
+
+    def diagnosis(lines, failed):
+        pat = BAD_WORDS if failed else GOOD_WORDS
         for line in reversed(lines):
             if pat.search(line):
                 return line.strip()
         return lines[-1].strip() if lines else ""
-    last = diagnosis(tail)
+    last = diagnosis(tail, p.returncode != 0)
     if verbose:
         print("\n".join("      | " + line for line in tail[-40:]))
     if special == "warn-if-no-docker" and p.returncode == 0 and NO_DOCKER in p.stdout:
