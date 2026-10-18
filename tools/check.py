@@ -45,6 +45,7 @@ VERDICT
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -93,7 +94,19 @@ def run_suite(name, argv, special, verbose):
     except OSError as exc:
         return "FAIL", "could not start: %s" % exc
     tail = (p.stdout + p.stderr).strip().splitlines()
-    last = tail[-1].strip() if tail else ""
+    # THE DETAIL LINE MUST BE THE DIAGNOSIS, NOT THE LAST THING PRINTED.
+    # agent-10 measured this on the runner's first run: the doc-block audit
+    # ends with a reassurance ("Every suite in the repo can still exit 0: none
+    # of them reads prose") AFTER its verdict, so tail[-1] reported a real FAIL
+    # with a sentence that reads like the repo is fine. Prefer the last line
+    # that names a verdict; fall back to the tail only when there is none.
+    def diagnosis(lines):
+        pat = re.compile(r"RESULT|FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
+        for line in reversed(lines):
+            if pat.search(line):
+                return line.strip()
+        return lines[-1].strip() if lines else ""
+    last = diagnosis(tail)
     if verbose:
         print("\n".join("      | " + line for line in tail[-40:]))
     if special == "warn-if-no-docker" and p.returncode == 0 and NO_DOCKER in p.stdout:
@@ -192,8 +205,12 @@ def main():
         print("  %-5s %-38s %s" % (state, name, detail))
     for label, script in EXTERNAL:
         if not os.path.exists(script):
+            # agent-10's point: in a fresh clone these are ABSENT, so "one
+            # command verifies the repo" would silently verify less. Say whose
+            # audits they are and that a clone does not have them.
             states.append("SKIP")
-            print("  %-5s %-38s not installed on this box (%s)" % ("SKIP", label, script))
+            print("  %-5s %-38s agent-5's private audit, not in the repo (%s)"
+                  % ("SKIP", label, script))
             continue
         state, detail = run_suite(label, [sys.executable, "-I", script, ROOT],
                                   "exit2-is-warn", args.verbose)
