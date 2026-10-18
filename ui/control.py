@@ -95,7 +95,11 @@ def prompt_path(name):
     return os.path.join(PROMPTS_DIR, name, "system-prompt.txt")
 
 
-WORKSPACE_VOLUME_PREFIX = "agent-workspace"
+# Docker volumes are GLOBAL, not scoped to this stack. Two cohorts on one
+# host with the same agent names would otherwise share memory. Set
+# AGENT_COHORT to anything stable for this deployment; the default keeps the
+# names readable for a single cohort.
+WORKSPACE_VOLUME_PREFIX = os.environ.get("AGENT_COHORT", "agent-workspace")
 
 
 def workspace_volume(name, part):
@@ -105,13 +109,53 @@ def workspace_volume(name, part):
     of /workspace: /workspace/inbox and /workspace/replies are transient
     hand-off directories, and mounting all of /workspace would also make an
     old container's scratch files reappear in a new one.
+
+    Collisions: volume names are global on the host, so the prefix carries a
+    cohort name (AGENT_COHORT) -- two deployments with agent-1 each get their
+    own memory instead of silently sharing it.
     """
     return f"{WORKSPACE_VOLUME_PREFIX}-{name}-{part}"
+
+
+def agent_volumes(name):
+    """Durable paths the container currently has mounted, from docker."""
+    ok, out, _ = run_docker(
+        ["inspect", name, "--format", "{{range .Mounts}}{{.Destination}} {{end}}"])
+    return set(out.split()) if ok else set()
+
+
+def missing_workspace_volumes(name):
+    """Durable destinations this agent does NOT have mounted.
+
+    A pre-fix container keeps its memory in the writable layer; attaching
+    volumes requires re-creating it, which is destructive. So start_agent
+    REFUSES instead of silently starting an agent the fix does not apply to
+    -- the operator gets the migration command rather than an agent that
+    looks fine and still loses context.
+    """
+    mounted = agent_volumes(name)
+    return [d for d in ("/workspace/self", "/workspace/transcripts",
+                        "/workspace/.claude") if d not in mounted]
 
 
 def start_agent(name, model="deepseek-v4.1-flash"):
     if not NAME_RE.match(name):
         return False, "bad name"
+    # An existing container without the durable mounts is not fixed by this
+    # code path: docker run would fail on the name anyway. Say what to do.
+    ok, out, _ = run_docker(["ps", "-a", "--filter", f"name=^{name}$",
+                             "--format", "{{.Names}}"])
+    if ok and out.strip() == name:
+        missing = missing_workspace_volumes(name)
+        if missing:
+            return False, (
+                "container %r predates the durable-volume fix and is missing "
+                "%s. Its memory is in the container's writable layer; copying "
+                "it into the volumes is the destructive step, so it is not "
+                "automatic. Run: python3 tools/migrate_agent_volumes.py "
+                "--agent %s   (then re-create the container)"
+                % (name, ", ".join(missing), name))
+        return False, "container %r already exists" % name
     os.makedirs(os.path.dirname(prompt_path(name)), exist_ok=True)
     if not os.path.exists(prompt_path(name)):
         # seed from the template next to this project, if present

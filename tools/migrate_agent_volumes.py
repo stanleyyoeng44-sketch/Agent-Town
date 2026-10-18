@@ -44,7 +44,10 @@ PARTS = (
     ("transcripts", "/workspace/transcripts"),
     ("claude", "/workspace/.claude"),
 )
-PREFIX = "agent-workspace"
+# MUST match ui/control.py:workspace_volume(). Read from the environment with
+# the same default rather than duplicated as a literal, so a cohort rename
+# cannot silently migrate into volumes the UI will never mount.
+PREFIX = os.environ.get("AGENT_COHORT", "agent-workspace")
 IMAGE_ENV = "AGENT_IMAGE"
 DEFAULT_IMAGE = "agent-glm"
 

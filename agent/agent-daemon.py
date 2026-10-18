@@ -132,11 +132,30 @@ def sdk_session_records() -> str:
     return os.path.join(projects, want)
 
 
+def session_record_path(sid: str) -> str:
+    """The exact transcript file the SDK/CLI stores for this session.
+
+    The SDK resolves <CLAUDE_CONFIG_DIR>/projects/<sanitized cwd>/ and stores
+    a session as <session-id>.jsonl inside it (sessions.py: it sanitizes the
+    cwd by replacing every non-alphanumeric char with '-', and validates the
+    file name as a UUID). Reproducing that mapping here is deliberate: the
+    guard below must be able to say NO about a specific session, not merely
+    that some session once ran in this directory.
+    """
+    return os.path.join(sdk_session_records(), sid + ".jsonl")
+
+
 def session_is_resumable(sid: str) -> bool:
-    """True iff a stored session id AND its record directory both exist."""
+    """True iff this specific session's record still exists on disk.
+
+    Directory-exists is NOT sufficient: the directory appears as soon as any
+    session has run in cwd, so a stale id would pass and then fail to resume
+    -- after suppressing the opening message. That is the mute-while-logging
+    'resuming session' failure this guard exists to prevent.
+    """
     if not sid:
         return False
-    return os.path.isdir(sdk_session_records())
+    return os.path.isfile(session_record_path(sid))
 
 
 def read_resumable_session() -> str | None:
@@ -144,9 +163,16 @@ def read_resumable_session() -> str | None:
 
     Resume when the container restarted mid-session (crash, docker stop,
     Docker Desktop outage): the CLI's session records live under
-    CLAUDE_CONFIG_DIR, which the UI mounts on a volume, so resuming
-    restores the FULL context window instead of waking amnesiac. The id
-    is written by the message loop when the init frame arrives.
+    CLAUDE_CONFIG_DIR (/workspace/.claude by default), which the UI mounts on
+    a per-agent volume, so resuming restores the FULL context window instead
+    of waking amnesiac. The id is written by the message loop when the init
+    frame arrives.
+
+    NOTE: the records are NOT under $HOME. An earlier version of this comment
+    said they were "under the agent user's home, which survives container
+    stop/start" -- false both before and after the volume fix, since nothing
+    under /home/agent is a volume. Left here so the sentence is not
+    reintroduced: the reason resume works is the CLAUDE_CONFIG_DIR volume.
     """
     try:
         with open(SESSION_FILE, encoding="utf-8") as f:
@@ -170,7 +196,7 @@ def read_resumable_session() -> str | None:
     return sid
 
 
-def build_options(cfg: dict):
+def build_options(cfg: dict, life_id: str | None = None):
     # Life-cycle tools (restart/chat/list_peers) come from a stdio MCP
     # server this daemon launches per life. The CLI's sdk-type in-process
     # servers are not driven by this SDK/CLI combo (manifest protocol
@@ -208,7 +234,15 @@ def build_options(cfg: dict):
     resume_sid = read_resumable_session()
     if resume_sid:
         opts["resume"] = resume_sid
+        # Logged into the transcript as well as stdout: 'resuming' in a log
+        # the operator cannot see is how a silent mute stayed invisible.
         print(f"[daemon] resuming session {resume_sid}", flush=True)
+        if life_id:
+            try:
+                LifeLog(life_id).log("resume", session=resume_sid,
+                                     record=session_record_path(resume_sid))
+            except Exception:
+                pass
     if "system_prompt" in cfg:
         opts["system_prompt"] = cfg["system_prompt"]
     elif cfg.get("system_prompt_file") and os.path.exists(cfg["system_prompt_file"]):
@@ -353,7 +387,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     def restart_requested_flag():
         return os.path.exists(RESTART_FLAG)
 
-    options = build_options(cfg)
+    options = build_options(cfg, life_id)
     resumed = getattr(options, "resume", None) is not None
 
     restart_requested = False

@@ -37,6 +37,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "ui"))
+sys.path.insert(0, os.path.join(REPO, "tools"))
 
 DURABLE = ("self", "transcripts", "claude")
 
@@ -133,14 +134,29 @@ def unit_simulation():
           not os.path.exists(sid_file),
           "stale id left on disk")
 
-    # --- a stored id WITH records is resumable -----------------------------
+    # --- the directory ALONE is not enough (agent-10's correction) ---------
     records = mod.sdk_session_records()
     os.makedirs(records, exist_ok=True)
     with open(sid_file, "w") as f:
-        f.write("good-session-id\n")
-    check("a session id WITH its record directory is resumed",
-          mod.read_resumable_session() == "good-session-id",
-          "records exist but the id was not returned")
+        f.write("another-session-id\n")
+    check("a session id is REFUSED when the directory exists but its own "
+          "record does not",
+          mod.read_resumable_session() is None,
+          "directory-only guard accepted a session with no record file")
+
+    # --- a stored id WITH its OWN record file is resumable -----------------
+    good = "11111111-2222-3333-4444-555555555555"
+    with open(os.path.join(records, good + ".jsonl"), "w") as f:
+        f.write("{}\n")
+    with open(sid_file, "w") as f:
+        f.write(good + "\n")
+    check("a session id WITH its own record file is resumed",
+          mod.read_resumable_session() == good,
+          "record exists but the id was not returned")
+    check("the record path is <config>/projects/<cwd>/<sid>.jsonl",
+          os.path.abspath(mod.session_record_path(good)) ==
+          os.path.abspath(os.path.join(records, good + ".jsonl")),
+          "record naming does not match the SDK")
 
     # --- the record path the SDK resolves is the one we check --------------
     check("session records live under the config dir, not the home dir",
@@ -149,6 +165,51 @@ def unit_simulation():
     check("ENV passes CLAUDE_CONFIG_DIR to the SDK subprocess",
           mod.ENV.get("CLAUDE_CONFIG_DIR") == config_dir,
           "the subprocess would resolve a different config dir than the check")
+
+    # --- start_agent refuses loudly for a pre-fix container ---------------
+    # Simulated docker answers (no daemon needed): an existing container with
+    # no durable mounts must be REFUSED with the migration command, and a
+    # brand-new name must still start. A silent success here is the defect.
+    try:
+        import control
+        real_run = control.run_docker
+
+        def fake_existing(args, input_text=None, timeout=30):
+            if args[0] == "ps":
+                return True, "agent-old\n", ""
+            if args[0] == "inspect":
+                return True, "/shared /app/system-prompt.txt ", ""
+            return False, "", "no docker"
+
+        control.run_docker = fake_existing
+        ok_old, msg_old = control.start_agent("agent-old")
+        check("start_agent REFUSES a container without durable mounts",
+              ok_old is False and "migrate_agent_volumes" in msg_old,
+              "silent no-op: %r" % (msg_old[:80],))
+
+        def fake_new(args, input_text=None, timeout=30):
+            if args[0] == "ps":
+                return True, "", ""
+            if args[0] == "run":
+                return True, "sha", ""
+            return False, "", ""
+
+        control.run_docker = fake_new
+        ok_new, _ = control.start_agent("agent-new")
+        control.run_docker = real_run
+        check("start_agent still starts a brand-new agent", ok_new is True,
+              "the refusal overreached and blocks new agents")
+
+        # The migration tool must name the same volumes the UI mounts, or it
+        # copies memory into volumes nothing will ever attach.
+        import migrate_agent_volumes as mig
+        check("migration tool and UI agree on the volume name",
+              mig.volume("agent-x", "self") == control.workspace_volume(
+                  "agent-x", "self"),
+              "%r != %r" % (mig.volume("agent-x", "self"),
+                            control.workspace_volume("agent-x", "self")))
+    except Exception as exc:                     # noqa: BLE001
+        check("start_agent refuses a pre-fix container", False, repr(exc))
 
     # --- P3: the CURRENT marker is written for a life ----------------------
     class _Cfg(dict):
