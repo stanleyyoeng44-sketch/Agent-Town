@@ -511,9 +511,18 @@ def c7_sources_import(root, timeout=60):
         if not os.path.isfile(path):
             findings.append(f"{f}: listed as an import target but MISSING")
             continue
+        # THE CHILD MUST BE GIVEN AN ABSOLUTE PATH. The first version passed
+        # `os.path.basename(f)` and ran the child with cwd=root, so it looked
+        # for <root>/agent-daemon.py -- which does not exist for any target
+        # below the top level. On a box with claude_agent_sdk installed the
+        # interpreter import-failed anyway and the basename never mattered;
+        # on a bare runner it produced `FileNotFoundError: <repo>/agent-daemon.py`
+        # and C7 failed for a reason that has nothing to do with the module.
+        # A check that reports its own bug as an object defect is the exact
+        # pattern this file warns about elsewhere.
         code = (
             "import importlib.util,sys\n"
-            f"spec=importlib.util.spec_from_file_location('m', {os.path.basename(f)!r})\n"
+            f"spec=importlib.util.spec_from_file_location('m', {os.path.abspath(path)!r})\n"
             "m=importlib.util.module_from_spec(spec)\n"
             "try:\n"
             "    spec.loader.exec_module(m)\n"
@@ -531,6 +540,14 @@ def c7_sources_import(root, timeout=60):
             if r.returncode == 0:
                 return "ok"
             tail = (r.stderr or r.stdout).strip().splitlines()
+            # Name the FIRST line that says what went wrong, not the last:
+            # a traceback's last line is the symptom, and its first
+            # "XError:" is the cause.
+            for line in tail:
+                if line.startswith(("ModuleNotFoundError", "ImportError",
+                                    "FileNotFoundError", "SyntaxError",
+                                    "AttributeError", "NameError")):
+                    return line[:200]
             return tail[-1][:200] if tail else "?"
 
         at_root = try_from(root)
