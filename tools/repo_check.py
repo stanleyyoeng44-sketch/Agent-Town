@@ -219,11 +219,25 @@ SH_BLOCK = re.compile(r"```(?:sh|bash|console)\n(.*?)```", re.S)
 # reported as skipped WITH ITS REASON -- never silently dropped.
 RUNNABLE = ("python3 ", "python ", "bash -n ", "sh -n ", "test ", "[ ")
 ENV_LIMITED = ("docker ", "docker-compose ", "make ")   # no docker daemon here
+# `cd <dir> && cmd` is a runnable command, not an opaque one. The cd is honoured
+# by running from that directory. This was the first thing the opaque/covered
+# split surfaced: 'cd ui && python3 control.py' was being filed as "not a
+# command this check runs", which was a limitation of the CHECKER being
+# reported as a property of the DOC.
+CD_PREFIX = re.compile(r"^cd\s+([^\s&;]+)\s*&&\s*(.+)$")
 # a leading VAR=value is environment, not the command; look through it
 ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 
 
-def _looks_like_server(body, root="."):
+def _split_cd(first):
+    """Return (cwd_suffix, command) for `cd X && cmd`, else (None, first)."""
+    m = CD_PREFIX.match(first)
+    if m:
+        return m.group(1), m.group(2).strip()
+    return None, first
+
+
+def _looks_like_server(body, root=".", cd_dir=None):
     """A block that starts a long-running listener, not a one-shot command.
 
     The block itself usually does NOT contain 'serve_forever' -- it runs a
@@ -232,9 +246,10 @@ def _looks_like_server(body, root="."):
     if re.search(r"\b(uvicorn|flask run|gunicorn)\b", body):
         return True
     targets = re.findall(r"python3?\s+([\w./-]+\.py)", body)
+    base = os.path.join(root, cd_dir) if cd_dir else root
     for t in targets:
         try:
-            src = open(os.path.join(root, t), encoding="utf-8",
+            src = open(os.path.join(base, t), encoding="utf-8",
                        errors="replace").read()
         except OSError:
             continue
@@ -274,7 +289,7 @@ def c5_doc_commands(root, timeout=60):
             not FAIL: the blocks may legitimately need docker. It is printed
             on every run so the gap cannot quietly become a green tick.
     """
-    findings, ran, skipped, warnings = [], 0, [], []
+    findings, ran, skipped, opaque, warnings = [], 0, [], [], []
     for f in _tracked(root):
         if not f.endswith(DOC_SUFFIXES):
             continue
@@ -284,18 +299,38 @@ def c5_doc_commands(root, timeout=60):
             first = _first_cmd(body)
             if not first:
                 continue
+            # SKIPS ARE TWO DIFFERENT FACTS and must not share a bucket.
+            #   environmental -- needs a tool this box does not have (docker,
+            #                    make). Nothing about the doc is in question.
+            #   opaque        -- a command this checker does not know how to
+            #                    run. The doc may be fine, but this check did
+            #                    not verify it, and no one can tell why from
+            #                    the output.
+            # Only the second is worth anyone's attention, so they are counted
+            # and printed separately. That is the honest form of "add a
+            # coverage threshold": a threshold on the TOTAL would fire on every
+            # container README forever and teach people to ignore the check.
+            cd_dir, cmd = _split_cd(first)
             if "SKIP" in body.splitlines()[0]:
                 skipped.append(f"{f}: {first[:60]} (marked SKIP)")
                 continue
-            if first.startswith(ENV_LIMITED):
+            if cmd.startswith(ENV_LIMITED):
                 skipped.append(f"{f}: {first[:60]} (no docker/make on this box)")
                 continue
-            if not first.startswith(RUNNABLE):
-                skipped.append(f"{f}: {first[:60]} (not a command this check runs)")
+            if not cmd.startswith(RUNNABLE):
+                opaque.append(f"{f}: {first[:60]} (not a command this check runs)")
                 continue
+            run_cwd = os.path.join(root, cd_dir) if cd_dir else root
+            if cd_dir and not os.path.isdir(run_cwd):
+                opaque.append(f"{f}: {first[:60]} (cd target {cd_dir}/ does not exist)")
+                continue
+            # Strip the leading `cd X && ` before executing: the cd is already
+            # honoured via cwd, and leaving it in makes the shell try to cd
+            # relative to a directory this checker is not in.
+            to_run = body.replace(first, cmd, 1) if cd_dir else body
             ran += 1
             try:
-                r = subprocess.run(body, shell=True, cwd=root, text=True,
+                r = subprocess.run(to_run, shell=True, cwd=run_cwd, text=True,
                                    capture_output=True, timeout=timeout)
             except subprocess.TimeoutExpired:
                 findings.append(f"{f}: `{first[:60]}` TIMEOUT after {timeout}s")
@@ -306,7 +341,7 @@ def c5_doc_commands(root, timeout=60):
                 # doc command -- it is a command that collides with the box it
                 # is run on. Report it as WARN with the reason, and say what to
                 # do, rather than calling the document wrong.
-                if "Address already in use" in err and _looks_like_server(body, root):
+                if "Address already in use" in err and _looks_like_server(body, root, cd_dir):
                     warnings.append(
                         f"{f}: `{first[:60]}` needs a free port; this box already "
                         f"runs it (use PORT=<free> to verify)")
@@ -314,9 +349,11 @@ def c5_doc_commands(root, timeout=60):
                 findings.append(f"{f}: `{first[:60]}` exit {r.returncode}: "
                                 f"{err[:200]}")
 
-    note = [f"executed {ran} block(s), skipped {len(skipped)}"]
+    note = [f"executed {ran} block(s); skipped {len(skipped)} environmental, "
+            f"{len(opaque)} opaque"]
     # skips are always visible; they are never silently absorbed
     note.extend("skipped " + s for s in skipped[:20])
+    note.extend("OPAQUE " + s for s in opaque[:20])
     if findings:
         return "C5 doc commands run", "FAIL", findings + warnings + note
     if warnings:
@@ -559,6 +596,39 @@ def selftest():
     _, r = run(d)
     outcomes.append(("C5 catches a doc command that fails",
                      dict((n, o) for n, o, _ in r)["C5 doc commands run"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C5 + cd: `cd sub && python3 x.py` must RUN, not be filed as opaque.
+    # Before this fix it was counted as "not a command this check runs", which
+    # reported a limitation of the CHECKER as a property of the doc.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "sub"))
+    open(os.path.join(d, "sub", "ok.py"), "w").write("print('fine')\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\ncd sub && python3 ok.py\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "cd command")
+    _, r = run(d)
+    status = dict((n, o) for n, o, _ in r)["C5 doc commands run"]
+    outcomes.append(("C5 actually RUNS a `cd X && cmd` block", status == "PASS"))
+    shutil.rmtree(d)
+
+    # ...and a `cd X && cmd` where the command fails must still FAIL, so the cd
+    # handling does not become a way to skip execution.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "sub"))
+    open(os.path.join(d, "sub", "bad.py"), "w").write("raise SystemExit(3)\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\ncd sub && python3 bad.py\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "cd command fails")
+    _, r = run(d)
+    status = dict((n, o) for n, o, _ in r)["C5 doc commands run"]
+    outcomes.append(("C5 still catches a FAILING `cd X && cmd`", status == "FAIL"))
     shutil.rmtree(d)
 
     # C6: a .py that does not parse
