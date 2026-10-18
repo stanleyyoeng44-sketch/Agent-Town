@@ -1169,7 +1169,47 @@ def _mutant_tree(root, rel, old, new, mutate=True):
     return d, True
 
 
-def _run_tool(root, tool, label, mutants):
+def _publisher_docs(root):
+    """How many docker PUBLISH SITES the tree actually has.
+
+    NOT read from tools/portcheck.py's PUBLISHER_DOCS: that constant is the
+    thing an attacker narrows, so counting it made the assertion agree with
+    the attacker (it reported 6 vs 1 and PASSED). Ground truth comes from the
+    tree.
+
+    Counted as SITES, because that is what portcheck prints: README and
+    CLOUD-DEPLOYMENT carry one `-p` line each, and CLOUD-DEPLOYMENT carries
+    two, so the tree has three and a tool that reads one file sees one.
+
+    KNOWN LIMIT, measured: docs/guide.md publishes the bank INLINE on the
+    docker run line (`... agent-bank -p 8790:8790 \`), which this predicate
+    does not count and portcheck does not appear to either. If that is a real
+    coverage gap it should be found by reading guide.md, not by this number
+    quietly including it.
+    """
+    import subprocess
+    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
+                           capture_output=True, text=True).stdout.split("\0")
+    sites = 0
+    for f in filter(None, files):
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        sites += sum(1 for ln in text.splitlines()
+                     if re.match(r"\s*-p\s+[^\s:]+:\d+(:\d+)?", ln))
+    return sites
+
+
+def _required_tokens(root):
+    """How many secrets bank.py requires, read from ITS _token_file calls."""
+    path = os.path.join(root, "bank", "bank.py")
+    src = open(path, encoding="utf-8").read()
+    return len(re.findall(r"^\w+_TOKEN_FILE = _token_file\(", src, re.M))
+
+
+def _run_tool(root, tool, label, mutants, reach=None):
     """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
 
     These two tools were built and reviewed (agent-7, portcheck+tokencheck)
@@ -1215,6 +1255,22 @@ def _run_tool(root, tool, label, mutants):
                        capture_output=True, text=True, timeout=120)
     out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
     tail = out[-1] if out else "(no output)"
+    # REACH IS ASSERTED, not inferred from the verdict. Measured: a portcheck
+    # whose PUBLISHER_DOCS was narrowed to ONE file passes every mutant arm
+    # here (they all live in CLOUD-DEPLOYMENT.md) and prints MATCH -- while
+    # being blind to the same defect in docs/guide.md. A narrowed INPUT SET is
+    # invisible in a verdict and visible in a count. agent-8's attack, mine to
+    # fix.
+    if reach is not None:
+        m = re.search(reach[0], "\n".join(out))
+        got = int(m.group(1)) if m else None
+        want = reach[1](root)
+        if got != want:
+            return label, "FAIL", [
+                f"{tool} checked {got} {reach[2]}(s) but this tree has "
+                f"{want}. A detector that narrows its INPUT SET keeps its "
+                f"verdict and loses its coverage; the count is the only arm "
+                f"that sees it."]
     if r.returncode == 2:
         return label, "WARN", [f"cannot measure here: {tail}"]
     if r.returncode != 0:
@@ -1290,7 +1346,9 @@ def c15_portcheck(root):
                       # ui/control.py:432. A detector wired to only one of
                       # them is as blind as a filter that names its tokens.
                       ("docs/CLOUD-DEPLOYMENT.md",
-                       "  -p $docker0:8790:8790 \\\n", "")])
+                       "  -p $docker0:8790:8790 \\\n", "")],
+                     reach=(r"MATCH \((\d+) publish site", _publisher_docs,
+                            "publish site"))
 
 
 def c16_tokencheck(root):
