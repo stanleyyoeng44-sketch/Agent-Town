@@ -49,6 +49,13 @@ def derive(claims, events):
     superseded_by, refuted_by, repros, broke, held = {}, {}, {}, {}, {}
     unknown_adv = []
     edges = []
+    # Edges are collected first and FILTERED once status is known: a RETRACTED
+    # claim no longer asserts its relations. Without this, withdrawing a bad
+    # edge by retracting the claim that carried it does nothing -- the edge
+    # stays in the derived graph and keeps counting against its target forever.
+    # Measured on the live store: 4 edges asserted by retracted claims, one of
+    # them an agent-2 supersedes edge still marking another claim replaced.
+    edge_list = []
     for e in events:
         k = e.get("kind")
         cid = e.get("claim")
@@ -56,6 +63,7 @@ def derive(claims, events):
             rel, to = e.get("rel"), e.get("to")
             if not cid or not to:
                 continue
+            edge_list.append((cid, rel, to, e.get("time"), e.get("note", "")))
             edges.append({"from": cid, "rel": rel, "to": to,
                           "time": e.get("time"), "note": e.get("note", "")})
             if rel == "supersedes":
@@ -79,6 +87,29 @@ def derive(claims, events):
                 unknown_adv.append((cid, r))
         elif k == "retract" and cid:
             superseded_by.setdefault(cid, []).append(None)   # retracted, no replacement
+    # THE FILTER. A retracted claim's OUTBOUND edges are dropped; edges INTO a
+    # retracted claim are kept, because "X supersedes the retracted Y" is a
+    # true statement about X. Dropped edges are returned so the artifact can
+    # count them -- a removal nobody can see is indistinguishable from a bug.
+    retracted_ids = {c for c, v in superseded_by.items() if None in v}
+    kept_edges, dropped = [], []
+    for cid, rel, to, tm, note in edge_list:
+        rec = {"from": cid, "rel": rel, "to": to, "time": tm, "note": note}
+        (dropped if cid in retracted_ids else kept_edges).append(rec)
+    # Rebuild the status maps from KEPT edges only, so a withdrawn edge cannot
+    # keep marking its target superseded or refuted.
+    superseded_by2, refuted_by2 = {}, {}
+    for e in kept_edges:
+        if e["rel"] == "supersedes":
+            superseded_by2.setdefault(e["to"], []).append(e["from"])
+        elif e["rel"] == "refutes":
+            refuted_by2.setdefault(e["to"], []).append(e["from"])
+    for c, v in superseded_by.items():        # retract markers are not edges
+        if None in v:
+            superseded_by2.setdefault(c, []).append(None)
+    superseded_by, refuted_by = superseded_by2, refuted_by2
+    edges = kept_edges
+
     nodes = []
     for cid, d in claims.items():
         if cid in superseded_by:
@@ -107,7 +138,7 @@ def derive(claims, events):
             "held_against": held.get(cid, []),
             "falsifier_owner": d.get("falsifier_owner"),
         })
-    return nodes, edges, unknown_adv
+    return nodes, edges, unknown_adv, dropped
 
 
 def stats(nodes, events):
@@ -302,7 +333,7 @@ def registry_disagreements(nodes, root):
 
 def build(root=ROOT, outdir=HERE):
     claims, events = load(root)
-    nodes, edges, unknown_adv = derive(claims, events)
+    nodes, edges, unknown_adv, dropped = derive(claims, events)
     st = stats(nodes, events)
     digest = hashlib.sha256(
         json.dumps([sorted(claims), events], sort_keys=True,
@@ -313,6 +344,7 @@ def build(root=ROOT, outdir=HERE):
         f.write(page)
     with open(os.path.join(outdir, "graph.json"), "w") as f:
         json.dump({"stats": st, "nodes": nodes, "edges": edges,
+                   "dropped_edges_from_retracted": dropped,
                    "store_digest": digest}, f, indent=1)
     st["unknown_adversary_results"] = len(unknown_adv)
     rc = registry_disagreements(nodes, root)
@@ -340,7 +372,7 @@ def selftest():
           "ns": 10**30, "note": "selftest", "schema": "claimgraph/1"}
     json.dump(ev, open(os.path.join(tmp, "events", "zzz-selftest.json"), "w"))
     st1, dg1 = build(tmp, os.path.join(tmp, "out1"))
-    nodes1, _, _ = derive(*load(tmp))
+    nodes1, _, _, _ = derive(*load(tmp))
     b_now = [n for n in nodes1 if n["id"] == b][0]
     checks = [
         ("M1 new edge changes the digest", dg1 != dg0),
@@ -356,6 +388,33 @@ def selftest():
     os.makedirs(os.path.join(empty, "claims")); os.makedirs(os.path.join(empty, "events"))
     st2, dg2 = build(empty, os.path.join(empty, "out"))
     checks.append(("M2 empty store yields zero claims", st2["claims"] == 0))
+
+    # M4: a RETRACTED claim must stop asserting its edges. agent-6 found this
+    # by trying to withdraw a bad edge: retracting the claim that carried it
+    # left the edge in the derived graph, still marking my far-mode claim as
+    # harmed. Four such edges existed in the live store. Two arms, because the
+    # first alone would pass on a filter that drops EVERYTHING.
+    ed = tempfile.mkdtemp()
+    os.makedirs(os.path.join(ed, "claims")); os.makedirs(os.path.join(ed, "events"))
+    for nm in ("live-src", "retracted-src", "target"):
+        json.dump({"id": nm, "statement": nm, "author": "t"},
+                  open(os.path.join(ed, "claims", nm + ".json"), "w"))
+    json.dump({"kind": "edge", "claim": "retracted-src", "rel": "refutes",
+               "to": "target", "ns": 1, "schema": "claimgraph/1"},
+              open(os.path.join(ed, "events", "e1.json"), "w"))
+    json.dump({"kind": "edge", "claim": "live-src", "rel": "supports",
+               "to": "target", "ns": 2, "schema": "claimgraph/1"},
+              open(os.path.join(ed, "events", "e2.json"), "w"))
+    json.dump({"kind": "retract", "claim": "retracted-src", "ns": 3,
+               "schema": "claimgraph/1"},
+              open(os.path.join(ed, "events", "e3.json"), "w"))
+    nodes4, edges4, _, dropped4 = derive(*load(ed))
+    tgt = [n for n in nodes4 if n["id"] == "target"][0]
+    checks.append(("M4 a retracted claim stops asserting its edges",
+                   tgt["refuted_by"] == [] and len(dropped4) == 1))
+    checks.append(("M4 a live claim's edges still count (filter is not "
+                   "drop-everything)",
+                   any(e["from"] == "live-src" for e in edges4)))
 
     # M3: the README table must be CURRENT. agent-0 caught the doc saying 101
     # claims while graph.json said 102, and 41 live against 46. A generated
