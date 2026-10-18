@@ -151,13 +151,49 @@ def run_suite(name, argv, special, verbose):
     # of them reads prose") AFTER its verdict, so tail[-1] reported a real FAIL
     # with a sentence that reads like the repo is fine. Prefer the last line
     # that names a verdict; fall back to the tail only when there is none.
-    def diagnosis(lines):
-        pat = re.compile(r"RESULT|FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
+    #
+    # BUT THE SAME RULE INVERTS ON THE PASS PATH (agent-5, measured). Three
+    # CORRECT suites print a failure word while exiting 0, because the word is
+    # the NAME of the case they exercise or of the pre-fix behaviour they
+    # assert against:
+    #     demo/selftest_demo.py        "FAIL: bank.py has neither a DATA env ..."
+    #     bank/tests/test_transfer_amounts.py   "... before=FAIL(mint visible)"
+    #     tools/test_prompt_stream.py  "FAIL  resumed, mail already queued"
+    # The runner showed all three as PASS rows whose text says FAIL, so a
+    # reader skimming sees three failures that are not there -- the mirror of
+    # agent-10's bug (a reassurance in a failure row is now a failure word in a
+    # passing row).
+    #
+    # THE EXIT STATUS IS THE FACT; the regex is only a hint about WHERE to
+    # look. So the vocabulary depends on the verdict the exit code already
+    # established:
+    #   rc != 0  -> prefer the last line that names a problem  (old behaviour)
+    #   rc == 0  -> prefer the last line that names a SUCCESS, and never
+    #               promote a line whose only verdict word is a failure one
+    BAD_WORDS = re.compile(r"RESULT|FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
+    GOOD_WORDS = re.compile(r"RESULT|PASS|HOLDS|MATCH|OK\b|GREEN", re.I)
+    # A line that says both ("control fired (pre-fix shape went mute): PASS")
+    # is a success line: it reports a failure it INDUCED, then its own verdict.
+    # The trailing verdict wins, so score the LAST match in the line.
+    def _kind(line):
+        good = [m.start() for m in GOOD_WORDS.finditer(line)]
+        bad = [m.start() for m in BAD_WORDS.finditer(line)]
+        if not bad:
+            return "neutral"
+        if good and max(good) > max(bad):
+            return "good"
+        return "bad"
+
+    def diagnosis(lines, ok):
+        want = "good" if ok else "bad"
         for line in reversed(lines):
-            if pat.search(line):
+            k = _kind(line)
+            if k == want:
                 return line.strip()
+        # No line in the right vocabulary: report the tail, but never let a
+        # failure word masquerade as the summary of a passing suite.
         return lines[-1].strip() if lines else ""
-    last = diagnosis(tail)
+    last = diagnosis(tail, p.returncode == 0)
     if verbose:
         print("\n".join("      | " + line for line in tail[-40:]))
     if special == "warn-if-no-docker" and p.returncode == 0 and NO_DOCKER in p.stdout:
@@ -183,6 +219,10 @@ def selftest():
     Each runs through run_suite() itself, so this tests the real code path.
     """
     import tempfile
+    # Same vocabulary run_suite() uses to classify a line AT rc==0. Imported
+    # by construction rather than by copy: if the two ever disagree, the
+    # control tests a rule the runner does not apply.
+    BAD_WORDS_ONLY = re.compile(r"FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
     work = tempfile.mkdtemp(prefix="check-selftest-")
     ok = True
 
@@ -209,6 +249,31 @@ def selftest():
         good_case = got == want
         ok = ok and good_case
         print("  %-5s %-44s got %s, want %s" % ("PASS" if good_case else "FAIL", label, got, want))
+
+    # L8: A PASSING SUITE MUST NOT BE SUMMARISED BY A FAILURE WORD.
+    # agent-5 measured three correct suites whose detail line said FAIL while
+    # exiting 0 -- a case NAME ("FAIL  resumed, mail already queued") or the
+    # pre-fix behaviour under test ("before=FAIL(mint visible)"). The old
+    # diagnosis() preferred the last line matching a failure word regardless
+    # of the exit code, so all three read as failures on PASS rows.
+    # This control asserts on the DETAIL, not on the verdict: the verdict was
+    # never wrong, which is why no existing case caught it.
+    # Both directions, because a rule that only suppresses failure words would
+    # also erase agent-10's original fix (the reassurance after a real FAIL).
+    mixed = script("mixed.py", "print('before=FAIL(mint visible)')\n"
+                               "print('SELFTEST PASS')\n")
+    good_bad = script("good_bad.py",
+                      "print('SUITE FAILED: two plus two')\n"
+                      "print('Every suite can still exit 0: none reads prose')\n"
+                      "import sys; sys.exit(1)\n")
+    _s1, d1 = run_suite("t", [sys.executable, mixed], None, False)
+    _s2, d2 = run_suite("t", [sys.executable, good_bad], None, False)
+    l8 = (not BAD_WORDS_ONLY.search(d1)) and ("FAIL" in d2.upper())
+    ok = ok and l8
+    print("  %-5s %-44s detail=%r" % ("PASS" if l8 else "FAIL",
+                                      "L8 a PASS row is not a FAIL word", d1[:60]))
+    print("  %-5s %-44s detail=%r" % ("PASS" if ("FAIL" in d2.upper()) else "FAIL",
+                                      "L9 a FAIL row keeps its diagnosis", d2[:60]))
 
     # L6: DISCOVERY MUST SEE A NEW SUITE. agent-10's finding was that the
     # runner ran 2 of 3 agent suites because the list was hand-written. This
