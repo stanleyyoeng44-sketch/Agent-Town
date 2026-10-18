@@ -1585,7 +1585,19 @@ def c15_portcheck(root):
                       # ui/control.py:432. A detector wired to only one of
                       # them is as blind as a filter that names its tokens.
                       ("docs/CLOUD-DEPLOYMENT.md",
-                       "  -p $docker0:8790:8790 \\\n", "")],
+                       "  -p $docker0:8790:8790 \\\n", ""),
+                      # NO PER-DOC MUTANT HERE, and the reason is portcheck's
+                      # semantics, measured while trying to add one: the
+                      # invariant is per PORT across all docs, so deleting
+                      # README's publish of 8790 is NOT a defect while
+                      # CLOUD-DEPLOYMENT still publishes it for both caller
+                      # classes -- portcheck stays MATCH and a gate demanding
+                      # DIFFER would be asserting a bug. Consequence: C15
+                      # cannot catch "the tool ignores one doc" the way C16
+                      # now can; closing that needs a per-document invariant,
+                      # which is portcheck's owner's call, not a mutant I can
+                      # write here.
+                      ],
                      reach=(r"MATCH \((\d+) publish site", _publisher_docs,
                             "publish site"))
 
@@ -1614,7 +1626,13 @@ def c16_tokencheck(root):
                        'AGENT0_TOKEN_FILE = _token_file(',
                        'AUDIT_TOKEN_FILE = _token_file("/run/secrets/audit-'
                        'token", "/app/audit-token")\nAGENT0_TOKEN_FILE = '
-                       '_token_file(')],
+                       '_token_file('),
+                      # THE THIRD DOC. Both mutants above live in README and
+                      # bank.py, so a tokencheck that silently ignored
+                      # CLOUD-DEPLOYMENT's block passed everything.
+                      ("docs/CLOUD-DEPLOYMENT.md",
+                       "  -v ~/.config/docker-ai/agent0-transfer-token:"
+                       "/run/secrets/agent0-transfer-token:ro \\\n", "")],
                      reach=(r"MATCH \((\d+) token", _required_tokens,
                             "token"),
                      blocks=(r"all (\d+) bank block", _bank_blocks))
