@@ -1638,12 +1638,127 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
+def c18_runner_discovery(root):
+    """Every tracked suite-shaped file is DISCOVERED by tools/check.py or
+    named in its EXCLUDE table -- nothing is omitted by accident.
+
+    THE DEFECT, measured on master 570c627 (agent-6, life 12). tools/check.py's
+    own docstring says: "a new suite is included by EXISTING, and the only way
+    to omit one is the EXCLUDE table below, which a reviewer can argue with."
+    That is a promise about the TREE, and nothing checked it. I made it false
+    the cheapest possible way: dropped
+        tools/tests/test_new_suite.py   (print one line, sys.exit(1))
+    into the repo and ran check.py. It was not discovered, it did not run, and
+    the verdict was 'CHECK: WARN (16 pass, 1 warn, 0 fail)'. A failing suite
+    in the tree, a green board. The file was suite-SHAPED by the repo's own
+    convention (tests/ directory) and the runner never saw it.
+
+    WHY A COUNT WOULD NOT HAVE CAUGHT IT, and why this check does not count.
+    agent-0 and I agreed a CI check should assert a SUITE COUNT rather than a WARN,
+    because a WARN row is invisible (the board reads PASS/FAIL) and because
+    check.py's exit code cannot see a suite that VANISHED. Both true. But a
+    constant `== 15` is the hand-maintained list this runner already replaced
+    once: it goes red when someone legitimately adds a suite and green when
+    someone deletes one and edits the constant in the same commit. The
+    DISCOVERY PREDICATE has neither failure: it is derived from the tree on
+    every run, so a new suite is expected to be discovered and a REMOVED one
+    cannot hide.
+
+    THE PREDICATE. Let SHAPED be tracked *.py under any tests/ directory, or
+    named test_*.py / selftest_*.py. For every SHAPED file: it must appear in
+    check.py's discovered set, or its path must be a KEY of EXCLUDE. Both
+    sides are read from the code, never restated here -- a copy of the rule is
+    how this check would rot the same way the list did.
+
+    SCOPE, stated because the check's docstring is what a reviewer argues
+    with. (a) SHAPED is a HEURISTIC: `tools/tests/undefined_names_legal.py`
+    is a control FIXTURE that C12 runs, not a suite with its own verdict, and
+    it matches the heuristic. It is not discovered today and this check
+    reports it -- see the arm below, which asserts that the two known fixtures
+    are the ONLY current findings, so a third one cannot hide behind them.
+    (b) It reads tools/check.py as a MODULE (importlib), so a syntax error
+    there is reported as a failure, not skipped.
+    (c) It does not run check.py. Running the whole suite set from a repo
+    check would make repo_check take minutes and duplicate C15/C16's choice to
+    gate on the tool instead of on the world.
+    """
+    ck = os.path.join(root, "tools", "check.py")
+    if not os.path.isfile(ck):
+        return "C18 runner discovery", "FAIL", [
+            "tools/check.py is missing; the suite runner cannot be checked"]
+    # ---- read the DISCOVERED set and the EXCLUDE keys from the code ------
+    probe = os.path.join(root, ".c18_probe.py")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write(
+                "import importlib.util, json, sys\n"
+                "spec = importlib.util.spec_from_file_location('_ck17', %r)\n"
+                "m = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(m)\n"
+                "print(json.dumps({'discovered': sorted(r for _n, _a, _s, r in m.discover()),"
+                " 'exclude': sorted(m.EXCLUDE)}))\n" % ck)
+        r = subprocess.run([sys.executable, "-I", probe], cwd=root,
+                           capture_output=True, text=True, timeout=120)
+    finally:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+    if r.returncode != 0:
+        return "C18 runner discovery", "FAIL", [
+            "could not import tools/check.py to read its discovery: "
+            + (r.stderr or r.stdout).strip()[-300:]]
+    try:
+        info = json.loads(r.stdout)
+        discovered = set(info["discovered"])
+        excluded = set(info["exclude"])
+    except (ValueError, KeyError) as e:
+        return "C18 runner discovery", "FAIL", [
+            "check.py's discovery probe did not return usable JSON (%s): %s"
+            % (e, (r.stdout or "")[:200])]
+
+    # ---- the tracked, suite-shaped set, from git -------------------------
+    g = subprocess.run(["git", "-C", root, "ls-files", "*.py"],
+                       capture_output=True, text=True)
+    if g.returncode != 0:
+        return "C18 runner discovery", "FAIL", [
+            "git ls-files exit %d: this check needs a git tree (C1/C2/C3/C5 "
+            "have the same requirement)" % g.returncode]
+
+    def shaped(rel):
+        base = os.path.basename(rel)
+        return ("/tests/" in rel) or base.startswith("test_") \
+            or base.startswith("selftest_")
+
+    tracked = [p for p in g.stdout.split() if shaped(p)]
+    omitted = sorted(p for p in tracked
+                     if p not in discovered and p not in excluded)
+    # The two C12 control fixtures are run BY repo_check (C12 invokes both),
+    # so they are covered by the gate even though check.py does not discover
+    # them. They are named here so that "they are the only ones" is asserted
+    # rather than assumed -- a THIRD such file fails this check.
+    known_fixtures = {"tools/tests/undefined_names_cases.py",
+                      "tools/tests/undefined_names_legal.py"}
+    unexpected = [p for p in omitted if p not in known_fixtures]
+    if unexpected:
+        return "C18 runner discovery", "FAIL", [
+            "suite-shaped file(s) tracked but NEITHER discovered by "
+            "tools/check.py NOR named in its EXCLUDE table: %s. check.py's "
+            "docstring promises the EXCLUDE table is the only way to omit "
+            "one; this is the list that makes that promise true. Add the file "
+            "to SUITE_GLOBS or to EXCLUDE with a reason." % ", ".join(unexpected)]
+    return "C18 runner discovery", "PASS", [
+        "%d suite-shaped tracked file(s); %d discovered by check.py, %d in "
+        "EXCLUDE, %d known C12 fixtures -- none omitted by accident"
+        % (len(tracked), len(discovered & set(tracked)),
+           len(excluded & set(tracked)), len(known_fixtures))]
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck]
+          c15_portcheck, c16_tokencheck, c18_runner_discovery]
 
 
 def _is_git_tree(root):
@@ -2566,6 +2681,90 @@ def selftest():
         CHECKS[:] = _saved
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
+
+    # C18: runner discovery. The motivating defect was measured, not invented:
+    # a suite-shaped file dropped into tools/tests/ was discovered by NOTHING
+    # and check.py still said 'WARN (16 pass, 1 warn, 0 fail)'. Four arms in
+    # both directions, and the third is the one that keeps the first two from
+    # being satisfied by an allow-list that lets anything through.
+    def c18_on(mutator):
+        """A git COPY of the real tree, mutated, then C18 run against it.
+
+        farm() creates and initialises the repo; this check needs the whole
+        tree because it reads tools/check.py and git ls-files, so the copy is
+        everything tracked. Files C18 does not read are still copied, on
+        purpose: a fixture that differs from the real tree in more ways than
+        the injected defect is a fixture that measures the difference.
+        """
+        d = farm()
+        for rel in subprocess.run(["git", "-C", ROOT, "ls-files"],
+                                  capture_output=True, text=True
+                                  ).stdout.split():
+            dst = os.path.join(d, rel)
+            pdir = os.path.dirname(dst)
+            if pdir:
+                os.makedirs(pdir, exist_ok=True)
+            try:
+                shutil.copyfile(os.path.join(ROOT, rel), dst)
+            except OSError:
+                pass
+        mutator(d)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c18 fixture")
+        try:
+            # THIS CHECK ONLY, not run(d). Measured: run(d) executes EVERY
+            # check including C15/C16's mutant arms and C5's doc probes, which
+            # copies the tree again each time -- four arms took >10 minutes
+            # and the selftest TIMED OUT, which is a gate nobody can run.
+            # C18 needs ./tools/check.py and `git ls-files`; it needs nothing
+            # else in the tree, so the fixture is the tree and the call is
+            # c18_runner_discovery directly.
+            _n, status, fds = c18_runner_discovery(d)
+            return status, fds
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    outcomes.append(("C18 passes on the real tree",
+                     (c18_on(lambda d: None) or ("?", []))[0] == "PASS"))
+
+    def _add_orphan(d):
+        os.makedirs(os.path.join(d, "tools", "tests"), exist_ok=True)
+        with open(os.path.join(d, "tools", "tests", "test_orphan.py"), "w") as f:
+            f.write("print('orphan')\n")
+
+    st_o, fd_o = c18_on(_add_orphan) or ("?", [])
+    outcomes.append(("C18 catches a suite-shaped file nothing discovers",
+                     st_o == "FAIL" and any("test_orphan.py" in x for x in fd_o)))
+
+    # The allow-list must not be a hole: a DIFFERENT file in the SAME directory
+    # as the two known C12 fixtures must still be caught. Without this arm the
+    # three above are satisfied by "ignore anything under tools/tests/".
+    def _add_sneaky(d):
+        os.makedirs(os.path.join(d, "tools", "tests"), exist_ok=True)
+        with open(os.path.join(d, "tools", "tests",
+                               "undefined_names_sneaky.py"), "w") as f:
+            f.write("print('sneaky')\n")
+
+    st_s, fd_s = c18_on(_add_sneaky) or ("?", [])
+    outcomes.append(("C18 is not blinded by the known-fixture allow-list",
+                     st_s == "FAIL" and any("sneaky" in x for x in fd_s)))
+
+    # ... and EXCLUDE must be a real door: naming the file with a reason makes
+    # C18 pass, or the only way to fix a red is to delete the suite.
+    def _exclude_orphan(d):
+        _add_orphan(d)
+        p2 = os.path.join(d, "tools", "check.py")
+        txt = open(p2, encoding="utf-8").read()
+        txt = txt.replace('    "tools/check.py": (',
+                          '    "tools/tests/test_orphan.py": (None, "skip", '
+                          '"excluded for the C18 control"),\n'
+                          '    "tools/check.py": (', 1)
+        open(p2, "w", encoding="utf-8").write(txt)
+
+    st_e, fd_e = c18_on(_exclude_orphan) or ("?", [])
+    outcomes.append(("C18 accepts a file EXCLUDED with a reason",
+                     st_e == "PASS"))
+
 
     bad = 0
     for label, passed in outcomes:
