@@ -1338,7 +1338,6 @@ def _registry_orphans(source):
     HARNESS = {"selftest", "_self_guard", "registry_status",
                "_registry_orphans", "main"}
     called = set()
-    harness_called = set()
 
     def record_calls(node):
         for n in ast.walk(node):
@@ -1347,26 +1346,39 @@ def _registry_orphans(source):
                 if isinstance(f, ast.Name):
                     called.add(f.id)
 
+    # Calls made from the HARNESS do not mark a function as a live helper, so
+    # the harness nodes are simply not walked. (An earlier revision built a
+    # separate `harness_called` set that nothing ever read -- a field no one
+    # reads is telemetry, not an alarm.)
     harness_nodes = [n for n in tree.body
                      if isinstance(n, ast.FunctionDef) and n.name in HARNESS]
-    for node in harness_nodes:
-        for n in ast.walk(node):
-            if isinstance(n, ast.Call):
-                f = n.func
-                if isinstance(f, ast.Name):
-                    harness_called.add(f.id)
     for node in tree.body:
         if node in harness_nodes:
             continue
         record_calls(node)
 
-    defined = [n.name for n in tree.body
-               if isinstance(n, ast.FunctionDef)
-               and re.fullmatch(r"c[0-9]+_[a-z0-9_]+", n.name)
-               and n.name not in called]
-    return (sorted(defined), sorted(registered),
-            sorted(set(defined) - set(registered)),
-            sorted(set(registered) - set(defined)))
+    # TWO SETS, because the two verdicts ask different questions.
+    #
+    # `defined` is every module-level check-shaped NAME. It answers the
+    # phantom question ("does a CHECKS entry point at nothing?") and must
+    # NOT be filtered by calls: a registered check that production code also
+    # calls still EXISTS, and subtracting it made it a phantom on a correct
+    # tree (agent-2's row 4, reproduced here: c5 registered + called from a
+    # helper -> FAIL "REGISTERED BUT NOT DEFINED: c5"). That was a false
+    # FAIL, and a gate that bites correct code gets deleted.
+    #
+    # `dead_candidates` answers the orphan question ("is a check-shaped
+    # function that never runs?"). Only this set is filtered by calls: a
+    # call from PRODUCTION code marks a function as a live helper, not a
+    # check. Calls from the harness are already excluded above, so an
+    # unregistered check exercised only by selftest() stays a candidate.
+    check_names = [n.name for n in tree.body
+                   if isinstance(n, ast.FunctionDef)
+                   and re.fullmatch(r"c[0-9]+_[a-z0-9_]+", n.name)]
+    dead_candidates = [name for name in check_names if name not in called]
+    return (sorted(check_names), sorted(registered),
+            sorted(set(dead_candidates) - set(registered)),
+            sorted(set(registered) - set(check_names)))
 
 
 def registry_status(source):
@@ -1401,14 +1413,23 @@ def c14_check_registry(root):
     whose body is gutted to `return ("x", "PASS", [])` is still registered and
     still named, and C14 passes. Second limit, added after agent-7 asked for
     the sentence to match the predicate: a check-shaped function that is
-    CALLED FROM PRODUCTION CODE is treated as a helper and is not reported,
-    so "C14 PASS" means every check-shaped function is either registered or
-    called by production code -- not simply registered. A check called only
-    from the selftest IS reported; that distinction is the fix in this
-    commit, because liveness is not registration. That is the boundary of a registry check, not
-    a defect in this one -- catching a gutted body needs a different
-    instrument (inject a defect per check and require red). Stated here so
-    "registry PASS" is not read as more than it is. (agent-2's review.)
+    CALLED FROM PRODUCTION CODE is treated as a helper and is not reported as
+    an orphan, so the ORPHAN verdict means every check-shaped function is
+    either registered or called by production code. A check called only from
+    the selftest IS reported as an orphan; that distinction is agent-7's fix,
+    because liveness is not registration.
+
+    BUT THAT EXEMPTION APPLIES ONLY TO THE ORPHAN VERDICT. A registered check
+    that production code also calls is still DEFINED, so the PHANTOM verdict
+    ("CHECKS names a function that does not exist here") must not subtract
+    calls -- doing so reported a registered+called check as REGISTERED BUT
+    NOT DEFINED on a correct tree (agent-2's row 4, reproduced here before
+    the fix, and asserted by arm J). Two verdicts, two sets: `check_names`
+    (unfiltered) answers phantom, `dead_candidates` (minus production calls)
+    answers orphan. That is the boundary of a registry check, not a defect in
+    this one -- catching a gutted body needs a different instrument (inject a
+    defect per check and require red). Stated here so "registry PASS" is not
+    read as more than it is. (agent-2's and agent-7's reviews.)
 
     This is the same failure the checker already names elsewhere: "a missing
     replayer is a FAIL, not a skip: otherwise deleting the script turns the
@@ -2734,6 +2755,22 @@ def selftest():
                          for st, (_, orph) in
                          ((r[0], (None, [f for f in r[1] if "ORPHAN" in f]))
                           for r in spell_results.values()))))
+
+    # Arm J: a REGISTERED check that production code ALSO calls must not
+    # become a phantom. agent-2's row 4, and it was a regression introduced
+    # by the fix for agent-7's finding: subtracting `called` from the
+    # check-shaped set removed a real function from `defined`, so C14
+    # reported it as "REGISTERED BUT NOT DEFINED" on a CORRECT tree. The
+    # original master passed this by never filtering; the first liveness fix
+    # broke it. This asserts the PHANTOM list on a registered+called tree --
+    # the verdict the fix newly produces, which no prior arm asserted.
+    row4_src = ("def c1_a(root):\n    return 'A', 'PASS', []\n\n\n"
+                "def c2_live(root):\n    return 'B', 'PASS', []\n\n\n"
+                "def _prod(root):\n    return c2_live(root)\n\n\n"
+                "CHECKS = [c1_a, c2_live]\n")
+    st_j, fd_j = registry_status(row4_src)
+    outcomes.append(("C14: a registered check CALLED from production is not a phantom",
+                     st_j == "PASS" and not any("NOT DEFINED" in f for f in fd_j)))
 
     # Arm C: C14's own removal must still be caught. registry_status cannot
     # see this (if C14 is unregistered it never runs), so the guard is
