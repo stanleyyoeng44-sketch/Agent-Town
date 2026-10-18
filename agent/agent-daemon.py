@@ -491,6 +491,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     restart_requested = False
     notice_sent = False
     saw_result = None
+    death_phase = None
 
     async with ClaudeSDKClient(options=options) as client:
         # Feed the opening message as a streaming prompt. When resuming a
@@ -685,8 +686,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     log.log("restart-flag-seen", phase="idle-watch")
                     try:
                         await client.interrupt()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # agent-9's review: returning here on a failed
+                        # interrupt() killed the guard for the rest of the
+                        # life, so a later restart call would hang -- the
+                        # exact hang this task exists to prevent. Log it and
+                        # keep polling instead.
+                        log.log("interrupt-failed", error=repr(exc))
+                        continue
                     return
 
         feed = asyncio.create_task(feed_tasks())
@@ -695,6 +702,16 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         human = asyncio.create_task(feed_human()) if AGENT_NAME == "agent-0" else None
         restart_watch = asyncio.create_task(watch_restart())
 
+        # The iterator step lives in a task; make it visible to the cleanup
+        # path so it cannot leak. agent-9's review: it was a local inside the
+        # try, so any exit that did not clear it (an exception in the message
+        # body, a CancelledError) left the async generator OPEN while the
+        # finally cancelled only the four pollers. live_one_life is called
+        # again on the SAME client next life, so a leaked task means two
+        # consumers of one stream -- the next life's first turn could be fed
+        # from the previous life's stream. Measured before the fix: one task
+        # still alive and the generator not closed after the life returned.
+        nxt: asyncio.Task | None = None
         try:
             # Start the life: feed the streaming prompt (opening message +
             # tasks), and consume the agent's messages.
@@ -726,7 +743,6 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             # A persistent task can be waited on with a timeout repeatedly
             # without being destroyed.
             messages = client.receive_messages()
-            nxt: asyncio.Task | None = None
             while True:
                 if nxt is None:
                     nxt = asyncio.ensure_future(messages.__anext__())
@@ -738,8 +754,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     # model is quiet, and an agent that answered and then
                     # called restart would otherwise never be noticed.
                     if restart_requested_flag():
+                        # phase=idle: noticed with NO message arriving. The
+                        # other path (phase absent, below) is noticed while
+                        # handling a message. They are different evidence for
+                        # the life-end record and must not be merged.
                         log.log("restart-called", phase="idle")
                         nxt.cancel()
+                        nxt = None
+                        death_phase = "idle"
                         raise Death()
                     continue
                 try:
@@ -749,7 +771,8 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     break   # the session genuinely closed
                 nxt = None
                 if restart_requested_flag():  # agent called the restart tool
-                    log.log("restart-called")
+                    log.log("restart-called", phase="after-message")
+                    death_phase = "after-message"
                     raise Death()
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
@@ -801,6 +824,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 pass
         finally:
             tasks = [feed, watcher, chat, restart_watch] + ([human] if human else [])
+            if nxt is not None:
+                # The pending __anext__ task: cancelling it closes the async
+                # generator. Without this, a non-standard exit leaks it and
+                # the next life shares this life's stream.
+                tasks.append(nxt)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -817,6 +845,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         LifeLog(life_id).log(
             "life-end",
             slept=bool(restart_requested),
+            death_phase=death_phase,
             result=saw_result,
             session_file_left=session_left,
             # agent-9: existence is nearly free of information -- on a box
