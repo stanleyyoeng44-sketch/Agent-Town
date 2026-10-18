@@ -113,6 +113,36 @@ def load_mcp_servers():
     return data.get("servers", data)
 
 
+def peers_present() -> int:
+    """How many other agents have a mailbox directory. Cheap, no bank call."""
+    try:
+        return sum(1 for d in os.listdir(MAILBOX)
+                   if os.path.isdir(os.path.join(MAILBOX, d))
+                   and d != AGENT_NAME)
+    except OSError:
+        return 0
+
+
+def log_idle_proof(log, why: str, pending: int = 0) -> None:
+    """Write ONE transcript line proving this life is alive and waiting.
+
+    Stanley's defect: a restarted agent "will not have any response unless
+    someone messages it". The cause is not a crash -- prompt_stream() feeds the
+    model the opening message and then blocks on an empty inbox, and a model
+    with nothing to do writes nothing, so the transcript contains only `birth`
+    and the UI has nothing to show. The process is fine; the evidence is
+    missing.
+
+    This is evidence, not behaviour: a transcript line, no model turn, no
+    tokens, no new wire format, nothing the agent can observe. It is written at
+    three points -- when the life starts, whenever the agent finishes a run and
+    goes quiet, and when the context watcher wakes up -- so ANY of the three
+    readers of the transcript (UI, viewer, a human with `cat`) sees a live
+    agent without having to talk to it.
+    """
+    log.log("idle", why=why, peers=peers_present(), pending=pending)
+
+
 def sdk_session_records() -> str:
     """Where the CLI stores a session's records for this cwd.
 
@@ -389,6 +419,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
 
     options = build_options(cfg, life_id)
     resumed = getattr(options, "resume", None) is not None
+    # The delivery queue is module state. Anything left in it belongs to the
+    # previous life (its consumer is gone); carrying it into this one would
+    # deliver stale text as this life's opening turn. prompt_stream() drains
+    # whatever the poll loops queue from NOW ON.
+    pending_delivery.clear()
 
     restart_requested = False
     notice_sent = False
@@ -400,30 +435,42 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         # wake framing would corrupt it, so the stream starts empty and the
         # CLI replays history on its own.
         async def prompt_stream():
-            if not resumed:
+            # THE STREAM MUST YIELD ONCE AT START-UP, IN EVERY CASE.
+            # A streaming prompt that yields nothing produces no model turn,
+            # and the agent is silent until somebody happens to message it --
+            # Stanley's defect 3. Two ways that used to happen:
+            #   * a resumed session yielded nothing (context is replayed, but
+            #     nothing asks the model to act), and
+            #   * mail queued in `pending_delivery` BEFORE the stream started
+            #     made the old `elif not pending_delivery` skip the kick, while
+            #     the queue is only drained by a "__kick__" marker -- so those
+            #     items waited forever and the first yield never came.
+            # Now: deliver anything already queued, and if there is still
+            # nothing to say, send one harness note. Exactly one turn either
+            # way.
+            prequeued = drain_pending_delivery()
+            if prequeued:
+                yield {"type": "user",
+                       "message": {"role": "user", "content":
+                                   "<system-reminder>\n" + prequeued +
+                                   "\n</system-reminder>"}}
+            elif not resumed:
                 yield {"type": "user",
                        "message": {"role": "user", "content": opening_message(wake_prompt)}}
-            elif not pending_delivery:
-                # RESUMED life: the CLI replays the conversation and then
-                # waits for a user turn. The operator has not sent anything
-                # (a restart is exactly when nobody is talking to it), so the
-                # stream would never yield and the session would emit
-                # nothing until a peer messaged it. Kick once, with a
-                # harness note that is NOT the wake framing (that would
-                # duplicate history). If mail is already queued, the normal
-                # delivery path below carries it instead.
-                # STATE ONLY WHAT IS KNOWN. The daemon knows that a stored
-                # session id was found and resumed. It does NOT know why the
-                # previous life ended: a crash, a docker stop, a life that
-                # completed without calling the restart tool, and a resume of
-                # an already-finished session are all indistinguishable here
-                # (verified live: an old image resumed a session that had
-                # returned result=success, and told the model 'the container
-                # restarted' when PID 1 proved it had not).
-                #
-                # A note that names a cause it never checked is the same class
-                # of defect as a comment that claims behaviour the code does
-                # not have. So this note states the resume and nothing more.
+            else:
+                # RESUMED, nothing queued: the CLI replays the conversation
+                # and then waits for a user turn. Kick once with a harness
+                # note that is NOT the wake framing (that would duplicate
+                # history).
+                # STATE ONLY WHAT IS KNOWN. The daemon knows a stored session
+                # id was found and resumed. It does NOT know why the previous
+                # life ended: a crash, a docker stop, a completed session, and
+                # a resume of an already-finished session are indistinguishable
+                # here (verified live: an old image resumed a session that had
+                # returned result=success and told the model 'the container
+                # restarted' when PID 1 proved it had not). A note that names
+                # a cause it never checked is the same defect class as a
+                # comment that claims behaviour the code lacks.
                 yield {"type": "user",
                        "message": {"role": "user", "content":
                                    "<system-reminder>\nA previous session "
@@ -452,6 +499,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                                "message": {"role": "user", "content":
                                            "<system-reminder>\n" + combined +
                                            "\n</system-reminder>"}}
+                    else:
+                        # A kick with nothing left to deliver means the agent
+                        # just finished a run and is waiting again. That is the
+                        # exact moment the transcript used to go silent.
+                        log_idle_proof(log, "after-run")
                     continue
                 yield {"type": "user",
                         "message": {"role": "user", "content": item}}
@@ -556,6 +608,14 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         try:
             # Start the life: feed the streaming prompt (opening message +
             # tasks), and consume the agent's messages.
+            #
+            # Emit proof of life from the LIFE BODY, not from inside
+            # prompt_stream. A generator only runs when the model pulls from
+            # it, so a log line inside it is hostage to the model doing
+            # something -- and "the model did nothing" is precisely the state
+            # we are trying to make visible.
+            log_idle_proof(log, "started")
+
             send_task = asyncio.create_task(client.query(prompt_stream()))
 
             async for message in client.receive_response():
