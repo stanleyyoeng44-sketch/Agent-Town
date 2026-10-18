@@ -197,7 +197,8 @@ does.
 
 **Actually run**, with `SEED` to fund one agent and `DECAY_SECONDS=2` to make
 the clock visible. The banner and every response below are copied from that
-run:
+run (replayed and re-verified against `bank/bank.py` at master `1b95b8d`; the
+only edit is `<float>` for the ledger timestamp, which cannot reproduce):
 
 ```
 $ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py
@@ -212,7 +213,7 @@ $ curl -s localhost:8941/balance/agent-2
 $ curl -s -X POST -d '{"from":"agent-2","to":"agent-3","amount":7}' localhost:8941/transfer
 {"ok": true, "money": 991, "recipient": "agent-3", "recipient_balance": 7}
 $ cat accounts.json
-{"accounts": {"agent-2": 991, "agent-3": 7}, "last_decay": 1792329264.5666666}
+{"accounts": {"agent-2": 991, "agent-3": 7}, "last_decay": <float>}
 ```
 
 Note the two lines that show the rule holding. `agent-3` received **7**, not
@@ -223,7 +224,7 @@ balance. And the mint attempt on the same live bank is refused outright:
 $ curl -s localhost:8941/balance/ghost-x
 {"agent": "ghost-x", "money": 0, "exists": false}
 $ curl -s -X POST -d '{"from":"ghost-x","to":"agent-3","amount":1000}' localhost:8941/transfer
-{"error": "insufficient funds", "money": 0}
+{"error": "unknown sender"}
 ```
 
 ## The agent's tools
