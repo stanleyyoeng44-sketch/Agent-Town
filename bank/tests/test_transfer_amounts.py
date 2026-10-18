@@ -115,11 +115,11 @@ def build(fixed, seed=""):
         # grant checks could not see: it created-and-funded a row while
         # honestly answering exists=false. Reconstruct it too, or A2's
         # calibration passes against a bank that never had the defect.
-        fixed_read = ("                existed = name in _accounts\n"
+        fixed_read = ("                exists = name in _accounts\n"
                       "                balance = _accounts.get(name, 0)\n"
                       "                if ticks:\n")
         broken_read = ("                balance, created = ensure_account(name)\n"
-                       "                existed = not created\n"
+                       "                exists = not created\n"
                        "                if ticks or created:\n")
         assert fixed_read in src, ("GET /balance read path anchor missing -- "
                                    "the pre-fix reconstruction would not run")
