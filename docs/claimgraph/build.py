@@ -374,14 +374,25 @@ def selftest():
     after = open(tmp_readme, encoding="utf-8").read()
     checks.append(("M3 sync rewrites a stale claims number",
                    changed and f'| claims | {stale_st["claims"]} |' in after))
-    # ...and the committed README is already in sync with the REAL stats.
-    # Extract the block ACTUALLY in the committed README and compare it to the
-    # table this run would generate. (An earlier version of this check
-    # compared base_readme to itself after a no-op replace -- it could never
-    # fail. The control for a drift check must be a real drift.)
+    # ...and the committed README agrees with the COMMITTED ARTIFACT, not with
+    # the live store.
+    #
+    # I got this wrong first. I asserted the committed README table equals the
+    # table generated from /shared/claims RIGHT NOW. That is unachievable: the
+    # store is shared and grows while you work, so the check goes red the
+    # moment anyone files a claim -- and a gate that is permanently red gets
+    # deleted, not fixed (agent-0's review, and the C5 coverage-threshold
+    # lesson agent-10 and agent-4 already settled). A doc check must compare
+    # the doc to the artifact it ships with; staleness against the LIVE store
+    # is a separate, non-fatal warning (see store_status below).
     committed = base_readme.split(README_START, 1)[1].split(README_END, 1)[0]
-    checks.append(("M3 committed README table equals generated table",
-                   committed.strip() == stats_markdown(st0).strip()))
+    committed_graph = json.load(open(os.path.join(HERE, "graph.json")))
+    checks.append(
+        ("M3 committed README table equals committed graph.json",
+         committed.strip() == stats_markdown(committed_graph["stats"]).strip()))
+    checks.append(
+        ("M3 committed graph.json parses and has a store digest",
+         bool(committed_graph.get("store_digest"))))
     checks.append(("M3 live count is claims - superseded - retracted",
                    st0["live"] == st0["claims"] - st0["superseded"]
                    - st0["retracted"] - st0["status"].get("contested", 0)))
@@ -389,6 +400,19 @@ def selftest():
     for name, cond in checks:
         print("  %-42s %s" % (name, "OK" if cond else "FAIL"))
         ok &= bool(cond)
+
+    # STALENESS IS A WARNING, NOT A FAILURE. The committed artifact was built
+    # from some past state of the live store; the store moves. Reporting the
+    # gap is useful; failing on it would make every new claim a red build.
+    # Compare CLAIM COUNTS, not digests: the digest also folds in the event
+    # log, which changes on every note even when no claim was added.
+    committed_digest = committed_graph.get("store_digest")
+    live_st, _ = build(ROOT, os.path.join(tempfile.mkdtemp(), "o"))
+    behind = live_st["claims"] - committed_graph["stats"]["claims"]
+    if behind:
+        print(f"  WARN artifact is from store {committed_digest}, "
+              f"{behind:+d} claim(s) behind the live store -- "
+              f"run build.py to refresh (not a failure)")
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.rmtree(empty, ignore_errors=True)
     print("selftest:", "PASS" if ok else "FAILED")

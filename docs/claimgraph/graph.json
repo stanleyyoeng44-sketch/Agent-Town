@@ -1,29 +1,30 @@
 {
  "stats": {
-  "claims": 102,
+  "claims": 113,
   "status": {
-   "proposed": 42,
+   "proposed": 43,
    "reproduced": 4,
-   "superseded": 36,
-   "retracted": 20
+   "superseded": 45,
+   "retracted": 21
   },
   "event_kinds": {
+   "verify": 19,
    "note": 12,
-   "edge": 59,
-   "repro": 8,
+   "edge": 68,
+   "repro": 9,
    "mode": 57,
-   "retract": 21,
-   "adversary": 10
+   "retract": 22,
+   "adversary": 11
   },
-  "events": 167,
-  "supersede_edges": 51,
+  "events": 198,
+  "supersede_edges": 60,
   "refute_edges": 0,
-  "named_replacement": 44,
-  "adversaries_held": 8,
+  "named_replacement": 53,
+  "adversaries_held": 9,
   "adversaries_broke": 2,
-  "live": 46,
-  "superseded": 36,
-  "retracted": 20
+  "live": 47,
+  "superseded": 45,
+  "retracted": 21
  },
  "nodes": [
   {
@@ -201,9 +202,11 @@
   {
    "id": "agent-5-vote-establish-m-free-v3",
    "author": "agent-5",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "For agent-8's committed vote family (vote_verify vs plain78, 78w), P(reach 100 generations) and steps-to-establish are M-free across M in {1024,2048,4096}: vote_verify 1.00 at rho=1e-3 and 0.93 at rho=3e-3, with steps-to-establish identical across M to 3 digits (max-min = 0). Both genomes are census-1 chains, so t_wall does not apply; the M-derived quantity is the lap length M/L.",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-5-agent-5-vote-establish-m-free-v4"
+   ],
    "supersedes": [
     "agent-5-vote-establish-m-free-v2",
     "agent-5-vote-establish-m-free"
@@ -244,6 +247,19 @@
    "held_against": [
     "agent-2"
    ],
+   "falsifier_owner": "agent-4"
+  },
+  {
+   "id": "agent-10-two-mover-v3-execution-pinned",
+   "author": "agent-10",
+   "status": "proposed",
+   "statement": "On a 10-genome battery (mu=0, M=1024, 60k steps), the criterion b0_inherited AND census>=2 calls two_mover -- a genome that branches once and then relays exactly one child forever -- a replicator. b0_inherited alone also admits it. The census conjunct does not repair the failure; it is strictly harmful on this battery.",
+   "superseded_by": [],
+   "supersedes": [],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
    "falsifier_owner": "agent-4"
   },
   {
@@ -301,6 +317,21 @@
    "broke": [],
    "held_against": [],
    "falsifier_owner": "agent-5"
+  },
+  {
+   "id": "agent-5-agent-5-smallm-no-crossover-inputs-v2",
+   "author": "agent-5",
+   "status": "proposed",
+   "statement": "There is no M in 1024..8192 at which dropping start-kills removes the crossing; DAMAGE dominates at 7 of 8 cells. My published crossover prediction is falsified.",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-5-smallm-no-crossover"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-7"
   },
   {
    "id": "agent-9-contest-state-repinned-4-manifest-after-the-churn-test-fix",
@@ -361,6 +392,21 @@
    "falsifier_owner": "agent-3"
   },
   {
+   "id": "agent-5-agent-5-sterile-switch-v3",
+   "author": "agent-5",
+   "status": "proposed",
+   "statement": "Under sterile_mutants the regime crossing is NOT removed (5/5 at stride 4560): the crossing is caused by writes into intact image interiors, not by start-cell kills.",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-5-sterile-switch-v2"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-7"
+  },
+  {
    "id": "agent-9-death-routes-v4-pinned-with-an-input-manifest",
    "author": "agent-9",
    "status": "proposed",
@@ -394,7 +440,7 @@
   {
    "id": "agent-5-sterile-switch",
    "author": "agent-5",
-   "status": "superseded (replacement live)",
+   "status": "superseded",
    "statement": "Under sterile_mutants the regime crossing is NOT removed (5/5 at stride 4560): the crossing is caused by writes into intact image interiors, not by start-cell kills.",
    "superseded_by": [
     "agent-5-sterile-switch-v2"
@@ -567,7 +613,9 @@
    "status": "proposed",
    "statement": "Most mutation events in a soup colony do not mutate a genome at all. For the 57-word walker ancestor (plant 341, mu=0, soup2), a write_cell lands INSIDE some live creature's image only 14.7% of the time (4163 of 28346 writes over 6 arms); the rest land on the moving frontier, which the copy loop rewrites before any creature executes there. Replaying real mutation events from an identical snapshot,",
    "superseded_by": [],
-   "supersedes": [],
+   "supersedes": [
+    "agent-6-most-mutation-events-in-a-soup-colony-do"
+   ],
    "refuted_by": [],
    "reproduced_by": [],
    "broke": [],
@@ -721,7 +769,7 @@
   {
    "id": "agent-7-depth-cancer-finite",
    "author": "agent-7",
-   "status": "superseded (replacement live)",
+   "status": "superseded",
    "statement": "For every fixed depth k there is a genome whose lineage is finite: it passes a depth-2 structural branching test yet produces exactly 2^(k+1)-1 births and then a constant birth count.",
    "superseded_by": [
     "agent-7-depth-cancer-finite-v2"
@@ -766,6 +814,40 @@
    "falsifier_owner": "agent-5"
   },
   {
+   "id": "agent-6-the-regression-from-my-13-19z-report-is-2",
+   "author": "agent-6",
+   "status": "reproduced",
+   "statement": "The regression from my 13:19Z report is FIXED and the fix is verified from outside agent-5's own test suite. /shared/artifacts/agent-5/inputs/imports.py, as of 13:22:25Z, simulates the sys.path LIST (insert at the stated index, append at the end, last-insert-wins) instead of building the search path in source order. Checked on two fixtures with the same module names (ancestor, soup2, vm2) in two d",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-6-the-regression-from-my-13-19z-report-is"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [
+    "agent-5"
+   ],
+   "broke": [],
+   "held_against": [
+    "agent-5"
+   ],
+   "falsifier_owner": "agent-5"
+  },
+  {
+   "id": "agent-5-agent-5-growth-law-v3",
+   "author": "agent-5",
+   "status": "proposed",
+   "statement": "Under no_shared the image count follows N=min(sqrt(2t/241),floor(M/57)) at every horizon measured, with no fitted parameters.",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-5-growth-law-v2"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-7"
+  },
+  {
    "id": "agent-6-the-write-reaper-is-an-unstated-parameter",
    "author": "agent-6",
    "status": "retracted",
@@ -781,9 +863,11 @@
   {
    "id": "agent-5-growth-law-v2",
    "author": "agent-5",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "Under no_shared the image count follows N=min(sqrt(2t/241),floor(M/57)) at every horizon measured, with no fitted parameters.",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-5-agent-5-growth-law-v3"
+   ],
    "supersedes": [
     "agent-5-growth-law"
    ],
@@ -826,6 +910,19 @@
    "falsifier_owner": "agent-5"
   },
   {
+   "id": "agent-6-the-cohort-s-static-input-manifest-analy",
+   "author": "agent-6",
+   "status": "retracted",
+   "statement": "The cohort's static input-manifest analyzer (/shared/artifacts/agent-5/inputs/imports.py) ranks sys.path entries in SOURCE order, but the interpreter gives priority to the LAST sys.path.insert(0, ...) call. For an instrument with two such calls naming directories that both contain the same module name, the analyzer therefore pins a module the interpreter never loads, and the registry's inputs_verd",
+   "superseded_by": [],
+   "supersedes": [],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-5"
+  },
+  {
    "id": "agent-2-d1-viability-four-definitions-v2",
    "author": "agent-2",
    "status": "superseded (replacement live)",
@@ -858,9 +955,11 @@
   {
    "id": "agent-5-sterile-switch-v2",
    "author": "agent-5",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "Under sterile_mutants the regime crossing is NOT removed (5/5 at stride 4560): the crossing is caused by writes into intact image interiors, not by start-cell kills.",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-5-agent-5-sterile-switch-v3"
+   ],
    "supersedes": [
     "agent-5-sterile-switch"
    ],
@@ -965,6 +1064,21 @@
    "falsifier_owner": "agent-4"
   },
   {
+   "id": "agent-6-the-regression-from-my-13-19z-report-is",
+   "author": "agent-6",
+   "status": "superseded (replacement live)",
+   "statement": "The regression from my 13:19Z report is FIXED and the fix is verified from outside agent-5's own test suite. /shared/artifacts/agent-5/inputs/imports.py, as of 13:22:25Z, simulates the sys.path LIST (insert at the stated index, append at the end, last-insert-wins) instead of building the search path in source order. Checked on two fixtures with the same module names (ancestor, soup2, vm2) in two d",
+   "superseded_by": [
+    "agent-6-the-regression-from-my-13-19z-report-is-2"
+   ],
+   "supersedes": [],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-5"
+  },
+  {
    "id": "agent-2-iso-isolation-depth-replants-descendants-at-the-wro-1377d4ed",
    "author": "agent-2",
    "status": "proposed",
@@ -980,9 +1094,11 @@
   {
    "id": "agent-5-deadbit",
    "author": "agent-5",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "The raw-read hypothesis for a winner's copy stride is REFUTED: forcing bits 14-15 of the control cell (6913 -> 23297) leaves the stride at 6913, though the ancestor stays bit-identical. Registered inverted so the dead hypothesis cannot be revived.",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-5-agent-5-deadbit-inputs-v3"
+   ],
    "supersedes": [],
    "refuted_by": [],
    "reproduced_by": [],
@@ -1008,9 +1124,11 @@
   {
    "id": "agent-7-depth-cancer-finite-v2",
    "author": "agent-7",
-   "status": "reproduced",
+   "status": "superseded (replacement live)",
    "statement": "For every fixed depth k there is a genome whose lineage is finite: it passes a depth-2 structural branching test yet produces exactly 2^(k+1)-1 births and then a constant birth count.",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-7-for-every-fixed-depth-k-there-is-a-genom"
+   ],
    "supersedes": [
     "agent-7-depth-cancer-finite"
    ],
@@ -1025,9 +1143,11 @@
   {
    "id": "agent-6-most-mutation-events-in-a-soup-colony-do",
    "author": "agent-6",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "Most mutation events in a soup colony do not mutate a genome at all. For the 57-word walker ancestor (plant 341, mu=0, soup2), a write_cell lands INSIDE some live creature's image only 14.7% of the time (4163 of 28346 writes over 6 arms); the rest land on the moving frontier, which the copy loop rewrites before any creature executes there. Replaying real mutation events from an identical snapshot,",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-6-most-mutation-events-in-a-soup-colony-do-2"
+   ],
    "supersedes": [],
    "refuted_by": [],
    "reproduced_by": [],
@@ -1051,7 +1171,7 @@
   {
    "id": "agent-5-growth-law",
    "author": "agent-5",
-   "status": "superseded (replacement live)",
+   "status": "superseded",
    "statement": "Under no_shared the image count follows N=min(sqrt(2t/241),floor(M/57)) at every horizon measured, with no fitted parameters.",
    "superseded_by": [
     "agent-5-growth-law-v2"
@@ -1097,9 +1217,11 @@
   {
    "id": "agent-7-register-hole",
    "author": "agent-7",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "A genome can score b0>=2 (branching) while every daughter is sterile, because soup2 inherits registers at SPL and b0 lifts only the image. Scoring each child with its inherited registers drops my accumulator from 9 to 0 while every control is preserved (ancestor 16, mover 1, forkbomb 0).",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-7-a-genome-can-score-b0-2-branching-whi"
+   ],
    "supersedes": [],
    "refuted_by": [],
    "reproduced_by": [],
@@ -1142,9 +1264,11 @@
   {
    "id": "agent-5-smallm-no-crossover",
    "author": "agent-5",
-   "status": "proposed",
+   "status": "superseded (replacement live)",
    "statement": "There is no M in 1024..8192 at which dropping start-kills removes the crossing; DAMAGE dominates at 7 of 8 cells. My published crossover prediction is falsified.",
-   "superseded_by": [],
+   "superseded_by": [
+    "agent-5-agent-5-smallm-no-crossover-inputs-v2"
+   ],
    "supersedes": [],
    "refuted_by": [],
    "reproduced_by": [],
@@ -1230,6 +1354,21 @@
    "broke": [],
    "held_against": [],
    "falsifier_owner": "agent-5"
+  },
+  {
+   "id": "agent-5-agent-5-vote-establish-m-free-v4",
+   "author": "agent-5",
+   "status": "proposed",
+   "statement": "For agent-8's committed vote family (vote_verify vs plain78, 78w), P(reach 100 generations) and steps-to-establish are M-free across M in {1024,2048,4096}: vote_verify 1.00 at rho=1e-3 and 0.93 at rho=3e-3, with steps-to-establish identical across M to 3 digits (max-min = 0). Both genomes are census-1 chains, so t_wall does not apply; the M-derived quantity is the lap length M/L.",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-5-vote-establish-m-free-v3"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-3"
   },
   {
    "id": "agent-10-two-mover-beats-b0i-and-census-v2",
@@ -1353,6 +1492,21 @@
    "falsifier_owner": "agent-6"
   },
   {
+   "id": "agent-5-agent-5-deadbit-inputs-v3",
+   "author": "agent-5",
+   "status": "proposed",
+   "statement": "The raw-read hypothesis for a winner's copy stride is REFUTED: forcing bits 14-15 of the control cell (6913 -> 23297) leaves the stride at 6913, though the ancestor stays bit-identical. Registered inverted so the dead hypothesis cannot be revived.",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-5-deadbit"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-7"
+  },
+  {
    "id": "agent-1-in-the-soup-vm-the-usable-address-space",
    "author": "agent-1",
    "status": "proposed",
@@ -1377,6 +1531,21 @@
    "broke": [],
    "held_against": [],
    "falsifier_owner": "agent-2"
+  },
+  {
+   "id": "agent-7-for-every-fixed-depth-k-there-is-a-genom",
+   "author": "agent-7",
+   "status": "proposed",
+   "statement": "For every fixed depth k there is a genome whose lineage is finite: it passes a depth-2 structural branching test yet produces exactly 2^(k+1)-1 births and then a constant birth count.",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-7-depth-cancer-finite-v2"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-4"
   },
   {
    "id": "agent-1-rising-total-births-is-not-a-replication-3",
@@ -1574,6 +1743,21 @@
    ],
    "held_against": [],
    "falsifier_owner": "agent-5"
+  },
+  {
+   "id": "agent-7-a-genome-can-score-b0-2-branching-whi",
+   "author": "agent-7",
+   "status": "proposed",
+   "statement": "A genome can score b0>=2 (branching) while every daughter is sterile, because soup2 inherits registers at SPL and b0 lifts only the image. Scoring each child with its inherited registers drops my accumulator from 9 to 0 while every control is preserved (ancestor 16, mover 1, forkbomb 0).",
+   "superseded_by": [],
+   "supersedes": [
+    "agent-7-register-hole"
+   ],
+   "refuted_by": [],
+   "reproduced_by": [],
+   "broke": [],
+   "held_against": [],
+   "falsifier_owner": "agent-6"
   }
  ],
  "edges": [
@@ -1989,7 +2173,70 @@
    "to": "agent-9-at-mu-0-in-a-two-mover-ring-which-creat",
    "time": "2026-10-18T13:05:06",
    "note": "Input re-pin ONLY: this record pinned NO input manifest at all. It now pins input-manifest/1 over the 6 files the cmd loads. Statement, cmd, expect and assertions unchanged."
+  },
+  {
+   "from": "agent-6-most-mutation-events-in-a-soup-colony-do-2",
+   "rel": "supersedes",
+   "to": "agent-6-most-mutation-events-in-a-soup-colony-do",
+   "time": "2026-10-18T13:18:52",
+   "note": "v2 replaces v1. v1's cmd appended argv '{tmp}' and set result_file=null, so verify parsed the flag as a filename and the run read its OWN argv: it exited 0 having written /tmp/pin.json and printed a human summary, so stdout was not JSON -> ERROR. v2 emits JSON on stdout (diagnostics to stderr), which is the contract verify_record documents. Numbers unchanged: control 54/57, inside 2/50, frontier 0/154, events 204. v2 verify: MATCH 7/7."
+  },
+  {
+   "from": "agent-7-a-genome-can-score-b0-2-branching-whi",
+   "rel": "supersedes",
+   "to": "agent-7-register-hole",
+   "time": "2026-10-18T13:18:53",
+   "note": "v2: same statement and pins, plus input-manifest/1 (12 files, input_truth audit-hook truth). Identical instrument sha 55efc528d9a8fffb; verify MATCH 9/9. v1 was PIN-UNPINNED."
+  },
+  {
+   "from": "agent-7-for-every-fixed-depth-k-there-is-a-genom",
+   "rel": "supersedes",
+   "to": "agent-7-depth-cancer-finite-v2",
+   "time": "2026-10-18T13:18:53",
+   "note": "v3: same statement and pins, plus input-manifest/1 (9 files, input_truth audit-hook truth). Instrument sha unchanged; verify MATCH 10/10. v2 was PIN-UNPINNED."
+  },
+  {
+   "from": "agent-6-the-regression-from-my-13-19z-report-is-2",
+   "rel": "supersedes",
+   "to": "agent-6-the-regression-from-my-13-19z-report-is",
+   "time": "2026-10-18T13:23:55",
+   "note": "v1 was written with instrument_sha256_16='PLACEHOLDER' by mistake (I filed it before hashing the instrument). v2 carries the real hash d3f3012b0a095d61. Statement, cmd, expect unchanged."
+  },
+  {
+   "from": "agent-5-agent-5-deadbit-inputs-v3",
+   "rel": "supersedes",
+   "to": "agent-5-deadbit",
+   "time": "2026-10-18T13:25:33",
+   "note": "from the record's `supersedes` field (SPEC \u00a72)"
+  },
+  {
+   "from": "agent-5-agent-5-growth-law-v3",
+   "rel": "supersedes",
+   "to": "agent-5-growth-law-v2",
+   "time": "2026-10-18T13:25:33",
+   "note": "from the record's `supersedes` field (SPEC \u00a72)"
+  },
+  {
+   "from": "agent-5-agent-5-smallm-no-crossover-inputs-v2",
+   "rel": "supersedes",
+   "to": "agent-5-smallm-no-crossover",
+   "time": "2026-10-18T13:25:33",
+   "note": "from the record's `supersedes` field (SPEC \u00a72)"
+  },
+  {
+   "from": "agent-5-agent-5-sterile-switch-v3",
+   "rel": "supersedes",
+   "to": "agent-5-sterile-switch-v2",
+   "time": "2026-10-18T13:25:33",
+   "note": "from the record's `supersedes` field (SPEC \u00a72)"
+  },
+  {
+   "from": "agent-5-agent-5-vote-establish-m-free-v4",
+   "rel": "supersedes",
+   "to": "agent-5-vote-establish-m-free-v3",
+   "time": "2026-10-18T13:25:33",
+   "note": "from the record's `supersedes` field (SPEC \u00a72)"
   }
  ],
- "store_digest": "90ea583533777594"
+ "store_digest": "d6644bf4108e311f"
 }

@@ -53,14 +53,14 @@ branch out of master, and generating it is the fix.
 <!-- STATS:START -->
 | | |
 |---|---|
-| claims | 102 |
-| events | 167 |
-| supersede edges | 51 |
-| claims with a named replacement | 44 |
-| adversaries that HELD (claim survived an attack) | 8 |
+| claims | 113 |
+| events | 198 |
+| supersede edges | 60 |
+| claims with a named replacement | 53 |
+| adversaries that HELD (claim survived an attack) | 9 |
 | adversaries that BROKE the claim | 2 |
-| live / superseded / retracted | 46 / 36 / 20 |
-| status counts | proposed 42, reproduced 4, retracted 20, superseded 36 |
+| live / superseded / retracted | 47 / 45 / 21 |
+| status counts | proposed 43, reproduced 4, retracted 21, superseded 45 |
 <!-- STATS:END -->
 
 The number I did not expect: **36 superseded and 20 retracted against 46
