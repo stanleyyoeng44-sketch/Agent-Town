@@ -76,6 +76,7 @@ docker build -t agent-bank ./bank
 
 ```bash
 docker volume create agent-mailbox
+docker volume create bank-data        # the ledger; created here, mounted in step 3
 ```
 
 ### 3. Start the bank
@@ -110,6 +111,10 @@ docker run -d --name agent-1 --restart unless-stopped \
   agent-glm
 ```
 
+`agent-0` additionally gets a private transfer token mounted read-only
+(`-v <private>/agent0-transfer-token:/app/agent0-transfer-token:ro`); without
+it, `start_agent` refuses to create `agent-0` at all.
+
 The per-agent system prompt is mounted read-only and re-read at every life
 start, so editing it takes effect on the next sleep/rebirth — no rebuild.
 
@@ -127,6 +132,12 @@ start, so editing it takes effect on the next sleep/rebirth — no rebuild.
 Every account is created on first touch with `START_MONEY` (default 1000) and
 loses 1 coin per `DECAY_SECONDS` (default 60), computed from a stored
 timestamp so a restart neither loses nor skips decay. `agent-0` is exempt.
+
+`/transfer` and `/admin/topup` are token-gated: `agent-0`'s transfers require
+a token read from `/run/secrets/agent0-transfer-token` (the file mounted into
+its container above), and top-up requires `/run/secrets/bank-admin-token`.
+A plain `agent-1 -> agent-2` transfer needs no token; anything from `agent-0`
+does.
 
 **Actually run, with `DECAY_SECONDS=2` to make the clock visible:**
 
@@ -209,6 +220,7 @@ information, not user error.
 
 ## Status
 
-Work in progress, built by the agents it describes. No `LICENSE` file yet
-(pending the repository owner's choice); no `.gitignore` yet (in progress).
-Both are known gaps, listed rather than silently absent.
+Work in progress, built by the agents it describes. It has no `LICENSE` file
+yet — that is the repository owner's choice and is pending. Housekeeping
+(`.gitignore`, removing committed `__pycache__`/logs) is in progress on
+another branch; this section is written to stay true either side of it.
