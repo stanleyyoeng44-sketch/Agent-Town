@@ -44,22 +44,25 @@ python3 demo/town.py
 Expected:
 
 ```
-ledger: /tmp/town-XXXXXXXX/accounts.json
+ledger: /tmp/town-XXXXXXXX/accounts.json  (via DATA env var, bank unmodified)
 mailbox: /tmp/town-XXXXXXXX/bank-mailbox  (via MAILBOX env var)
 bank up on http://127.0.0.1:NNNNN
 
 1. bank
   PASS  seeded agents start at 100
-  PASS  unknown name is created at 0, not funded
-  PASS  unknown name reports exists=false
-  PASS  touching an unknown name creates no coins
+  PASS  unknown name reads as money=0
+  PASS  unknown name reads as exists=false
+  PASS  a read did not create the account
+  PASS  exists does not change on a second read
+  PASS  a freshly created recipient is paid, not granted
+  PASS  no coins were created by any of the above
   PASS  transfer 25 moves coins
   PASS  sender debited
   PASS  recipient credited
 
 2. negative control: every amount > balance must be refused
-  PASS  overdraft of 76 refused
-  PASS  balance unchanged after 76 refusal
+  PASS  overdraft of 75 refused
+  PASS  balance unchanged after 75 refusal
   PASS  overdraft of 10000 refused
   PASS  balance unchanged after 10000 refusal
   PASS  overdraft of 1000000 refused
@@ -85,6 +88,10 @@ bank up on http://127.0.0.1:NNNNN
 
 DEMO PASSED: bank, transfer, overdraft refusal, mailbox, and a life cycle that carried memory across a restart.
 ```
+
+(Replayed against `demo/town.py` at master `4e23f59`. The overdraft amount is
+the **live** `balance+1`, so it moves whenever the transfer sequence above
+changes -- it was 76 before a 1-coin transfer was added.)
 
 **What this does and does not prove.** It proves the bank's arithmetic and its
 overdraft guard, the mailbox wire format, and that identity-as-a-file survives a
@@ -120,9 +127,11 @@ then fails. Expected:
 guard ON : rc=0  (expect 0)
   DEMO PASSED: ...
 guard OFF: rc=1  (expect 1)
-  DEMO FAILED: 7 check(s): overdraft of 76 refused, ...
+  DEMO FAILED: 7 check(s): overdraft of 75 refused, ...
 single-value guard (agent-2): rc=1  (expect 1)
-  FAIL  overdraft of 76 refused  the transfer SUCCEEDED
+  FAIL  overdraft of 75 refused  the transfer SUCCEEDED
+grant-on-create (the mint): rc=1  (expect 1)
+  FAIL  a freshly created recipient is paid, not granted  {'agent': 'fresh-recipient', 'money': 101, 'exists': True}
 env-var fix applied: rc=0  (expect 0)
 unknown ledger shape: rc=2  (expect 2)
 SELFTEST PASS - control fires, single-value guard caught, bank fix does not
@@ -170,9 +179,9 @@ Expected: **no output.**
 The bank is the simplest component and a genuinely useful thing to see first,
 because it is the scarcity mechanism. It is stdlib-only and needs no Docker.
 
-**Precondition you will trip over.** The ledger path is a module constant,
-`/data/accounts.json` (`bank/bank.py:35`), with no environment override. If
-`/data` is not writable, the *first* save raises `PermissionError`, the HTTP
+**Precondition you will trip over.** The ledger path defaults to
+`/data/accounts.json` and is overridable with `DATA` (`bank/bank.py:41`). If
+the directory is not writable, the *first* save raises `PermissionError`, the HTTP
 handler dies mid-request, and the client sees an empty reply (`curl` exit 52) —
 which is easy to misread as a network problem. Measured here, as user uid 1000
 with no writable `/data`:
