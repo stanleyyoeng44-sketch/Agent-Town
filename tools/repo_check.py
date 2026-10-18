@@ -25,6 +25,11 @@ Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
 CONTROL per check: it builds a deliberately bad tree and asserts the check
 FAILS on it. A check that has never failed is not a check -- that is the
 whole rule this cohort spent the day learning, and the repo is no exception.
+  RUN INSIDE A GIT TREE. C1/C2/C3/C5 read `git ls-files`; a `git archive`
+  export (or a bare directory) has no .git and every one of those checks
+  reports "git ls-files exit 128" -- four FAILs that look like defects and are
+  a missing repository. `git init && git add -A && git commit -qm x` makes such
+  a tree checkable. This is not a repo defect and the output now says so.
 """
 import ast
 import os
@@ -503,9 +508,29 @@ CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import]
 
 
+def _is_git_tree(root):
+    r = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
 def run(root="."):
     """Tri-state: PASS / WARN / FAIL. Only FAIL fails the build; WARN is
     printed every run. A check that cannot see is never allowed to be silent."""
+    # ONE FACT, REPORTED ONCE. C1/C2/C3/C5 all read `git ls-files`; without a
+    # repository each raises and prints "check crashed" -- four FAILs that read
+    # as four defects in the repo, when the only fact is that there is no .git
+    # (a `git archive` export, a copied tree). Name the real cause once instead
+    # of letting four checks each report their own confusion. This is the same
+    # rule as C5's skip split: a check reporting its own limitation as an
+    # object defect is the bug.
+    if not _is_git_tree(root):
+        return False, [("check", "FAIL",
+                        [f"{root} is not inside a git work tree, so the checks "
+                         f"that read `git ls-files` cannot see any files. This "
+                         f"is not a defect in the tree's contents: run inside a "
+                         f"clone, or `git init && git add -A && git commit -qm x` "
+                         f"to make an export checkable."])]
     results = []
     for fn in CHECKS:
         try:
@@ -703,6 +728,20 @@ def selftest():
     outcomes.append(("C5 declines to PROBE a command that writes",
                      any("probe declined" in str(x) for x in c5[1])
                      and not os.path.exists(marker)))
+    shutil.rmtree(d)
+
+    # C0: a tree with NO .git must be named as such, ONCE.
+    # Without this, C1/C2/C3/C5 each crash with "git ls-files exit 128" and the
+    # report shows four FAILs -- which reads as four defects in the repo. The
+    # only fact is that there is no repository. agent-7 hit this twice on a
+    # `git archive` export and got it wrong once.
+    d = tempfile.mkdtemp(prefix="rc_nogit_")
+    open(os.path.join(d, "x.py"), "w").write("print(1)\n")
+    ok0, r0 = run(d)
+    outcomes.append(("C0 names a missing .git ONCE instead of four crashes",
+                     (not ok0) and len(r0) == 1
+                     and "not inside a git work tree" in r0[0][2][0]
+                     and "git ls-files exit 128" not in str(r0)))
     shutil.rmtree(d)
 
     # C6: a .py that does not parse
