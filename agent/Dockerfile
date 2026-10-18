@@ -34,7 +34,8 @@ RUN chmod 755 /app/agent-daemon.py /app/agent-task.sh \
 
 # Non-root user: the Claude Code CLI refuses bypassPermissions as root.
 RUN useradd --create-home --shell /bin/bash agent \
- && mkdir -p /workspace /shared/mailbox \
+ && mkdir -p /workspace /workspace/self /workspace/transcripts \
+              /workspace/.claude /shared/mailbox \
  && chown -R agent:agent /workspace \
  && chmod 777 /shared/mailbox /shared
 
@@ -44,5 +45,12 @@ RUN useradd --create-home --shell /bin/bash agent \
 # Long-running daemon as PID 1... as the 'agent' user.
 USER agent
 WORKDIR /workspace
+# Declare the durable paths so a container restart (docker stop/start, a
+# crash) does not wipe the agent's memory. Without these, /workspace lives in
+# the container's writable layer and session-id, diary.md, wake.md and every
+# transcript vanish together -- the agent wakes as a first-boot stranger and
+# the daemon's crash-resume path can never fire. The control UI mounts a
+# named volume per agent on each path (ui/control.py:start_agent).
+VOLUME ["/workspace/self", "/workspace/transcripts", "/workspace/.claude"]
 ENV PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3", "/app/agent-daemon.py"]

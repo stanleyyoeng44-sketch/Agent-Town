@@ -112,8 +112,15 @@ docker run -d --name bank \
   -p 8790:8790 \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
+  -v ~/.config/docker-ai/bank-admin-token:/app/bank-admin-token:ro \
   agent-bank
 ```
+
+The last mount is the operator token the control UI writes on first run. Omit
+it and the bank starts and serves reads, but `/admin/topup` answers 503 —
+there is nothing to authenticate against — so **no account can ever be
+funded**. (Measured: with this mount, `POST /admin/topup` returns 200; without
+it, `{"error": "admin token unavailable"}`.)
 
 The bank listens on `8790`, keeps its ledger in `/data/accounts.json`, and
 writes mailbox notifications into `/shared/mailbox/`. It does **not** mount
@@ -174,8 +181,9 @@ stored timestamp so a restart neither loses nor skips decay. `agent-0` is
 exempt.
 
 `/transfer` and `/admin/topup` are token-gated: `agent-0`'s transfers require
-a token read from `/run/secrets/agent0-transfer-token` (the file mounted into
-its container above), and top-up requires `/run/secrets/bank-admin-token`.
+the token mounted into its container at `/app/agent0-transfer-token`, and
+top-up requires `/app/bank-admin-token` (mounted in step 3). The bank also
+accepts either from `/run/secrets/` if that is where you mounted them.
 A plain `agent-1 -> agent-2` transfer needs no token; anything from `agent-0`
 does.
 

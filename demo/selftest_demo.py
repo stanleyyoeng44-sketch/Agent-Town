@@ -100,12 +100,22 @@ def grant_on_create(src):
     FAIL. If this control ever passes, the demo has stopped testing the
     property the bank exists to guarantee.
     """
-    needle = "    _accounts[name] = 0\n    return 0, True"
-    assert needle in src, ("ensure_account no longer creates at 0 -- this "
-                           "control would be testing nothing")
+    needle = ("    if name in _accounts:\n"
+              "        return _accounts[name], False\n"
+              "    _accounts[name] = 0\n"
+              "    return 0, True\n")
+    assert needle in src, ("ensure_account no longer has the create-at-0 "
+                           "shape -- this control would be testing nothing")
+    # Replace the WHOLE function body. A needle of only its last two lines is
+    # a substring of the FIRST branch too, and grant-on-create would silently
+    # rewrite the lookup branch while leaving creation at 0 -- the mutation
+    # runs, changes the file, and tests nothing. Measured: that exact needle
+    # made the demo PASS while the bank still created at 0.
     return src.replace(needle,
+                       "    if name in _accounts:\n"
+                       "        return _accounts[name], False\n"
                        "    _accounts[name] = START_MONEY\n"
-                       "    return START_MONEY, True")
+                       "    return START_MONEY, True\n")
 
 
 def single_value_guard(src):
