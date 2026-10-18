@@ -248,20 +248,37 @@ def _looks_like_server(body, root="."):
     return False
 
 
+# A probe is executed with shell=True, so the allowlist must reason about the
+# WHOLE LINE, not just the prefix it recognises. These characters can start a
+# second command, substitute one, or redirect output. Any of them means the
+# 'safe' first word says nothing about what the line does:
+#   python3 -c "print(1)" && rm -rf victim      <- deleted a directory
+# The probe declined only the line it could not parse; the shell ran all of it.
+_SHELL_COMPOUND = (";", "&&", "||", "|", "&", "`", "$(", ">", "<", "\n")
+
+
 def _probe_safe(cmd: str) -> bool:
     """Is `cmd` safe to execute twice, for the SKIP probe?
 
-    Deliberately narrow. The probe runs a command a document asked NOT to run,
-    so it must not be able to do damage. Allowed:
-      * `bash -n` / `sh -n`          -- parse only, by definition side-effect free
-      * `python3 -c "..."`           -- only if the snippet imports nothing and
-                                        calls nothing (no open/exec/system/
-                                        remove/rmtree/subprocess/socket)
-      * `test ...` / `[ ... ]`       -- pure predicate
-    Everything else is declined and reported as an honoured SKIP. A declined
-    probe is visible, which is the point: silence is what this change removed.
+    Deliberately narrow, and it must be: the probe runs a command a document
+    asked NOT to run. Allowed:
+      * `bash -n` / `sh -n`        -- parse only, by definition side-effect free
+      * `python3 -c "..."`         -- only a single snippet, no imports, no
+                                      open/exec/system/remove/rmtree/subprocess
+      * `test ...` / `[ ... ]`     -- pure predicate
+    Everything else is declined and reported as an honoured SKIP, which is
+    visible: silence is what this change removed.
+
+    THE BUG THIS GUARD FIXES (found by agent-2 reviewing the first version):
+    the check inspected only the leading command. With shell=True the rest of
+    the line still ran, so `python3 -c "print(1)" && rm -rf victim` passed the
+    allowlist on its first token and then deleted the directory. Demonstrated
+    end to end before the fix. A prefix test is not a statement about a shell
+    line; any compound operator disqualifies the line outright.
     """
     c = cmd.strip()
+    if any(tok in c for tok in _SHELL_COMPOUND):
+        return False
     if c.startswith(("bash -n ", "sh -n ", "test ", "[ ")):
         return True
     if c.startswith(("python3 -c", "python -c")):
@@ -728,6 +745,35 @@ def selftest():
     outcomes.append(("C5 declines to PROBE a command that writes",
                      any("probe declined" in str(x) for x in c5[1])
                      and not os.path.exists(marker)))
+    shutil.rmtree(d)
+
+    # C5e: a SAFE PREFIX with a DESTRUCTIVE TAIL must be declined. C5d uses a
+    # line the allowlist already rejects on its first token (it contains
+    # open()). The hole agent-2 found is different and was live in the first
+    # version of this probe: the first token is allowed, and the shell still
+    # runs everything after it, so
+    #     python3 -c "print(1)" && rm -rf victim
+    # passed the allowlist and deleted the directory during a probe that was
+    # supposed to be side-effect free. A prefix check is not a statement about
+    # a shell line. The control's evidence is the VICTIM DIRECTORY, i.e. a
+    # positive artifact that survives -- not a log line claiming it did.
+    d = farm()
+    victim = os.path.join(d, "victim")
+    os.makedirs(victim)
+    open(os.path.join(victim, "important"), "w").write("x")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\n# SKIP: needs docker\n"
+        "python3 -c \"print(1)\" && rm -rf victim\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "compound skipper")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 will not probe a safe prefix with a shell tail",
+                     os.path.isdir(victim)
+                     and os.path.exists(os.path.join(victim, "important"))
+                     and any("probe declined" in str(x) for x in c5[1])))
     shutil.rmtree(d)
 
     # C0: a tree with NO .git must be named as such, ONCE.
