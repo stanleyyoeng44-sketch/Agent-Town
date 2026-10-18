@@ -63,14 +63,32 @@ print("  " + [l for l in out.splitlines() if "DEMO" in l][-1])
 rc2, out2 = run_demo_with_mutated_bank(False)
 print(f"guard OFF: rc={rc2}  (expect 1)")
 print("  " + [l for l in out2.splitlines() if "DEMO" in l][-1])
+def _data_line_re():
+    """The ledger assignment may be a literal or an os.environ.get(...) call.
+
+    Kept as a REGEX, not a literal replace: once bank.py made DATA configurable
+    (repo-hygiene 025faf1), a literal-only mutation became a no-op and this
+    selftest silently tested the UNMUTATED bank -- it reported rc=0 and the
+    whole selftest failed. A mutation that does not mutate is the same defect
+    class as a control that cannot fail. The regex is anchored on the DATA
+    assignment and the caller asserts the replacement CHANGED the source.
+    """
+    import re
+    return re.compile(r'^DATA = .*$', re.M)
+
+def _mutate_data(src, replacement):
+    rx = _data_line_re()
+    new, n = rx.subn(replacement, src, count=1)
+    assert n == 1, "selftest is stale: no single '^DATA = ...' line in bank.py"
+    assert new != src, "selftest mutation was a NO-OP -- it would test the real bank"
+    return new
+
 def env_fix(src):
-    return src.replace('DATA = "/data/accounts.json"',
-                       'DATA = os.environ.get("BANK_DATA", "/data/accounts.json")')
+    return _mutate_data(src, 'DATA = os.environ.get("BANK_DATA", "/data/accounts.json")  # mutated: env fix')
 
 def unknown_shape(src):
     # neither the literal nor an env read the demo recognises
-    return src.replace('DATA = "/data/accounts.json"',
-                       'DATA = "/srv/x/ledger.json"')
+    return _mutate_data(src, 'DATA = "/srv/x/ledger.json"  # mutated: unknown shape')
 
 def single_value_guard(src):
     """agent-2's attack: refuse overdrafts ONLY at the amount the demo tests.
