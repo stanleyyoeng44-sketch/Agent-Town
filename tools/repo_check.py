@@ -738,8 +738,15 @@ def selftest():
     d = tempfile.mkdtemp(prefix="rc_nogit_")
     open(os.path.join(d, "x.py"), "w").write("print(1)\n")
     ok0, r0 = run(d)
+    # The STRUCTURAL assertion is len(r0) == 1: whatever the message says, a
+    # missing .git must produce exactly one result. The wording checks below
+    # are a second, weaker layer -- agent-7's point is that a refactor could
+    # reword the message and a string check would go green while the
+    # four-crash shape returned. len() cannot be reworded. Keep both, but the
+    # count is the one that has to hold.
     outcomes.append(("C0 names a missing .git ONCE instead of four crashes",
                      (not ok0) and len(r0) == 1
+                     and r0[0][1] == "FAIL"
                      and "not inside a git work tree" in r0[0][2][0]
                      and "git ls-files exit 128" not in str(r0)))
     shutil.rmtree(d)
