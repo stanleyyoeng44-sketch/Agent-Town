@@ -149,21 +149,45 @@ def main():
     port = free_port()
     base = f"http://127.0.0.1:{port}"
 
-    # The bank hardcodes /data; run a patched COPY for the demo so we do not
-    # need root and do not touch a real ledger. The patch is one line and it
-    # is printed below so the reader can see exactly what changed.
+    # The bank's ledger path. Two supported shapes, in order:
+    #   1. bank.py reads the path from an env var (the fix recommended in
+    #      review #1) -> use it, run the file UNMODIFIED. No coupling.
+    #   2. bank.py hardcodes /data/accounts.json -> run a PATCHED COPY so the
+    #      demo needs no root and touches no real ledger.
+    # Anything else fails loudly rather than guessing.
+    #
+    # Shape 1 exists so that fixing the bank does not silently break the demo:
+    # matching only on the hardcoded literal would turn a GOOD change into an
+    # exit-2 failure.
+    env = dict(os.environ, PORT=str(port), START_MONEY="100",
+               DECAY_SECONDS="3600")
     src = open(BANK, encoding="utf-8").read()
-    if 'DATA = "/data/accounts.json"' not in src:
-        say("FAIL: bank.py no longer has the DATA line this demo patches")
+    env_name = None
+    for cand in ("BANK_DATA", "DATA", "LEDGER"):
+        if f'os.environ.get("{cand}"' in src or \
+           f"os.environ.get('{cand}'" in src:
+            env_name = cand
+            break
+    if env_name:
+        bank_copy = os.path.join(work, "bank_demo.py")
+        with open(bank_copy, "w", encoding="utf-8") as f:
+            f.write(src)                       # unmodified
+        env = dict(env, **{env_name: ledger})
+        say(f"ledger: {ledger}  (via {env_name} env var, bank unmodified)")
+    elif 'DATA = "/data/accounts.json"' in src:
+        patched = src.replace('DATA = "/data/accounts.json"',
+                              f'DATA = {ledger!r}')
+        bank_copy = os.path.join(work, "bank_demo.py")
+        with open(bank_copy, "w", encoding="utf-8") as f:
+            f.write(patched)
+        say(f"ledger: {ledger}  (patched copy: DATA constant -> temp path)")
+    else:
+        say("FAIL: bank.py has neither a DATA env override nor the "
+            "hardcoded /data literal this demo knows how to redirect.")
+        say("      Update demo/town.py to match the new ledger configuration; "
+            "do not silently run against /data.")
         return 2
-    patched = src.replace('DATA = "/data/accounts.json"',
-                          f'DATA = {ledger!r}')
-    bank_copy = os.path.join(work, "bank_demo.py")
-    with open(bank_copy, "w", encoding="utf-8") as f:
-        f.write(patched)
-    say(f"ledger: {ledger}")
 
-    env = dict(os.environ, PORT=str(port), START_MONEY="100", DECAY_SECONDS="3600")
     proc = subprocess.Popen([sys.executable, bank_copy], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True)
@@ -199,19 +223,35 @@ def main():
         check("sender debited", r["money"] == 75, str(r))
         check("recipient credited", r["recipient_balance"] == 125, str(r))
 
-        # -- 2. NEGATIVE CONTROL: overdraft must be refused ----------------
+        # -- 2. NEGATIVE CONTROL: the OVERDRAFT INVARIANT, not one value ---
+        # agent-2's attack: a bank that refuses only `amount == 10000` passes a
+        # single-value check. The invariant is "any amount greater than the
+        # balance is refused", so test the BOUNDARY, a value just past it, and
+        # a large one -- and assert no balance can go negative.
         say("")
-        say("2. negative control (this MUST fail to transfer)")
-        try:
-            http("POST", f"{base}/transfer",
-                 {"from": "agent-1", "to": "agent-2", "amount": 10_000})
-            check("overdraft refused", False, "the transfer SUCCEEDED")
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            check("overdraft refused", e.code == 400, f"code {e.code} {body}")
-        after = http("GET", f"{base}/balance/agent-1")
-        check("balance unchanged after refusal", after["money"] == 75,
-              str(after))
+        say("2. negative control: every amount > balance must be refused")
+        floor = http("GET", f"{base}/balance/agent-1")["money"]   # 75
+        attacker = http("GET", f"{base}/balance/agent-2")["money"]
+        for amt in (floor + 1, 10_000, 1_000_000):
+            before = http("GET", f"{base}/balance/agent-1")["money"]
+            refused = False
+            try:
+                http("POST", f"{base}/transfer",
+                     {"from": "agent-1", "to": "agent-2", "amount": amt})
+            except urllib.error.HTTPError as e:
+                refused = e.code == 400
+            after = http("GET", f"{base}/balance/agent-1")["money"]
+            check(f"overdraft of {amt} refused", refused,
+                  "the transfer SUCCEEDED")
+            check(f"balance unchanged after {amt} refusal", after == before,
+                  f"{before} -> {after}")
+        # the invariant, stated directly: no account may be negative
+        accounts = http("GET", f"{base}/accounts")["accounts"]
+        check("no balance went negative",
+              all(v >= 0 for v in accounts.values()), str(accounts))
+        check("no coins were created by a refused transfer",
+              sum(accounts.values()) == 200,
+              f"total={sum(accounts.values())} expected 200 (2 x 100)")
 
         # -- 3. the mailbox is the protocol --------------------------------
         say("")

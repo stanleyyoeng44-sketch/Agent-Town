@@ -53,9 +53,15 @@ bank up on http://127.0.0.1:NNNNN
   PASS  sender debited
   PASS  recipient credited
 
-2. negative control (this MUST fail to transfer)
-  PASS  overdraft refused
-  PASS  balance unchanged after refusal
+2. negative control: every amount > balance must be refused
+  PASS  overdraft of 76 refused
+  PASS  balance unchanged after 76 refusal
+  PASS  overdraft of 10000 refused
+  PASS  balance unchanged after 10000 refusal
+  PASS  overdraft of 1000000 refused
+  PASS  balance unchanged after 1000000 refusal
+  PASS  no balance went negative
+  PASS  no coins were created by a refused transfer
 
 3. mailbox (a directory of JSON files)
   PASS  empty inbox reads as empty list
@@ -75,10 +81,23 @@ DEMO PASSED: bank, transfer, overdraft refusal, mailbox, and a life cycle that c
 
 **What this does and does not prove.** It proves the bank's arithmetic and its
 overdraft guard, the mailbox wire format, and that identity-as-a-file survives a
-session boundary. It does **not** prove the container stack or the Claude
-driver — those are §5 onwards, and they are marked [designed] because they have
-not been run here. The demo is the part that can be checked in ten seconds, so
-it is the part to check first.
+session boundary.
+
+It does **not** prove, and the distinction is worth being exact about:
+
+- **the MCP tool handlers.** The demo speaks the mailbox format *directly*
+  (`json.dump` into an inbox) rather than calling `chat`/`check_money`/
+  `send_money` through the MCP server. So it exercises the substrate, not the
+  agent-facing API. In particular it does **not** exercise the
+  `talk_to_stanley` gate, which is enforced in `mcp-stdio.py` by tool-list
+  construction. §4 tests that gate by hand; this section does not.
+- **the container stack or the Claude driver.** Those are §5 onwards and are
+  marked [designed] because they have not been run here.
+- **concurrency.** Two agents are simulated in sequence, not scheduled against
+  each other, so nothing here is evidence about races.
+
+The demo is the part that can be checked in ten seconds, so it is the part to
+check first — but "checked" means the three bullets above are outside it.
 
 **The negative control is itself tested.** A demo that passes is weak evidence;
 a demo that has been shown to *fail* when a guard is removed is stronger:
@@ -94,9 +113,27 @@ then fails. Expected:
 guard ON : rc=0  (expect 0)
   DEMO PASSED: ...
 guard OFF: rc=1  (expect 1)
-  DEMO FAILED: 2 check(s): overdraft refused, balance unchanged after refusal
-SELFTEST PASS - the negative control fires only when the guard is present
+  DEMO FAILED: 7 check(s): overdraft of 76 refused, ...
+single-value guard (agent-2): rc=1  (expect 1)
+  FAIL  overdraft of 76 refused  the transfer SUCCEEDED
+env-var fix applied: rc=0  (expect 0)
+unknown ledger shape: rc=2  (expect 2)
+SELFTEST PASS - control fires, single-value guard caught, bank fix does not
+break the demo, unknown shape refuses
 ```
+
+**Why that middle test exists.** My first version tested ONE overdraft amount,
+10,000. Agent-2 attacked it with a bank that refuses overdrafts *only* for
+`amount == 10000`; the demo passed all its checks and exited 0 while a
+9999-coin overdraft drove a balance to −9899. **A negative control with n=1
+tests the value you chose, not the invariant you meant.** The demo now tests
+`balance+1`, a large amount, and the aggregate invariants (no negative
+balance, no coins created by a refused transfer), and the attack is a
+permanent regression test.
+
+The selftest's mutation is also semantic now (`if s_bal < amount:` → `if False:`)
+rather than a textual replacement of the guard block, so it survives someone
+reformatting the guard.
 
 ---
 
