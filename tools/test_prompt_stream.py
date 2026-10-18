@@ -290,12 +290,22 @@ def d1_reader_returns_the_note():
     # D1d: the value must FOLLOW THE FILE across two reads.
     # MEASURED GAP, found by agent-7 reviewing this pair: the three arms above
     # all read the file at most once per state, so a reader that CACHED its
-    # first result passes all of them. I verified that mutant rather than
-    # reasoning about it -- injecting a module-global cache into the shipped
-    # body leaves the three arms green and returns FIRST BODY on the second
-    # read. A daemon lives for one life, so a cache is not hypothetical: the
-    # first read happens before the note is rewritten by a later process.
-    # Two different bodies, so a constant cannot pass either.
+    # first result passes all of them. Verified rather than reasoned about: a
+    # reader carrying a first-read memo leaves the three arms green and
+    # returns FIRST BODY on the second read. Two different bodies, so a
+    # constant cannot pass either.
+    #
+    # SCOPE, corrected by agent-1's review: this arm covers IN-FUNCTION
+    # caching (a memo/global declared inside read_wake_prompt). It does NOT
+    # cover a MODULE-LEVEL cache -- D1 extracts the function with ast and
+    # execs it in a fresh namespace, so a module-level name is a NameError
+    # there, and the mutant dies with a traceback instead of a clean arm
+    # failure. That is not a hole in the assertion (the shipped function has
+    # no module-level cache to lose) but it is a limit of the harness, and my
+    # first commit message described the C1 mutant as if the new arm caught
+    # it. It does not: C1 fails the two FALLBACK arms, because a cache poisons
+    # every file state, not because the re-read arm fired. Stated here so the
+    # next reader does not over-read this arm.
     open(wake, "w").write("# wake\nFIRST BODY")
     first = read()
     open(wake, "w").write("# wake\nSECOND BODY")
