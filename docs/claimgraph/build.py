@@ -16,7 +16,7 @@ generator that ignores its input would still pass a visual check.
 OUTPUT: a single self-contained index.html (no network, no CDN), plus
 graph.json, so both a human and a program can read it.
 """
-import json, os, sys, glob, html, hashlib, shutil, tempfile
+import json, os, re, sys, glob, html, hashlib, shutil, tempfile
 
 ROOT = os.environ.get("CLAIM_ROOT", "/shared/claims")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -354,6 +354,45 @@ def build(root=ROOT, outdir=HERE):
     return st, digest
 
 
+# Wording-tolerant on purpose. The first version required the number to be
+# adjacent to its noun, so it MISSED "60 of them supersessions" -- the control
+# caught 3 of 4 phrases and reported FAIL, which looks like a pass until you
+# read the count. A gate that fires on a subset of the thing it names is the
+# "control that mutates but is never reached" shape one level over: it is right
+# about the phrases it sees and silent about the rest.
+#
+# This list IS the gate's meaning. Deleting one phrase narrows what the gate
+# forbids, silently; the selftest asserts the exact set for that reason.
+COUNT_PHRASES = [r"\b\d+\s+claims\b",
+                 r"\b\d+\s+(?:typed\s+)?edges\b",
+                 r"\b\d+\s+(?:of\s+them\s+)?supersessions?\b",
+                 r"\b\d+\s+retractions?\b"]
+
+
+def retyped_counts(text):
+    """Which of COUNT_PHRASES appear in `text`. Empty list == gate passes.
+
+    `text is None` (unreadable file) is NOT an empty list: absence of a
+    measurement is an error, not a clean result.
+    """
+    if text is None:
+        return list(COUNT_PHRASES)
+    return [p for p in COUNT_PHRASES if re.search(p, text)]
+
+
+def _read_text(path):
+    """File contents, or None if it cannot be read.
+
+    None is deliberate and distinct from "": a missing README must not score
+    as a README that retypes nothing.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def selftest():
     """THE GENERATOR MUST RESPOND TO ITS INPUT. A graph builder that ignores
     the store would still produce a pretty page. So: copy the store, change
@@ -467,41 +506,69 @@ def selftest():
     # a gate that had just been deleted. Mutating the claims number to 999
     # left repo_check PASS.
     #
-    # The gate below makes the ABSENCE enforceable, which is the only form
-    # that survives a store that moves: a stale number cannot be typed wrong
-    # if it is not typed at all. It asserts, against the committed artifact:
-    #   1. the four count phrases do not appear in the top-level README, and
-    #   2. if the README still says C8 checks these counts, that sentence is
-    #      not allowed to stand alone -- it must not name a gate that does not
-    #      exist. (repo_check cannot be imported here; the assertion is on the
-    #      text, which is what a reader believes.)
+    # The gate makes the ABSENCE enforceable, which is the only form that
+    # survives a store that moves: a stale number cannot be typed wrong if it
+    # is not typed at all.
     #
-    # A CONTROL THAT CANNOT FIRE IS DECORATION. `selftest` proves both arms in
-    # main_selftest below: re-inserting a stale count makes this FAIL, and the
-    # clean tree makes it PASS.
+    # A CONTROL THAT CANNOT FIRE IS DECORATION, and the first version of this
+    # block was exactly that: its comment claimed "selftest proves both arms"
+    # while `selftest()` contained no arm that ran M3b's predicate at all. The
+    # gate fired only because a human pasted a stale sentence into a scratch
+    # copy. agent-8 caught the same class in their own instrument an hour
+    # earlier. So the predicate is now a FUNCTION, and the arms below call it
+    # with a mutated string -- they do not depend on the repository's README
+    # being in any particular state.
     top_readme = os.path.join(HERE, "..", "..", "README.md")
-    try:
-        top_text = open(top_readme, encoding="utf-8").read()
-    except OSError:
-        top_text = ""
-    # Wording-tolerant on purpose. The first version required the number to be
-    # adjacent to its noun, so it MISSED "60 of them supersessions" -- the
-    # control caught 3 of 4 phrases and reported FAIL, which looks like a pass
-    # until you read the count. A gate that fires on a subset of the thing it
-    # names is the "control that mutates but is never reached" shape one level
-    # over: it is right about the phrases it sees and silent about the rest.
-    COUNT_PHRASES = [r"\b\d+\s+claims\b",
-                     r"\b\d+\s+(?:typed\s+)?edges\b",
-                     r"\b\d+\s+(?:of\s+them\s+)?supersessions?\b",
-                     r"\b\d+\s+retractions?\b"]
-    import re as _re
-    retyped = [p for p in COUNT_PHRASES if _re.search(p, top_text)]
+    top_text = _read_text(top_readme)
+    retyped = retyped_counts(top_text)
     if retyped:
-        # Naming the phrases is the diagnosis, not decoration: a FAIL that
-        # says only "M3b" makes the reader go find which number drifted.
-        print("    M3b: top-level README still retypes %s" % retyped)
+        # Naming ALL the phrases is the diagnosis, not decoration: a FAIL that
+        # says only "M3b" makes the reader go find which number drifted, and a
+        # FAIL naming a SUBSET reads as a pass until you count.
+        print("    M3b: top-level README still retypes %d/%d: %s"
+              % (len(retyped), len(COUNT_PHRASES), retyped))
     checks.append(("M3b top-level README retypes no graph counts",
                    not retyped))
+    # A MISSING README IS AN ERROR, NOT A PASS. `_read_text` returns None for
+    # an unreadable file; the first version turned that into "" and scored the
+    # gate OK -- the same absence-read-as-success shape as a missing
+    # measurement reported as 0. (agent-8: "a claim whose arms all vanish is
+    # not a passing claim, it is an empty one.")
+    checks.append(("M3b top-level README was actually read",
+                   top_text is not None))
+
+    # THE TWO ARMS THIS COMMENT USED TO PROMISE, now real. Both mutate a
+    # STRING, so they run on every selftest, on any tree, with no fixtures and
+    # no dependence on the README's current wording:
+    #   ARM 1 (positive): the exact sentence this gate exists to forbid, in the
+    #     wording that produced it, must be caught by ALL FOUR phrases. An
+    #     assertion of the SET -- not `len(retyped) >= 1` -- because a partial
+    #     catch is the defect that made the first M3b unreadable.
+    #   ARM 2 (negative): the current, correct README must produce none.
+    stale_sentence = (
+        "the committed graph holds 113 claims and 68 typed edges, 60 of them "
+        "supersessions, plus 21 retractions")
+    caught = retyped_counts(stale_sentence)
+    # ASSERT THE LITERAL SET, NOT COUNT_PHRASES. The first version of this arm
+    # compared `caught` to COUNT_PHRASES, which is the same list the predicate
+    # reads -- so deleting "retractions" from the target list made the arm
+    # compare 3 to 3 and PASS, while its own LABEL still read "4/4". Measured
+    # (mutant: drop the fourth phrase -> selftest PASS, exit 0). A control that
+    # derives its expectation from the thing it tests cannot see that thing
+    # change. agent-8 asked for exactly this and I got it wrong on the first
+    # attempt, in the way they warned about.
+    EXPECTED_PHRASES = [r"\b\d+\s+claims\b",
+                        r"\b\d+\s+(?:typed\s+)?edges\b",
+                        r"\b\d+\s+(?:of\s+them\s+)?supersessions?\b",
+                        r"\b\d+\s+retractions?\b"]
+    checks.append(("M3b target list is exactly the four intended phrases",
+                   COUNT_PHRASES == EXPECTED_PHRASES))
+    checks.append(("M3b arm: the stale sentence is caught %d/%d, all of them"
+                   % (len(caught), len(EXPECTED_PHRASES)),
+                   caught == EXPECTED_PHRASES))
+    checks.append(("M3b arm: prose that names no count is allowed",
+                   retyped_counts("the graph is rendered from the store and "
+                                  "its table is generated") == []))
     ok = True
     for name, cond in checks:
         print("  %-42s %s" % (name, "OK" if cond else "FAIL"))
