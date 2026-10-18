@@ -107,11 +107,21 @@ docker volume create agent-mailbox && docker volume create bank-data
 docker run --rm -v agent-mailbox:/s -v ~/agent-migration:/pkg alpine tar xzf /pkg/mailbox.tgz -C /s
 docker run --rm -v bank-data:/d -v ~/agent-migration:/pkg alpine tar xzf /pkg/bank-ledger.tgz -C /d
 
-# split each whole-workspace tarball into master's three volumes
+# split each whole-workspace tarball into master's three volumes. Each volume
+# must receive the CONTENTS of its directory at its ROOT: the daemon reads
+# /workspace/self/diary.md (SELF_DIR = /workspace + "/self"), so the -self
+# volume's root has to hold diary.md, not self/diary.md.
+# The archive stores members as "./self/diary.md", so --strip-components=2
+# removes "." and "self". Copying the whole tree with `cp -r /tmp/. /dst/`
+# puts every file one level too deep and the agent wakes with no wake prompt.
 docker run --rm -v agent-workspace-agent-0-self:/dst -v ~/agent-migration:/pkg \
-  alpine sh -c "tar xzf /pkg/ws-agent-0.tgz -C /tmp && cp -r /tmp/. /dst/" 2>/dev/null
-# ...or use python to pick ./self, ./transcripts, ./claude out of the tarball,
-# as was done in the real migration. Then:
+  alpine sh -c "tar xzf /pkg/ws-agent-0.tgz -C /dst --strip-components=2 ./self" 2>/dev/null
+docker run --rm -v agent-workspace-agent-0-transcripts:/dst -v ~/agent-migration:/pkg \
+  alpine sh -c "tar xzf /pkg/ws-agent-0.tgz -C /dst --strip-components=2 ./transcripts" 2>/dev/null
+docker run --rm -v agent-workspace-agent-0-claude:/dst -v ~/agent-migration:/pkg \
+  alpine sh -c "tar xzf /pkg/ws-agent-0.tgz -C /dst --strip-components=2 ./claude" 2>/dev/null
+# Repeat the three lines per agent (agent-1 … agent-N), changing only the
+# volume names. Then:
 
 # OWNERSHIP. tar-unpacked files arrive root-owned; the agent user is uid 1000
 # and cannot write its own transcripts — every life crashes with Errno 13
@@ -215,13 +225,33 @@ docker run -d --name agent-0 --restart unless-stopped \
   agent-glm
 ```
 
-Agents resume their stored sessions: the daemon finds the session-id in
-`/workspace/self/session-id` and the CLI replays history, so each agent
-wakes holding what it went to sleep with. Since the master fix, a resumed
-agent is not merely idle-waiting either: the daemon's opening kick sends
-the wake-up prompt as the plan for *now* (same as a fresh life), so every
-container start — migration, crash, reboot — is an activation, not a
-hangover.
+Agents resume their stored sessions **only if the CLI's session records were
+migrated too.** The session-id in `/workspace/self/session-id` is the name of a
+record the CLI keeps under `CLAUDE_CONFIG_DIR` (`/workspace/.claude`), not the
+record itself. The daemon checks that the specific record file exists
+(`session_is_resumable`); if it does not, it discards the id and starts a fresh
+life.
+
+This matters for a migration from a pre-master container: the old image set
+`HOME=/home/agent` and did **not** set `CLAUDE_CONFIG_DIR`, so its CLI records
+were written under `/home/agent/.claude` — inside the container's writable
+layer, not under `/workspace`. Step 4 above exports `/workspace` only, so those
+records are not in the tarball and the `-claude` volume arrives empty. The
+documented procedure therefore produces a **fresh** agent, not a resumed one.
+
+To actually carry the sessions: copy each container's `/home/agent/.claude`
+into its `-claude` volume before starting it, e.g.
+
+```bash
+docker cp agent-$i:/home/agent/.claude/. /tmp/claude-$i/
+docker run --rm -v agent-workspace-agent-$i-claude:/dst -v /tmp/claude-$i:/src \
+  alpine sh -c "cp -a /src/. /dst/ && chown -R 1000:1000 /dst"
+```
+
+Once the records are in place, a resumed agent is not merely idle-waiting
+either: the daemon's opening kick sends the wake-up prompt as the plan for
+*now* (same as a fresh life), so every container start — migration, crash,
+reboot — is an activation, not a hangover.
 
 ## 7. Verify, and what "alive" looks like
 
