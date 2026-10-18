@@ -536,8 +536,39 @@ def c7_sources_import(root, timeout=60):
     return "C7 sources import", "PASS", []
 
 
+def c8_readme_transcript(root):
+    """The README quotes bank output. Replay it against the bank in the tree.
+
+    C5 EXECUTES the fenced blocks, and this is not that. The transcript's
+    command lines are prefixed with '$', so C5 treats the block as prose and
+    never runs it -- which is why the quoted refusal drifted from
+    {"error": "insufficient funds"} to {"error": "unknown sender"} while every
+    suite stayed green. The text looks like output, so a reader trusts it more
+    than a claim; nothing was maintaining it.
+
+    Runs as a SUBPROCESS so a wedged bank cannot hang the checker, and a
+    non-zero exit is the finding. A missing replayer is a FAIL, not a skip:
+    otherwise deleting the script turns the check off.
+    """
+    script = os.path.join(root, "tools/check_readme_transcript.py")
+    if not os.path.exists(script):
+        return "C8 readme transcript", "FAIL", [
+            "tools/check_readme_transcript.py is absent, so the README's "
+            "quoted bank transcript is unverified"]
+    r = subprocess.run([sys.executable, script], cwd=root, text=True,
+                       capture_output=True, timeout=180)
+    if r.returncode != 0:
+        out = (r.stdout + r.stderr).strip().splitlines()
+        return "C8 readme transcript", "FAIL", out[:12] or ["replayer failed"]
+    return "C8 readme transcript", "PASS", [r.stdout.strip().splitlines()[-1]]
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # the repo this file lives in
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
-          c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import]
+          c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
+          c8_readme_transcript]
 
 
 def _is_git_tree(root):
@@ -835,6 +866,36 @@ def selftest():
                      res["C6 sources parse"] == "PASS"))
     outcomes.append(("C7 catches a module that parses but cannot import",
                      res["C7 sources import"] == "FAIL"))
+    shutil.rmtree(d)
+
+    # C8: a README that quotes a response the bank does not give must FAIL.
+    # This is the drift agent-5 found by hand; the point of the control is
+    # that the replayer is not merely re-running the commands and comparing
+    # nothing.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    os.makedirs(os.path.join(d, "bank"))
+    os.makedirs(os.path.join(d, "tools"))
+    shutil.copy(os.path.join(ROOT, "bank/bank.py"), os.path.join(d, "bank"))
+    shutil.copy(os.path.join(ROOT, "tools/check_readme_transcript.py"),
+                os.path.join(d, "tools"))
+    shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
+    p = os.path.join(d, "README.md")
+    t = open(p, encoding="utf-8").read()
+    lie = t.replace('{"error": "unknown sender"}',
+                    '{"error": "insufficient funds"}')
+    if lie == t:
+        outcomes.append(("C8 catches a quoted response the bank does not give",
+                         False))
+    else:
+        open(p, "w", encoding="utf-8").write(lie)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "lying transcript")
+        _, r = run(d)
+        outcomes.append(("C8 catches a quoted response the bank does not give",
+                         dict((n, o) for n, o, _ in r)
+                         ["C8 readme transcript"] == "FAIL"))
     shutil.rmtree(d)
 
     # THE TOOL MUST PASS ITS OWN CHECK. My first version hardcoded the real
