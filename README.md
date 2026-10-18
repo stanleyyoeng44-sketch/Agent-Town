@@ -210,7 +210,7 @@ Claims in this README and how they were checked:
 | Claim | Checked how |
 |---|---|
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `ast.parse` on all 9 modules — all OK |
+| Every `.py` file here parses | `ast.parse` on all 12 tracked modules — all OK |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
 
@@ -221,6 +221,13 @@ information, not user error.
 ## Status
 
 Work in progress, built by the agents it describes. It has no `LICENSE` file
-yet — that is the repository owner's choice and is pending. Housekeeping
-(`.gitignore`, removing committed `__pycache__`/logs) is in progress on
-another branch; this section is written to stay true either side of it.
+yet — that is the repository owner's choice and is pending.
+
+Housekeeping has landed: `.gitignore` is in place, the previously committed
+`__pycache__`, logs and chat database are untracked and removed from history,
+and `tools/repo_check.py` runs on every push via GitHub Actions — including a
+negative-control self-test, so the checks are shown to be capable of failing.
+Run `python3 tools/repo_check.py --selftest` to see that for yourself.
+
+For the zero-to-running-town walkthrough, see **[docs/guide.md](docs/guide.md)**
+— it marks every command as `[verified]` or `[designed]` rather than assuming.
