@@ -392,6 +392,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
 
     restart_requested = False
     notice_sent = False
+    saw_result = None
 
     async with ClaudeSDKClient(options=options) as client:
         # Feed the opening message as a streaming prompt. When resuming a
@@ -411,14 +412,28 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 # harness note that is NOT the wake framing (that would
                 # duplicate history). If mail is already queued, the normal
                 # delivery path below carries it instead.
+                # STATE ONLY WHAT IS KNOWN. The daemon knows that a stored
+                # session id was found and resumed. It does NOT know why the
+                # previous life ended: a crash, a docker stop, a life that
+                # completed without calling the restart tool, and a resume of
+                # an already-finished session are all indistinguishable here
+                # (verified live: an old image resumed a session that had
+                # returned result=success, and told the model 'the container
+                # restarted' when PID 1 proved it had not).
+                #
+                # A note that names a cause it never checked is the same class
+                # of defect as a comment that claims behaviour the code does
+                # not have. So this note states the resume and nothing more.
                 yield {"type": "user",
                        "message": {"role": "user", "content":
-                                   "<system-reminder>\nYou are resuming the "
-                                   "session that was interrupted. Your "
-                                   "context above is intact; no messages "
-                                   "were lost. Continue from where you were, "
-                                   "or write /workspace/self/diary.md if you "
-                                   "are ending this life.\n"
+                                   "<system-reminder>\nA previous session "
+                                   "was resumed and its conversation is "
+                                   "restored above. The reason the previous "
+                                   "life ended is not recorded, so none is "
+                                   "claimed. Continue from where the "
+                                   "conversation left off, or write "
+                                   "/workspace/self/diary.md if you are "
+                                   "ending this life.\n"
                                    "</system-reminder>"}}
             while True:
                 item = await inbox_next.get()
@@ -573,6 +588,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                             except OSError:
                                 pass
                 elif isinstance(message, ResultMessage):
+                    saw_result = message.subtype
                     log.log("result", subtype=message.subtype,
                             turns=message.num_turns, cost=message.total_cost_usd)
         except Death:
@@ -599,6 +615,24 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Record HOW this life ended and WHAT the next life will do about it.
+    # Without this line the ending classes are indistinguishable from outside:
+    # a deliberate sleep, a completed session, and a crash all leave a
+    # transcript, and the resume decision is made from a file whose presence
+    # does not identify which one happened. (agent-9: from inside the
+    # container these are indistinguishable; this is the evidence that makes
+    # them distinguishable, not a policy for what to do about it.)
+    try:
+        session_left = os.path.exists(SESSION_FILE)
+        LifeLog(life_id).log(
+            "life-end",
+            slept=bool(restart_requested),
+            result=saw_result,
+            session_file_left=session_left,
+            next_life="resume" if session_left else "fresh")
+    except Exception:
+        pass
 
     return restart_requested
 
