@@ -1270,14 +1270,60 @@ def _registry_orphans(source):
     correct code gets deleted, and then it catches nothing.
     """
     tree = ast.parse(source)
-    defined, registered = [], []
+
+    # CHECKS may be spelled three ways, all legal: `CHECKS = [...]`,
+    # `CHECKS: list = [...]` (AnnAssign) and `CHECKS = CHECKS + [...]`
+    # (BinOp). The first version tested only ast.Assign, so an annotated
+    # declaration gave registered=[] and C14 then named all fourteen
+    # registered checks as orphans -- fourteen innocent functions called
+    # dead is the output that gets a gate DELETED rather than fixed
+    # (agent-7's second finding, reproduced before this fix).
+    registered, checks_values = [], []
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and re.fullmatch(
-                r"c[0-9]+_[a-z0-9_]+", node.name):
-            defined.append(node.name)
-        if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "CHECKS" for t in node.targets):
-            registered = [e.id for e in node.value.elts if isinstance(e, ast.Name)]
+        target = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        if not (isinstance(target, ast.Name) and target.id == "CHECKS"):
+            continue
+        checks_values.append(node.value)
+        elts = []
+        if isinstance(node.value, (ast.List, ast.Tuple)):
+            elts = node.value.elts
+        elif isinstance(node.value, ast.BinOp):
+            # BOTH sides: `CHECKS = [a] + [b]` is two registrations, and
+            # reading only the first would report b as a dead check.
+            for side in (node.value.left, node.value.right):
+                if isinstance(side, (ast.List, ast.Tuple)):
+                    elts = elts + list(side.elts)
+        if elts is not None:
+            registered = [e.id for e in elts if isinstance(e, ast.Name)]
+
+    # A NAME IS A CHECK ONLY IF ITS ONLY REFERENCE IS THE CHECKS LITERAL.
+    # A module-level helper named c11_parse_flags (called by a real check) is
+    # NOT a check, and flagging it is how a gate gets deleted for biting
+    # correct code. agent-7 measured that false positive and this predicate:
+    # every real check is loaded exactly once, as an element of CHECKS. Any
+    # additional Load reference (a call, a variable use) means the function
+    # is used for something other than registration, so it is not a
+    # dead-check candidate.
+    # Count only CALL references, not every Load. C14 references ITSELF
+    # (the self-guard member-tests and the selftest removes it from CHECKS),
+    # and counting those would exclude the very check that guards the
+    # registry. A call -- `c11_parse_flags(...)` -- is the signal that a
+    # function is doing work rather than merely being registered.
+    called = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name):
+                called.add(f.id)
+
+    defined = [n.name for n in tree.body
+               if isinstance(n, ast.FunctionDef)
+               and re.fullmatch(r"c[0-9]+_[a-z0-9_]+", n.name)
+               and n.name not in called]
     return (sorted(defined), sorted(registered),
             sorted(set(defined) - set(registered)),
             sorted(set(registered) - set(defined)))
@@ -2553,6 +2599,56 @@ def selftest():
     outcomes.append(("C14 does NOT flag a nested check-shaped helper",
                      nested_src != real_src and st_b == "PASS"
                      and not any("c99_nested" in f for f in fd_b)))
+
+    # Arm D: a module-level helper whose name LOOKS like a check but which is
+    # CALLED by a real check must not be flagged. agent-7 measured this false
+    # positive: refactors create top-level helpers, and C14 protected only
+    # NESTED ones. A check that bites correct code gets deleted.
+    helper_src = real_src.replace(
+        "CHECKS = [c1_tracked_junk,",
+        "def c99_parse_flags():\n"
+        "    return []\n\n\n"
+        "CHECKS = [c1_tracked_junk,", 1)
+    # make the helper genuinely CALLED from inside another function
+    helper_src = helper_src.replace(
+        "def c1_tracked_junk(root):",
+        "def c1_tracked_junk(root):\n"
+        "    c99_parse_flags()", 1)
+    st_d, fd_d = registry_status(helper_src)
+    outcomes.append(("C14 does NOT flag a module-level helper that is CALLED",
+                     helper_src != real_src and st_d == "PASS"
+                     and not any("c99_parse_flags" in f for f in fd_d)))
+
+    # Arm E: an UNCALLED module-level check-shaped function is still dead.
+    # D alone could be satisfied by never flagging anything at module level.
+    st_e, fd_e = registry_status(
+        "def c99_dead(root):\n    return 'x', 'PASS', []\n\n\n"
+        "CHECKS = []\n")
+    outcomes.append(("C14 DOES flag an uncalled module-level check",
+                     st_e == "FAIL" and any("c99_dead" in f for f in fd_e)))
+
+    # Arm F: CHECKS may be ANNOTATED. `CHECKS: list = [...]` is legal and the
+    # first version read only ast.Assign, so registered came back empty and
+    # C14 named every registered check as an orphan -- fourteen innocent
+    # functions called dead is the output that gets a gate deleted.
+    ann_src = ("def c1_a(root):\n    return 'A', 'PASS', []\n\n\n"
+               "CHECKS: list = [c1_a]\n")
+    st_f, fd_f = registry_status(ann_src)
+    outcomes.append(("C14 reads an ANNOTATED CHECKS declaration",
+                     st_f == "PASS", ))
+    # `findings` carries an informational "N checks registered" line even on
+    # PASS, so the arm must look for ORPHAN text, not for an empty list.
+    outcomes.append(("C14 does not invent orphans under an annotation",
+                     not any("ORPHAN" in f or "DEFINED BUT" in f for f in fd_f)))
+
+    # Arm G: CHECKS built with `+` must register BOTH sides.
+    bin_src = ("def c1_a(root):\n    return 'A', 'PASS', []\n\n\n"
+               "def c2_b(root):\n    return 'B', 'PASS', []\n\n\n"
+               "CHECKS = [c1_a] + [c2_b]\n")
+    st_g, fd_g = registry_status(bin_src)
+    outcomes.append(("C14 reads both sides of CHECKS = [a] + [b]",
+                     st_g == "PASS"
+                     and any("2 checks registered" in f for f in fd_g)))
 
     # Arm C: C14's own removal must still be caught. registry_status cannot
     # see this (if C14 is unregistered it never runs), so the guard is
