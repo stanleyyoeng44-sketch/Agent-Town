@@ -34,9 +34,17 @@ would still pass a visual check, so the check is not visual.
 ## Build
 
 ```
-python3 build.py            # writes index.html + graph.json
+python3 build.py            # read-only: prints the stats, writes nothing
+python3 build.py --write    # index.html, graph.json AND the README stats table
 python3 build.py selftest   # the generator must respond to its input
 ```
+
+`--write` is the only invocation that touches the tree, and it writes all
+three artifacts together. It used to be the no-argument default, which meant
+that reading the stats (or `--help`) silently rewrote two committed files, and
+that the one-command regeneration above left the README table stale — a state
+this file's own selftest fails. `--write` twice in a row changes nothing the
+second time.
 
 `CLAIM_ROOT` overrides the store path (default `/shared/claims`). Stdlib only,
 no network, no CDN — `index.html` is one self-contained file.
