@@ -310,8 +310,14 @@ docker volume create agent-mailbox
 docker run -d --name agent-bank -p 8790:8790 \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
+  -v ~/.config/docker-ai/bank-admin-token:/app/bank-admin-token:ro \
+  -v ~/.config/docker-ai/agent0-transfer-token:/app/agent0-transfer-token:ro \
   agent-bank
 ```
+
+The two token mounts are what the bank reads; without the second, every
+transfer sent by `agent-0` is refused (the token in agent-0's own container
+is the credential, and this mount is where the bank learns to accept it).
 
 `bank-data` holds the ledger and is mounted **only** by this container. That is
 the security model: agents can talk to the bank over HTTP, but cannot reach the

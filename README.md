@@ -134,8 +134,17 @@ docker run -d --name agent-bank \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
   -v ~/.config/docker-ai/bank-admin-token:/app/bank-admin-token:ro \
+  -v ~/.config/docker-ai/agent0-transfer-token:/app/agent0-transfer-token:ro \
   agent-bank
 ```
+
+Both tokens are mounted because the BANK is what reads them (bank.py falls
+back between `/run/secrets/` and `/app/`): the admin token gates top-up, and
+the transfer token is what makes an `agent-0 -> anyone` transfer
+authenticated. Omit the second and every `send_money` from agent-0 is
+refused even though agent-0's own container has the token -- the two mounts
+are a pair, and the transfer token mounted into the agent alone authorises
+nothing.
 
 The last mount is the operator token the control UI writes on first run. Omit
 it and the bank starts and serves reads, but `/admin/topup` answers 503 —
