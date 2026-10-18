@@ -113,6 +113,36 @@ def load_mcp_servers():
     return data.get("servers", data)
 
 
+def peers_present() -> int:
+    """How many other agents have a mailbox directory. Cheap, no bank call."""
+    try:
+        return sum(1 for d in os.listdir(MAILBOX)
+                   if os.path.isdir(os.path.join(MAILBOX, d))
+                   and d != AGENT_NAME)
+    except OSError:
+        return 0
+
+
+def log_idle_proof(log, why: str, pending: int = 0) -> None:
+    """Write ONE transcript line proving this life is alive and waiting.
+
+    Stanley's defect: a restarted agent "will not have any response unless
+    someone messages it". The cause is not a crash -- prompt_stream() feeds the
+    model the opening message and then blocks on an empty inbox, and a model
+    with nothing to do writes nothing, so the transcript contains only `birth`
+    and the UI has nothing to show. The process is fine; the evidence is
+    missing.
+
+    This is evidence, not behaviour: a transcript line, no model turn, no
+    tokens, no new wire format, nothing the agent can observe. It is written at
+    three points -- when the life starts, whenever the agent finishes a run and
+    goes quiet, and when the context watcher wakes up -- so ANY of the three
+    readers of the transcript (UI, viewer, a human with `cat`) sees a live
+    agent without having to talk to it.
+    """
+    log.log("idle", why=why, peers=peers_present(), pending=pending)
+
+
 def sdk_session_records() -> str:
     """Where the CLI stores a session's records for this cwd.
 
@@ -389,9 +419,15 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
 
     options = build_options(cfg, life_id)
     resumed = getattr(options, "resume", None) is not None
+    # The delivery queue is module state. Anything left in it belongs to the
+    # previous life (its consumer is gone); carrying it into this one would
+    # deliver stale text as this life's opening turn. prompt_stream() drains
+    # whatever the poll loops queue from NOW ON.
+    pending_delivery.clear()
 
     restart_requested = False
     notice_sent = False
+    saw_result = None
 
     async with ClaudeSDKClient(options=options) as client:
         # Feed the opening message as a streaming prompt. When resuming a
@@ -399,26 +435,52 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         # wake framing would corrupt it, so the stream starts empty and the
         # CLI replays history on its own.
         async def prompt_stream():
-            if not resumed:
-                yield {"type": "user",
-                       "message": {"role": "user", "content": opening_message(wake_prompt)}}
-            elif not pending_delivery:
-                # RESUMED life: the CLI replays the conversation and then
-                # waits for a user turn. The operator has not sent anything
-                # (a restart is exactly when nobody is talking to it), so the
-                # stream would never yield and the session would emit
-                # nothing until a peer messaged it. Kick once, with a
-                # harness note that is NOT the wake framing (that would
-                # duplicate history). If mail is already queued, the normal
-                # delivery path below carries it instead.
+            # THE STREAM MUST YIELD ONCE AT START-UP, IN EVERY CASE.
+            # A streaming prompt that yields nothing produces no model turn,
+            # and the agent is silent until somebody happens to message it --
+            # Stanley's defect 3. Two ways that used to happen:
+            #   * a resumed session yielded nothing (context is replayed, but
+            #     nothing asks the model to act), and
+            #   * mail queued in `pending_delivery` BEFORE the stream started
+            #     made the old `elif not pending_delivery` skip the kick, while
+            #     the queue is only drained by a "__kick__" marker -- so those
+            #     items waited forever and the first yield never came.
+            # Now: deliver anything already queued, and if there is still
+            # nothing to say, send one harness note. Exactly one turn either
+            # way.
+            prequeued = drain_pending_delivery()
+            if prequeued:
                 yield {"type": "user",
                        "message": {"role": "user", "content":
-                                   "<system-reminder>\nYou are resuming the "
-                                   "session that was interrupted. Your "
-                                   "context above is intact; no messages "
-                                   "were lost. Continue from where you were, "
-                                   "or write /workspace/self/diary.md if you "
-                                   "are ending this life.\n"
+                                   "<system-reminder>\n" + prequeued +
+                                   "\n</system-reminder>"}}
+            elif not resumed:
+                yield {"type": "user",
+                       "message": {"role": "user", "content": opening_message(wake_prompt)}}
+            else:
+                # RESUMED, nothing queued: the CLI replays the conversation
+                # and then waits for a user turn. Kick once with a harness
+                # note that is NOT the wake framing (that would duplicate
+                # history).
+                # STATE ONLY WHAT IS KNOWN. The daemon knows a stored session
+                # id was found and resumed. It does NOT know why the previous
+                # life ended: a crash, a docker stop, a completed session, and
+                # a resume of an already-finished session are indistinguishable
+                # here (verified live: an old image resumed a session that had
+                # returned result=success and told the model 'the container
+                # restarted' when PID 1 proved it had not). A note that names
+                # a cause it never checked is the same defect class as a
+                # comment that claims behaviour the code lacks.
+                yield {"type": "user",
+                       "message": {"role": "user", "content":
+                                   "<system-reminder>\nA previous session "
+                                   "was resumed and its conversation is "
+                                   "restored above. The reason the previous "
+                                   "life ended is not recorded, so none is "
+                                   "claimed. Continue from where the "
+                                   "conversation left off, or write "
+                                   "/workspace/self/diary.md if you are "
+                                   "ending this life.\n"
                                    "</system-reminder>"}}
             while True:
                 item = await inbox_next.get()
@@ -437,6 +499,11 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                                "message": {"role": "user", "content":
                                            "<system-reminder>\n" + combined +
                                            "\n</system-reminder>"}}
+                    else:
+                        # A kick with nothing left to deliver means the agent
+                        # just finished a run and is waiting again. That is the
+                        # exact moment the transcript used to go silent.
+                        log_idle_proof(log, "after-run")
                     continue
                 yield {"type": "user",
                         "message": {"role": "user", "content": item}}
@@ -533,17 +600,91 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                     except (OSError, json.JSONDecodeError):
                         continue
 
+        async def watch_restart():
+            """Notice the restart flag even when NO message is arriving.
+
+            The flag used to be checked only inside the receive loop. With
+            receive_response() that was invisible, because the loop exited
+            after every answer. With receive_messages() the loop BLOCKS when
+            the model is quiet, so an agent that answered and then called
+            restart would sit there forever -- verified: without this task the
+            life hangs (agent/tests/test_restart_while_idle.py).
+
+            Pushing a queue sentinel does NOT help: the receive loop is
+            awaiting the CLIENT, not the queue, so a sentinel cannot wake it.
+            The only thing that can unblock the client is interrupting it.
+            interrupt() is documented as 'only works with streaming mode',
+            which is exactly how this daemon drives the session.
+            """
+            while True:
+                await asyncio.sleep(0.25)
+                if restart_requested_flag():
+                    log.log("restart-flag-seen", phase="idle-watch")
+                    try:
+                        await client.interrupt()
+                    except Exception:
+                        pass
+                    return
+
         feed = asyncio.create_task(feed_tasks())
         watcher = asyncio.create_task(watch_context())
         chat = asyncio.create_task(feed_chat())
         human = asyncio.create_task(feed_human()) if AGENT_NAME == "agent-0" else None
+        restart_watch = asyncio.create_task(watch_restart())
 
         try:
             # Start the life: feed the streaming prompt (opening message +
             # tasks), and consume the agent's messages.
+            #
+            # Emit proof of life from the LIFE BODY, not from inside
+            # prompt_stream. A generator only runs when the model pulls from
+            # it, so a log line inside it is hostage to the model doing
+            # something -- and "the model did nothing" is precisely the state
+            # we are trying to make visible.
+            log_idle_proof(log, "started")
+
             send_task = asyncio.create_task(client.query(prompt_stream()))
 
-            async for message in client.receive_response():
+            # ONE LIFE = ONE SESSION, NOT ONE RESPONSE.
+            # receive_response() stops at the first ResultMessage, so every
+            # ordinary answer ended the life; the next life resumed the same
+            # session and announced a 'restart'. Measured 3x on the running
+            # container: PID 1 unchanged, every life result=success with 0
+            # restart-tool calls and 0 death events, births wake_file=False.
+            # receive_messages() yields the whole stream; the life ends on the
+            # restart tool (Death) or when the stream genuinely closes.
+            # Regression test: agent/tests/test_life_boundary.py.
+            # Drive the iterator through a background TASK, not by wrapping
+            # __anext__() in wait_for: wait_for CANCELS the awaited coroutine
+            # on timeout, which closes the async generator, so the next
+            # __anext__() raises StopAsyncIteration and the life ends after
+            # one quiet interval. (Observed: the loop returned after 0.5s of
+            # model silence with the restart flag set and no Death.)
+            # A persistent task can be waited on with a timeout repeatedly
+            # without being destroyed.
+            messages = client.receive_messages()
+            nxt: asyncio.Task | None = None
+            while True:
+                if nxt is None:
+                    nxt = asyncio.ensure_future(messages.__anext__())
+                done, _pending = await asyncio.wait({nxt}, timeout=0.5)
+                if not done:
+                    # Nothing from the model for half a second. Check the
+                    # restart flag WITHOUT needing a message to arrive; with
+                    # receive_messages() the stream simply blocks when the
+                    # model is quiet, and an agent that answered and then
+                    # called restart would otherwise never be noticed.
+                    if restart_requested_flag():
+                        log.log("restart-called", phase="idle")
+                        nxt.cancel()
+                        raise Death()
+                    continue
+                try:
+                    message = nxt.result()
+                except StopAsyncIteration:
+                    nxt = None
+                    break   # the session genuinely closed
+                nxt = None
                 if restart_requested_flag():  # agent called the restart tool
                     log.log("restart-called")
                     raise Death()
@@ -573,6 +714,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                             except OSError:
                                 pass
                 elif isinstance(message, ResultMessage):
+                    saw_result = message.subtype
                     log.log("result", subtype=message.subtype,
                             turns=message.num_turns, cost=message.total_cost_usd)
         except Death:
@@ -595,10 +737,28 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             except OSError:
                 pass
         finally:
-            tasks = [feed, watcher, chat] + ([human] if human else [])
+            tasks = [feed, watcher, chat, restart_watch] + ([human] if human else [])
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Record HOW this life ended and WHAT the next life will do about it.
+    # Without this line the ending classes are indistinguishable from outside:
+    # a deliberate sleep, a completed session, and a crash all leave a
+    # transcript, and the resume decision is made from a file whose presence
+    # does not identify which one happened. (agent-9: from inside the
+    # container these are indistinguishable; this is the evidence that makes
+    # them distinguishable, not a policy for what to do about it.)
+    try:
+        session_left = os.path.exists(SESSION_FILE)
+        LifeLog(life_id).log(
+            "life-end",
+            slept=bool(restart_requested),
+            result=saw_result,
+            session_file_left=session_left,
+            next_life="resume" if session_left else "fresh")
+    except Exception:
+        pass
 
     return restart_requested
 

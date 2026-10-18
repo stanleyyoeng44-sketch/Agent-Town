@@ -334,6 +334,21 @@ def c5_doc_commands(root, timeout=60):
             WARN is not PASS: it never claims the docs are correct. It is also
             not FAIL: the blocks may legitimately need docker. It is printed
             on every run so the gap cannot quietly become a green tick.
+
+    IT IS NOT A READ-ONLY OBSERVER. This check RUNS the documented commands,
+    so it inherits every side effect they have. MEASURED: docs/guide.md
+    documents `python3 demo/town.py`, whose bank wrote real payment
+    notifications into live agents' mailboxes; C5 executed it on every push
+    and on every local run, so the checker was a COURIER for the leak, not
+    just a witness. (That block is fixed -- it now writes only to its own
+    temp directory -- but this check still runs whatever a doc block says,
+    so THE RULE IS: A NEW DOC COMMAND IS A NEW COURIER. Before adding one,
+    ask what it writes and where; if it can write outside the tree, either
+    give it a temp path or mark the block SKIP.) Any check that executes
+    untrusted code must be as careful about what that code does as about
+    whether it exits 0. If a doc block has an effect outside the tree, that
+    is a defect in the block, and fixing the block is what makes this check
+    read-only in practice.
     """
     findings, ran, skipped, warnings = [], 0, [], []
     for f in _tracked(root):
@@ -535,8 +550,111 @@ def c7_sources_import(root, timeout=60):
     return "C7 sources import", "PASS", []
 
 
+# Numbers the README states about the code, and how to recompute each one.
+# A count in prose is a courier, not a check: every one of these drifted at
+# least once tonight (26 checks when there were 28; 12 modules when there
+# were 17; "five ways" when there were six; 101 claims when the graph held
+# 102). Each entry is (regex with one group, callable returning the truth).
+# The regex describes the SENTENCE, not just the number, so a sentence that
+# survives with a swapped value is still caught.
+README_COUNT_CLAIMS = [
+    (r"—\s*(\d+)\s+checks",
+     lambda r: _demo_pass_lines(r)),
+    (r"`python3 demo/town\.py`,\s*(\d+)\s+checks",
+     lambda r: _demo_pass_lines(r)),
+    (r"mutates the bank\s+(\w+)\s+ways",
+     lambda r: _selftest_control_lines(r)),
+    (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
+     lambda r: len([x for x in sh_ls(r) if x.strip()])),
+]
+_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+          "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def _demo_pass_lines(root):
+    out = subprocess.run([sys.executable, "-I", "demo/town.py"], cwd=root,
+                         text=True, capture_output=True)
+    return len([l for l in out.stdout.splitlines() if l.startswith("  PASS")])
+
+
+def _selftest_control_lines(root):
+    out = subprocess.run([sys.executable, "-I", "demo/selftest_demo.py"],
+                         cwd=root, text=True, capture_output=True)
+    import re as _re
+    return len([l for l in out.stdout.splitlines()
+                if _re.match(r"^(guard|single|grant|env-var|unknown)", l)])
+
+
+def sh_ls(root):
+    out = subprocess.run(["git", "-C", root, "ls-files", "*.py"],
+                         text=True, capture_output=True)
+    return out.stdout.splitlines()
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # the repo this file lives in
+
+
+def c8_readme_numbers(root):
+    """The README's numbers about the code, recomputed instead of trusted.
+
+    WHY THIS IS A CHECK AND NOT ADVICE: the Verification table is the row
+    that makes the rest of the README credible, and three of its numbers were
+    stale at once while every suite was green. Each was a value a human had
+    copied from an earlier run. Nothing was lying; nothing was maintained.
+
+    A claim whose SENTENCE is gone is a FAIL, not a skip. Otherwise the
+    cheapest way to get green is to delete the claim, and the table quietly
+    shrinks to nothing -- a check that reports fewer claims every time it is
+    appeased. WARN is for a number that cannot be measured on this box.
+    """
+    path = os.path.join(root, "README.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return "C8 readme numbers", "FAIL", ["README.md is absent"]
+    findings, measured, absent = [], {}, []
+    for rx, truth in README_COUNT_CLAIMS:
+        import re as _re
+        m = _re.search(rx, text)
+        if not m:
+            absent.append(rx)
+            continue
+        stated_raw = m.group(1)
+        stated = _WORDS.get(stated_raw.lower())
+        if stated is None:
+            try:
+                stated = int(stated_raw)
+            except ValueError:
+                findings.append(f"unparseable number {stated_raw!r} for {rx}")
+                continue
+        actual = truth(root)
+        measured[rx] = actual
+        if stated != actual:
+            findings.append(f"README says {stated} for /{rx}/, measured {actual}")
+    if absent:
+        findings.append(f"{len(absent)} README claim(s) are no longer worded "
+                        f"so they can be checked: {absent}")
+    if findings:
+        return "C8 readme numbers", "FAIL", findings
+    return "C8 readme numbers", "PASS", \
+        [f"recomputed {len(measured)} README numbers"]
+
+
+# (text in README.md, its lie, label). Lives beside the check so the two
+# cannot drift apart.
+C8_CONTROLS = [
+    ("— 28 checks", "— 27 checks", "demo caption"),
+    ("`python3 demo/town.py`, 28 checks", "`python3 demo/town.py`, 27 checks",
+     "verification table"),
+    ("mutates the bank six ways", "mutates the bank five ways",
+     "selftest mutations"),
+    ("(20 files)", "(12 files)", "tracked modules"),
+]
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
-          c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import]
+          c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
+          c8_readme_numbers]
 
 
 def _is_git_tree(root):
@@ -870,6 +988,35 @@ def selftest():
     outcomes.append(("C7 catches a module that parses but cannot import",
                      res["C7 sources import"] == "FAIL"))
     shutil.rmtree(d)
+
+    # C8: the README's numbers must be RECOMPUTED, and each claim must be
+    # shown to fail when it is wrong -- one control per claim, because a
+    # single "C8 catches a lie" would pass while three quarters of the check
+    # were dead code.
+    for old, newv, label in C8_CONTROLS:
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        for rel in ("demo/town.py", "demo/selftest_demo.py"):
+            os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
+        shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
+        p = os.path.join(d, "README.md")
+        t = open(p, encoding="utf-8").read()
+        if old not in t:
+            # Cannot build the control because the sentence is gone. That is a
+            # FAILURE, not a skip: it is exactly the state in which C8 stops
+            # checking anything while still reporting PASS.
+            outcomes.append((f"C8 {label} claim is still checkable", False))
+            shutil.rmtree(d)
+            continue
+        open(p, "w", encoding="utf-8").write(t.replace(old, newv, 1))
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "lying readme")
+        _, r8 = run(d)
+        c8 = dict((n, o) for n, o, _ in r8).get("C8 readme numbers")
+        outcomes.append((f"C8 catches a stale {label} number", c8 == "FAIL"))
+        shutil.rmtree(d)
 
     # THE TOOL MUST PASS ITS OWN CHECK. My first version hardcoded the real
     # published token as the fixture string, so (a) the check that exists to
