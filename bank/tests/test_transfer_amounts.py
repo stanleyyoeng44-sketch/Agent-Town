@@ -111,6 +111,20 @@ def build(fixed, seed=""):
         src = src.replace(FIXED_ACCOUNT, BROKEN_ACCOUNT, 1)
         assert BROKEN_ACCOUNT in src and src != original, \
             "pre-fix reconstruction did not actually mutate the source"
+        # The GET path is the FOURTH creation door, and it is the one the
+        # grant checks could not see: it created-and-funded a row while
+        # honestly answering exists=false. Reconstruct it too, or A2's
+        # calibration passes against a bank that never had the defect.
+        fixed_read = ("                existed = name in _accounts\n"
+                      "                balance = _accounts.get(name, 0)\n"
+                      "                if ticks:\n")
+        broken_read = ("                balance, created = ensure_account(name)\n"
+                       "                existed = not created\n"
+                       "                if ticks or created:\n")
+        assert fixed_read in src, ("GET /balance read path anchor missing -- "
+                                   "the pre-fix reconstruction would not run")
+        src = src.replace(fixed_read, broken_read, 1)
+        assert broken_read in src, "read-path mutation did not take effect"
 
     open(path, "w", encoding="utf-8").write(src)
     return work, path, seed
@@ -167,6 +181,25 @@ def exercise(fixed, port):
         done["C: GET /balance on an unknown name reports 0"] = \
             (st == 200 and body.get("money") == 0)
         done["C: ...and reports exists=false"] = (body.get("exists") is False)
+
+        # ---- A2: a READ MUST NOT WRITE ------------------------------------
+        # The three grant paths above all answer "what does it cost to make a
+        # name exist". This one asks the prior question: does merely ASKING
+        # create it? On master 1221bea it did -- 2,000 reads of fresh names
+        # grew the ledger from 65 to 32,958 bytes while honestly replying
+        # exists=false. A storage mint, not a coin mint, and the honest
+        # response is what hid it. Measured as a LEDGER BYTE COUNT so it
+        # cannot be satisfied by a status code.
+        import os as _os
+        ledger_path = _os.path.join(work, "accounts.json")
+        before_size = _os.path.getsize(ledger_path)
+        before_accounts = len(call(port, "GET", "/accounts")[1]["accounts"])
+        for i in range(20):
+            call(port, "GET", "/balance/read-only-%d" % i)
+        after_size = _os.path.getsize(ledger_path)
+        after_accounts = len(call(port, "GET", "/accounts")[1]["accounts"])
+        done["A2 reads create no accounts"] = (after_accounts == before_accounts)
+        done["A2 reads do not grow the ledger"] = (after_size == before_size)
 
         st, _ = call(port, "POST", "/transfer",
                      {"from": "ghost-b", "to": "victim", "amount": 1000})
@@ -352,6 +385,11 @@ def main():
         "pre-fix: all three creation paths mint": minted_before > 0,
         "pre-fix: a fresh recipient CAN spend the grant":
             not before["B: a fresh RECIPIENT cannot spend a grant"],
+        # CALIBRATION for A2: the pre-fix bank CREATES on read, so a read
+        # check that passes here is not testing the read path. This is the
+        # control that would have caught the defect the grant checks missed.
+        "calibration: A2 reads-write on the pre-fix bank":
+            not before["A2 reads create no accounts"],
         "post-fix: every check holds": all(after.values()),
         "post-fix: zero coins created": minted_after == 0,
         "post-fix: legitimate paths still work":

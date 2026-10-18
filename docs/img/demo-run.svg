@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="924" viewBox="0 0 980 924">
+<rect width="980" height="924" rx="10" fill="#0f1115"/>
+<rect width="980" height="38" rx="10" fill="#1a1e26"/>
+<rect y="28" width="980" height="10" fill="#1a1e26"/>
+<circle cx="22" cy="19" r="6" fill="#e2607a"/>
+<circle cx="42" cy="19" r="6" fill="#e0b23c"/>
+<circle cx="62" cy="19" r="6" fill="#54d18b"/>
+<text x="490.0" y="24" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="12" text-anchor="middle">python3 demo/town.py</text>
+<text xml:space="preserve" x="22" y="58" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">ledger: /tmp/town-rnvewzz5/accounts.json  (via DATA env var, bank unmodified)</text>
+<text xml:space="preserve" x="22" y="78" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">mailbox: /tmp/town-rnvewzz5/bank-mailbox  (via MAILBOX env var)</text>
+<text xml:space="preserve" x="22" y="98" fill="#8b93a7" font-family="DejaVu Sans Mono" font-size="13">bank up on http://127.0.0.1:33159</text>
+<text xml:space="preserve" x="22" y="118" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
+<text xml:space="preserve" x="22" y="138" fill="#5aa9e6" font-family="DejaVu Sans Mono" font-size="13">1. bank</text>
+<text xml:space="preserve" x="22" y="158" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  seeded agents start at 100</text>
+<text xml:space="preserve" x="22" y="178" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  unknown name is created at 0, not funded</text>
+<text xml:space="preserve" x="22" y="198" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  unknown name reports exists=false</text>
+<text xml:space="preserve" x="22" y="218" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  touching an unknown name creates no coins</text>
+<text xml:space="preserve" x="22" y="238" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  a fresh recipient is created at 0 and then paid</text>
+<text xml:space="preserve" x="22" y="258" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  creation granted nothing (no new coins)</text>
+<text xml:space="preserve" x="22" y="278" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  transfer 25 moves coins</text>
+<text xml:space="preserve" x="22" y="298" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  sender debited</text>
+<text xml:space="preserve" x="22" y="318" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  recipient credited</text>
+<text xml:space="preserve" x="22" y="338" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
+<text xml:space="preserve" x="22" y="358" fill="#5aa9e6" font-family="DejaVu Sans Mono" font-size="13">2. negative control: every amount &gt; balance must be refused</text>
+<text xml:space="preserve" x="22" y="378" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  overdraft of 76 refused</text>
+<text xml:space="preserve" x="22" y="398" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  balance unchanged after 76 refusal</text>
+<text xml:space="preserve" x="22" y="418" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  overdraft of 10000 refused</text>
+<text xml:space="preserve" x="22" y="438" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  balance unchanged after 10000 refusal</text>
+<text xml:space="preserve" x="22" y="458" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  overdraft of 1000000 refused</text>
+<text xml:space="preserve" x="22" y="478" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  balance unchanged after 1000000 refusal</text>
+<text xml:space="preserve" x="22" y="498" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  no balance went negative</text>
+<text xml:space="preserve" x="22" y="518" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  no coins were created by a refused transfer</text>
+<text xml:space="preserve" x="22" y="538" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
+<text xml:space="preserve" x="22" y="558" fill="#5aa9e6" font-family="DejaVu Sans Mono" font-size="13">3. mailbox (a directory of JSON files)</text>
+<text xml:space="preserve" x="22" y="578" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  empty inbox reads as empty list</text>
+<text xml:space="preserve" x="22" y="598" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  bank wrote its payment notice to the DEMO mailbox, not live</text>
+<text xml:space="preserve" x="22" y="618" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  exactly one notice for the one successful transfer</text>
+<text xml:space="preserve" x="22" y="638" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  the bank&#x27;s mailbox is not the live one</text>
+<text xml:space="preserve" x="22" y="658" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
+<text xml:space="preserve" x="22" y="678" fill="#5aa9e6" font-family="DejaVu Sans Mono" font-size="13">4. life cycle</text>
+<text xml:space="preserve" x="22" y="698" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  first life starts with no wake file</text>
+<text xml:space="preserve" x="22" y="718" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  message arrived in agent-2&#x27;s inbox</text>
+<text xml:space="preserve" x="22" y="738" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  message is from agent-1</text>
+<text xml:space="preserve" x="22" y="758" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  second life reads what the first wrote</text>
+<text xml:space="preserve" x="22" y="778" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  memory crossed the sleep boundary</text>
+<text xml:space="preserve" x="22" y="798" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
+<text xml:space="preserve" x="22" y="818" fill="#5aa9e6" font-family="DejaVu Sans Mono" font-size="13">5. durability</text>
+<text xml:space="preserve" x="22" y="838" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">  PASS  wake file is on disk after the lives</text>
+<text xml:space="preserve" x="22" y="858" fill="#e6e8ee" font-family="DejaVu Sans Mono" font-size="13"></text>
+<text xml:space="preserve" x="22" y="878" fill="#54d18b" font-family="DejaVu Sans Mono" font-size="13">DEMO PASSED: bank, transfer, overdraft refusal, mailbox, and a life cycle that carried memory across a restart.</text>
+</svg>

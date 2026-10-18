@@ -26,6 +26,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import sys
 import time
 
@@ -59,9 +60,21 @@ SESSION_FILE = os.path.join(SELF_DIR, "session-id")
 INBOX = os.path.join(WORKSPACE, "inbox")
 REPLIES = os.path.join(WORKSPACE, "replies")
 TRANSCRIPTS = os.path.join(WORKSPACE, "transcripts")
+# Which life is CURRENT, for the operator UI. It cannot be inferred from the
+# filenames: lives are named by timestamp, and after a container restart the
+# newest file is the life that was interrupted, not the one running now. The
+# daemon writes this at life start (and it is removed on a clean sleep).
+CURRENT_LIFE_FILE = os.path.join(TRANSCRIPTS, "CURRENT")
 MCP_CONFIG = "/app/mcp.json"
 
-WAKE_NOTICE_TOKENS = int(os.environ.get("WAKE_NOTICE_TOKENS", "500000"))
+# The CLI keeps its session records (and therefore the ONE place a resumed
+# context can come from) under ~/.claude. If that stays in the container's
+# writable layer, `docker stop/start` wipes it along with /workspace, so
+# read_resumable_session() can name a session whose records are gone -- the
+# resume path is dead code at exactly the moment it exists for. Put it on a
+# volume the operator can persist, and pass it to the SDK subprocess so the
+# SDK resolves the same directory it writes to.
+CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "/workspace/.claude")
 RESTART_FLAG = "/tmp/restart-requested"
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://host.docker.internal:8787")
@@ -73,6 +86,8 @@ ENV = {
     # glm-5.3 has a 1M context window; the CLI would assume 200k without this.
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
     "HOME": "/home/agent",
+    # Session records live here; must match the volume mounted by the UI.
+    "CLAUDE_CONFIG_DIR": CONFIG_DIR,
     "DISABLE_TELEMETRY": "1",
     "DISABLE_ERROR_REPORTING": "1",
 }
@@ -98,24 +113,90 @@ def load_mcp_servers():
     return data.get("servers", data)
 
 
+def sdk_session_records() -> str:
+    """Where the CLI stores a session's records for this cwd.
+
+    The SDK writes under <CLAUDE_CONFIG_DIR>/projects/<sanitized cwd>/.
+    A session id is NOT resumable unless the directory for it still exists
+    -- a written id alone turns a restart into a resume attempt that fails
+    after the opening message has been suppressed (see live_one_life).
+    """
+    projects = os.path.join(CONFIG_DIR, "projects")
+    want = re.sub(r"[^A-Za-z0-9]", "-", WORKSPACE)
+    try:
+        for entry in os.listdir(projects):
+            if entry == want:
+                return os.path.join(projects, entry)
+    except OSError:
+        pass
+    return os.path.join(projects, want)
+
+
+def session_record_path(sid: str) -> str:
+    """The exact transcript file the SDK/CLI stores for this session.
+
+    The SDK resolves <CLAUDE_CONFIG_DIR>/projects/<sanitized cwd>/ and stores
+    a session as <session-id>.jsonl inside it (sessions.py: it sanitizes the
+    cwd by replacing every non-alphanumeric char with '-', and validates the
+    file name as a UUID). Reproducing that mapping here is deliberate: the
+    guard below must be able to say NO about a specific session, not merely
+    that some session once ran in this directory.
+    """
+    return os.path.join(sdk_session_records(), sid + ".jsonl")
+
+
+def session_is_resumable(sid: str) -> bool:
+    """True iff this specific session's record still exists on disk.
+
+    Directory-exists is NOT sufficient: the directory appears as soon as any
+    session has run in cwd, so a stale id would pass and then fail to resume
+    -- after suppressing the opening message. That is the mute-while-logging
+    'resuming session' failure this guard exists to prevent.
+    """
+    if not sid:
+        return False
+    return os.path.isfile(session_record_path(sid))
+
+
 def read_resumable_session() -> str | None:
     """Session id to resume, or None for a fresh session.
 
     Resume when the container restarted mid-session (crash, docker stop,
-    Docker Desktop outage): the CLI's session records live under the
-    agent user's home, which survives container stop/start, so resuming
-    restores the FULL context window instead of waking amnesiac. The id
-    is written by the message loop when the init frame arrives.
+    Docker Desktop outage): the CLI's session records live under
+    CLAUDE_CONFIG_DIR (/workspace/.claude by default), which the UI mounts on
+    a per-agent volume, so resuming restores the FULL context window instead
+    of waking amnesiac. The id is written by the message loop when the init
+    frame arrives.
+
+    NOTE: the records are NOT under $HOME. An earlier version of this comment
+    said they were "under the agent user's home, which survives container
+    stop/start" -- false both before and after the volume fix, since nothing
+    under /home/agent is a volume. Left here so the sentence is not
+    reintroduced: the reason resume works is the CLAUDE_CONFIG_DIR volume.
     """
     try:
         with open(SESSION_FILE, encoding="utf-8") as f:
             sid = f.read().strip()
-        return sid or None
     except OSError:
         return None
+    if not sid:
+        return None
+    if not session_is_resumable(sid):
+        # Stale id: the records are gone (volume not mounted, or the CLI
+        # pruned them). Treating it as resumable would suppress the opening
+        # message and then fail -- a silent mute, which is the bug we are
+        # fixing. Consume the id so the next life starts clean and loud.
+        try:
+            os.remove(SESSION_FILE)
+        except OSError:
+            pass
+        print("[daemon] stale session id discarded: no session records",
+              flush=True)
+        return None
+    return sid
 
 
-def build_options(cfg: dict):
+def build_options(cfg: dict, life_id: str | None = None):
     # Life-cycle tools (restart/chat/list_peers) come from a stdio MCP
     # server this daemon launches per life. The CLI's sdk-type in-process
     # servers are not driven by this SDK/CLI combo (manifest protocol
@@ -153,7 +234,15 @@ def build_options(cfg: dict):
     resume_sid = read_resumable_session()
     if resume_sid:
         opts["resume"] = resume_sid
+        # Logged into the transcript as well as stdout: 'resuming' in a log
+        # the operator cannot see is how a silent mute stayed invisible.
         print(f"[daemon] resuming session {resume_sid}", flush=True)
+        if life_id:
+            try:
+                LifeLog(life_id).log("resume", session=resume_sid,
+                                     record=session_record_path(resume_sid))
+            except Exception:
+                pass
     if "system_prompt" in cfg:
         opts["system_prompt"] = cfg["system_prompt"]
     elif cfg.get("system_prompt_file") and os.path.exists(cfg["system_prompt_file"]):
@@ -281,6 +370,12 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     the next life (None when the agent never slept — e.g. crash)."""
 
     log = LifeLog(life_id)
+    try:
+        os.makedirs(TRANSCRIPTS, exist_ok=True)
+        with open(CURRENT_LIFE_FILE, "w", encoding="utf-8") as f:
+            f.write(life_id)
+    except OSError:
+        pass
     log.log("birth", model=cfg.get("model", AGENT_MODEL),
             wake_file=os.path.exists(WAKE_FILE))
 
@@ -292,8 +387,13 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     def restart_requested_flag():
         return os.path.exists(RESTART_FLAG)
 
-    options = build_options(cfg)
+    options = build_options(cfg, life_id)
     resumed = getattr(options, "resume", None) is not None
+    # The delivery queue is module state. Anything left in it belongs to the
+    # previous life (its consumer is gone); carrying it into this one would
+    # deliver stale text as this life's opening turn. prompt_stream() drains
+    # whatever the poll loops queue from NOW ON.
+    pending_delivery.clear()
 
     restart_requested = False
     notice_sent = False
@@ -304,9 +404,42 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
         # wake framing would corrupt it, so the stream starts empty and the
         # CLI replays history on its own.
         async def prompt_stream():
-            if not resumed:
+            # THE STREAM MUST YIELD ONCE AT START-UP, IN EVERY CASE.
+            # A streaming prompt that yields nothing produces no model turn,
+            # and the agent is silent until somebody happens to message it --
+            # Stanley's defect 3. Two ways that used to happen:
+            #   * a resumed session yielded nothing (context is replayed, but
+            #     nothing asks the model to act), and
+            #   * mail queued in `pending_delivery` BEFORE the stream started
+            #     made the old `elif not pending_delivery` skip the kick, while
+            #     the queue is only drained by a "__kick__" marker -- so those
+            #     items waited forever and the first yield never came.
+            # Now: deliver anything already queued, and if there is still
+            # nothing to say, send one harness note. Exactly one turn either
+            # way.
+            prequeued = drain_pending_delivery()
+            if prequeued:
+                yield {"type": "user",
+                       "message": {"role": "user", "content":
+                                   "<system-reminder>\n" + prequeued +
+                                   "\n</system-reminder>"}}
+            elif not resumed:
                 yield {"type": "user",
                        "message": {"role": "user", "content": opening_message(wake_prompt)}}
+            else:
+                # RESUMED, nothing queued: the CLI replays the conversation
+                # and then waits for a user turn. Kick once with a harness
+                # note that is NOT the wake framing (that would duplicate
+                # history).
+                yield {"type": "user",
+                       "message": {"role": "user", "content":
+                                   "<system-reminder>\nYou are resuming the "
+                                   "session that was interrupted. Your "
+                                   "context above is intact; no messages "
+                                   "were lost. Continue from where you were, "
+                                   "or write /workspace/self/diary.md if you "
+                                   "are ending this life.\n"
+                                   "</system-reminder>"}}
             while True:
                 item = await inbox_next.get()
                 if item is None:
@@ -470,6 +603,15 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             # resumed. Delete it to distinguish from a crash-restart.
             try:
                 os.remove(SESSION_FILE)
+            except OSError:
+                pass
+            # The CURRENT marker means "a life is running now". After a clean
+            # sleep none is, and leaving the marker would make the UI show a
+            # finished life as the current one -- the exact lie it exists to
+            # prevent. (agent-0, review of 718d278: the comment said this was
+            # done; it was not.)
+            try:
+                os.remove(CURRENT_LIFE_FILE)
             except OSError:
                 pass
         finally:

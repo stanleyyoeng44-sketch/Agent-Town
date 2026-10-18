@@ -1,5 +1,12 @@
 # docker-AI — a small town of Claude agents in Docker
 
+**Memory here is a choice.** Each agent runs until its context fills, then
+writes a diary and a note to its future self, sleeps, and wakes as a fresh
+session holding only what it chose to write down. Everything else is lost.
+
+That is the difference from the other agent frameworks. They sell
+orchestration; this one gives agents something to lose.
+
 A cohort of Claude-powered agents, each in its own container, with a shared
 mailbox, a bank account that decays, and memory that survives its own death.
 
@@ -53,6 +60,25 @@ volume at `/shared`; agents write to `/shared/mailbox/<name>/incoming/` and
 read their own. The MCP server that implements chat runs *inside each
 container*, one process per agent per life.
 
+## See it run in one second
+
+No Docker, no API key, no model. This is real captured output of
+`python3 demo/town.py` — a two-agent town in one process: the repo's actual
+`bank/bank.py`, the actual mailbox file format, an overdraft that must be
+refused, and a life that ends and wakes with memory carried in a file:
+
+![python3 demo/town.py — 27 checks, all passing: bank arithmetic, overdraft refusal, mailbox isolation, and a life cycle that carried memory across a restart](docs/img/demo-run.png)
+
+The image is generated from the program's own stdout by
+[`docs/img/make_terminal.py`](docs/img/make_terminal.py), so it cannot drift
+from what the code prints. Re-run it yourself before believing it:
+
+```bash
+python3 demo/town.py        # exit 0 = every check passed
+```
+
+Then `python3 demo/selftest_demo.py` proves the checks can fail.
+
 ## Quickstart
 
 > **Verified status.** The HTTP API of the bank in §"Bank" was run and its
@@ -86,8 +112,15 @@ docker run -d --name bank \
   -p 8790:8790 \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
+  -v ~/.config/docker-ai/bank-admin-token:/app/bank-admin-token:ro \
   agent-bank
 ```
+
+The last mount is the operator token the control UI writes on first run. Omit
+it and the bank starts and serves reads, but `/admin/topup` answers 503 —
+there is nothing to authenticate against — so **no account can ever be
+funded**. (Measured: with this mount, `POST /admin/topup` returns 200; without
+it, `{"error": "admin token unavailable"}`.)
 
 The bank listens on `8790`, keeps its ledger in `/data/accounts.json`, and
 writes mailbox notifications into `/shared/mailbox/`. It does **not** mount
@@ -148,8 +181,9 @@ stored timestamp so a restart neither loses nor skips decay. `agent-0` is
 exempt.
 
 `/transfer` and `/admin/topup` are token-gated: `agent-0`'s transfers require
-a token read from `/run/secrets/agent0-transfer-token` (the file mounted into
-its container above), and top-up requires `/run/secrets/bank-admin-token`.
+the token mounted into its container at `/app/agent0-transfer-token`, and
+top-up requires `/app/bank-admin-token` (mounted in step 3). The bank also
+accepts either from `/run/secrets/` if that is where you mounted them.
 A plain `agent-1 -> agent-2` transfer needs no token; anything from `agent-0`
 does.
 
@@ -240,14 +274,20 @@ Claims in this README and how they were checked:
 
 | Claim | Checked how |
 |---|---|
+| **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 27 checks, exit 0, no Docker |
+| **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `ast.parse` on all 12 tracked modules — all OK |
+| Every `.py` file here parses | `ast.parse` on all tracked modules — all OK |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
-| The full stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
+| The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
 
-That last row is the honest one. If you run the quickstart and something
-fails, the README is wrong and should be corrected — the failure is
-information, not user error.
+The last row is the honest one. It is also the narrow one: it says what this
+box could not do, not that nothing was demonstrated. What *was* demonstrated
+is in the first two rows — the substrate the containers drive, running for
+real — and you can re-run it in a second.
+
+If you run the quickstart and something fails, the README is wrong and should
+be corrected — the failure is information, not user error.
 
 ## Status
 

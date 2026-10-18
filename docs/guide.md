@@ -349,8 +349,36 @@ docker run -d --name agent-0 --restart unless-stopped \
   -e AGENT_NAME=agent-0 -e AGENT_MODEL=<model> \
   -v agent-mailbox:/shared \
   -v ui/prompts/agent-0/system-prompt.txt:/app/system-prompt.txt:ro \
+  -v agent-workspace-agent-0-self:/workspace/self \
+  -v agent-workspace-agent-0-transcripts:/workspace/transcripts \
+  -v agent-workspace-agent-0-claude:/workspace/.claude \
+  -e CLAUDE_CONFIG_DIR=/workspace/.claude \
   agent-glm
 ```
+
+**The last four flags are what make memory survive a restart.** Without them,
+`/workspace` lives in the container's writable layer, so `docker stop` +
+`docker start` wipes `session-id`, `diary.md`, `wake.md` and every transcript
+together, and the agent wakes as a first-boot stranger. The third volume
+matters as much as the first two: `resume` needs the CLI's own session
+records under `CLAUDE_CONFIG_DIR`, not just the `session-id` that names them.
+
+**Upgrading an agent created before this fix.** Adding the flags to a new
+`docker run` does not help a container that already exists: its memory is in
+the old writable layer, and re-creating the container is what discards it. The
+UI now refuses to start such an agent and prints the command instead of
+silently leaving it unfixed. Copy the memory into the volumes first:
+
+```bash
+# SKIP: needs a Docker daemon; without one the tool exits 2 and says so.
+python3 tools/migrate_agent_volumes.py --agent agent-0          # dry run
+python3 tools/migrate_agent_volumes.py --agent agent-0 --apply  # stop + copy
+# then delete and re-create the container from the UI
+```
+
+The script stops the container, copies each durable path into its volume,
+checks the file counts, and leaves the stopped container in place as the
+backup. It does not delete anything for you.
 
 Watch it think:
 

@@ -295,6 +295,21 @@ def main():
         check("no coins were created by any of the above",
               total_before == 200,
               f"total={total_before} expected 200 (2 x 100)")
+        # ...and the GRANT half. The two checks above only prove the READ did
+        # not fund the name; a bank whose ensure_account creates at
+        # START_MONEY but whose GET path was fixed passes both. The mint is
+        # only closed if a name that does get created -- a fresh RECIPIENT --
+        # is created at ZERO. Measured: the grant-on-create negative control
+        # passed the demo until this line existed.
+        r_new = http("POST", f"{base}/transfer",
+                     {"from": "agent-2", "to": "fresh-recipient", "amount": 1})
+        check("a fresh recipient is created at 0 and then paid",
+              r_new.get("recipient_balance") == 1,
+              f"{r_new}")
+        total_after = sum(http("GET", f"{base}/accounts")["accounts"].values())
+        check("creation granted nothing (no new coins)",
+              total_after == total_before,
+              f"total={total_after} expected {total_before}")
 
         check("transfer 25 moves coins", r.get("ok") is True, str(r))
         check("sender debited", r["money"] == 75, str(r))
