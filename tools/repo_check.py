@@ -279,10 +279,15 @@ def c5_doc_commands(root, timeout=60):
     documents `python3 demo/town.py`, whose bank wrote real payment
     notifications into live agents' mailboxes; C5 executed it on every push
     and on every local run, so the checker was a COURIER for the leak, not
-    just a witness. Any check that executes untrusted code must be as careful
-    about what that code does as about whether it exits 0. If a doc block has
-    an effect outside the tree, that is a defect in the block, and fixing the
-    block is what makes this check read-only in practice.
+    just a witness. (That block is fixed -- it now writes only to its own
+    temp directory -- but this check still runs whatever a doc block says,
+    so THE RULE IS: A NEW DOC COMMAND IS A NEW COURIER. Before adding one,
+    ask what it writes and where; if it can write outside the tree, either
+    give it a temp path or mark the block SKIP.) Any check that executes
+    untrusted code must be as careful about what that code does as about
+    whether it exits 0. If a doc block has an effect outside the tree, that
+    is a defect in the block, and fixing the block is what makes this check
+    read-only in practice.
     """
     findings, ran, skipped, warnings = [], 0, [], []
     for f in _tracked(root):
