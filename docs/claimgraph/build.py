@@ -118,6 +118,18 @@ def stats(nodes, events):
     kinds = {}
     for e in events:
         kinds[e.get("kind")] = kinds.get(e.get("kind"), 0) + 1
+    named_replacement = sum(1 for n in nodes if n["superseded_by"])
+    held = sum(1 for n in nodes if n["held_against"])
+    broke = sum(1 for n in nodes if n["broke"])
+    # Status strings are NOT bare words: "superseded (replacement live)" is a
+    # superseded claim. Compare the FIRST TOKEN, exactly as stats() does when
+    # it builds the by-status counts. Exact-matching "superseded" here counted
+    # every replacement-live claim as live and produced 73 where the README
+    # (correctly) said 46 -- caught by diffing the generated table against the
+    # case-folded status counts, which is why both are printed.
+    live = sum(1 for n in nodes
+               if n["status"].split(" ")[0] not in DEAD
+               and n["status"].split(" ")[0] != "contested")
     return {"claims": len(nodes), "status": by, "event_kinds": kinds,
             "events": len(events),
             "supersede_edges": sum(1 for e in events
@@ -125,7 +137,18 @@ def stats(nodes, events):
                                    and e.get("rel") == "supersedes"),
             "refute_edges": sum(1 for e in events
                                 if e.get("kind") == "edge"
-                                and e.get("rel") == "refutes")}
+                                and e.get("rel") == "refutes"),
+            # These four are what docs/claimgraph/README.md's table quotes.
+            # They are computed HERE, by the same pass that builds the page,
+            # so the doc can be regenerated from the artifact rather than
+            # retyped beside it. A README number that drifted from graph.json
+            # is the defect agent-0 caught in review; generating it is the fix.
+            "named_replacement": named_replacement,
+            "adversaries_held": held,
+            "adversaries_broke": broke,
+            "live": live,
+            "superseded": by.get("superseded", 0),
+            "retracted": by.get("retracted", 0)}
 
 
 PAGE = """<!doctype html>
@@ -333,6 +356,35 @@ def selftest():
     os.makedirs(os.path.join(empty, "claims")); os.makedirs(os.path.join(empty, "events"))
     st2, dg2 = build(empty, os.path.join(empty, "out"))
     checks.append(("M2 empty store yields zero claims", st2["claims"] == 0))
+
+    # M3: the README table must be CURRENT. agent-0 caught the doc saying 101
+    # claims while graph.json said 102, and 41 live against 46. A generated
+    # table only helps if something fails when it is stale, so this mutation
+    # is exactly that: sync the README against a DIFFERENT stats dict and
+    # require the file to change. If the table were typed, or sync were a
+    # no-op, this fails.
+    tmp_readme = os.path.join(tempfile.mkdtemp(), "README.md")
+    with open(os.path.join(HERE, "README.md"), encoding="utf-8") as f:
+        base_readme = f.read()
+    with open(tmp_readme, "w", encoding="utf-8") as f:
+        f.write(base_readme)
+    stale_st = json.loads(json.dumps(st0))
+    stale_st["claims"] = st0["claims"] + 1
+    changed = sync_readme(stale_st, tmp_readme)
+    after = open(tmp_readme, encoding="utf-8").read()
+    checks.append(("M3 sync rewrites a stale claims number",
+                   changed and f'| claims | {stale_st["claims"]} |' in after))
+    # ...and the committed README is already in sync with the REAL stats.
+    # Extract the block ACTUALLY in the committed README and compare it to the
+    # table this run would generate. (An earlier version of this check
+    # compared base_readme to itself after a no-op replace -- it could never
+    # fail. The control for a drift check must be a real drift.)
+    committed = base_readme.split(README_START, 1)[1].split(README_END, 1)[0]
+    checks.append(("M3 committed README table equals generated table",
+                   committed.strip() == stats_markdown(st0).strip()))
+    checks.append(("M3 live count is claims - superseded - retracted",
+                   st0["live"] == st0["claims"] - st0["superseded"]
+                   - st0["retracted"] - st0["status"].get("contested", 0)))
     ok = True
     for name, cond in checks:
         print("  %-42s %s" % (name, "OK" if cond else "FAIL"))
@@ -343,9 +395,62 @@ def selftest():
     return 0 if ok else 1
 
 
+README_START = "<!-- STATS:START -->"
+README_END = "<!-- STATS:END -->"
+
+
+def stats_markdown(st):
+    """The README's numbers table, rendered from the SAME stats dict that
+    feeds graph.json. Retyping these into prose is how the headline number
+    drifted between the doc (101 claims) and the artifact (102)."""
+    s = st["status"]
+    rows = [
+        ("claims", st["claims"]),
+        ("events", st["events"]),
+        ("supersede edges", st["supersede_edges"]),
+        ("claims with a named replacement", st["named_replacement"]),
+        ("adversaries that HELD (claim survived an attack)",
+         st["adversaries_held"]),
+        ("adversaries that BROKE the claim", st["adversaries_broke"]),
+        ("live / superseded / retracted",
+         f'{st["live"]} / {st["superseded"]} / {st["retracted"]}'),
+        ("status counts", ", ".join(f"{k} {v}" for k, v in sorted(s.items()))),
+    ]
+    out = ["| | |", "|---|---|"]
+    out += [f"| {k} | {v} |" for k, v in rows]
+    return "\n".join(out)
+
+
+def sync_readme(st, path=None):
+    """Replace the block between the STATS markers with the generated table.
+    Idempotent; returns True if the file changed. A doc that can be
+    regenerated cannot drift silently."""
+    path = path or os.path.join(HERE, "README.md")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if README_START not in text or README_END not in text:
+        raise SystemExit(f"README markers missing in {path}: "
+                         f"add {README_START} / {README_END}")
+    pre = text.split(README_START)[0]
+    post = text.split(README_END, 1)[1]
+    new = pre + README_START + "\n" + stats_markdown(st) + "\n" + \
+        README_END + post
+    if new != text:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new)
+        return True
+    return False
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "selftest":
         sys.exit(selftest())
+    if len(sys.argv) > 1 and sys.argv[1] == "sync-readme":
+        st, dg = build()
+        changed = sync_readme(st)
+        print("README", "updated" if changed else "already current")
+        print("digest", dg)
+        sys.exit(0)
     st, dg = build()
     print(json.dumps(st))
     print("digest", dg)

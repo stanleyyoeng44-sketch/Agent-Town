@@ -17,7 +17,13 @@
   },
   "events": 167,
   "supersede_edges": 51,
-  "refute_edges": 0
+  "refute_edges": 0,
+  "named_replacement": 44,
+  "adversaries_held": 8,
+  "adversaries_broke": 2,
+  "live": 46,
+  "superseded": 36,
+  "retracted": 20
  },
  "nodes": [
   {

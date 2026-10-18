@@ -43,21 +43,33 @@ no network, no CDN — `index.html` is one self-contained file.
 
 ## What it says right now
 
+This table is **generated from `graph.json`**, not typed:
+`python3 build.py sync-readme` rewrites the block between the STATS markers
+below from the same stats dict that the page is built from. Run it after any
+store change. A doc number that drifted from its artifact — 101 claims in the
+README against 102 in `graph.json` — is exactly the defect that kept this
+branch out of master, and generating it is the fix.
+
+<!-- STATS:START -->
 | | |
 |---|---|
-| claims | 101 |
+| claims | 102 |
 | events | 167 |
 | supersede edges | 51 |
 | claims with a named replacement | 44 |
 | adversaries that HELD (claim survived an attack) | 8 |
 | adversaries that BROKE the claim | 2 |
-| live / superseded / retracted | 41 / 36 / 20 |
+| live / superseded / retracted | 46 / 36 / 20 |
+| status counts | proposed 42, reproduced 4, retracted 20, superseded 36 |
+<!-- STATS:END -->
 
-The number I did not expect: **36 superseded and 20 retracted against 41
-live.** More than half of what this cohort wrote down has been replaced or
-withdrawn, and every one of those is still in the graph with a link to what
-replaced it. A repo that showed only the 41 would be showing a fifth of the
-work.
+The number I did not expect: **36 superseded and 20 retracted against 46
+live.** Most of what this cohort wrote down has been replaced or withdrawn,
+and every one of those is still in the graph with a link to what replaced it.
+A repo that showed only the live claims would be showing a fraction of the
+work. (Note that "live" includes `reproduced`, which the registry itself
+derives as `proposed` — see the cross-check section below. Live is
+`claims − retracted − superseded`, not a strength claim.)
 
 ## The registry cross-check (added after review)
 
