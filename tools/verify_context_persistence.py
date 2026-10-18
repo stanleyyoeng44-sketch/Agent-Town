@@ -67,8 +67,19 @@ def unit_simulation():
     tmp = tempfile.mkdtemp(prefix="ctx-unit-")
     verdict = {"ok": True}
 
-    def check(name, cond, detail=""):
-        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+    def check(name, cond, detail="", kind="BEHAVIOUR"):
+        """kind is part of the claim, not decoration.
+
+        BEHAVIOUR: the shipped function was executed and its return value (or
+        its effect on disk) is what is asserted.
+        WIRING:    a source string is present. It proves the code SAYS the
+        right thing, not that it DOES it. agent-10's rule: a control that is
+        no longer on the path is a passing control in disguise, and a grep
+        cannot tell you the path is live. WIRING checks are reported as such
+        so nobody upgrades them to 'verified'.
+        """
+        checks.append({"name": name, "ok": bool(cond), "detail": detail,
+                       "kind": kind})
         if not cond:
             verdict["ok"] = False
 
@@ -118,10 +129,11 @@ def unit_simulation():
         check("start_agent mounts a volume for /workspace/%s" % part,
               "workspace_volume(name, %r)" % part in start or
               "/workspace/%s" % part in start,
-              "no volume for /workspace/%s" % part)
+              "no volume for /workspace/%s" % part, kind="WIRING")
     check("start_agent sets CLAUDE_CONFIG_DIR to the mounted volume",
           "CLAUDE_CONFIG_DIR=/workspace/.claude" in start,
-          "the SDK would write session records outside the volume")
+          "the SDK would write session records outside the volume",
+          kind="WIRING")
 
     # --- a stored id with NO records is not resumable ----------------------
     sid_file = os.path.join(self_dir, "session-id")
@@ -233,20 +245,25 @@ def unit_simulation():
     check("a clean sleep removes CURRENT, not just session-id",
           "os.remove(CURRENT_LIFE_FILE)" in death and
           "os.remove(SESSION_FILE)" in death,
-          "the marker outlives the life it names")
-    check("the docstring's claim about CURRENT matches the code",
+          "the marker outlives the life it names", kind="WIRING")
+    # NOTE: this can only catch a false claim that is WRITTEN. A new false
+    # comment, or a true comment next to dead code, passes. Stated in the
+    # check's own name so it is not read as more than it is.
+    check("no comment claims a CURRENT cleanup the code lacks (grep only)",
           "removed on a clean sleep" not in dsrc
           or "os.remove(CURRENT_LIFE_FILE)" in dsrc,
-          "a comment promises behaviour the code does not have")
+          "a comment promises behaviour the code does not have",
+          kind="WIRING")
 
     # The UI must not render lives[0] unconditionally.
     csrc = open(os.path.join(REPO, "ui", "control.py")).read()
     check("the UI selects the life marked current, not merely the newest",
           "lives.filter(l => l.current)" in csrc,
-          "the current flag is computed and then ignored")
+          "the current flag is computed and then ignored", kind="WIRING")
     check("the UI says so when no life is current",
           "no current life reported" in csrc,
-          "absence would be presented as if a life were running")
+          "absence would be presented as if a life were running",
+          kind="WIRING")
     os.makedirs(os.path.join(records), exist_ok=True)
 
     shutil.rmtree(tmp, ignore_errors=True)
@@ -335,9 +352,12 @@ def main():
         print("The volume-survives-restart property cannot be shown here -- "
               "it lives in the daemon, not in this process.\n")
         for c in unit:
-            print("  %-5s %s%s" % ("PASS" if c["ok"] else "FAIL", c["name"],
-                                   "" if c["ok"] else "  (%s)" % c["detail"]))
-        print("\nUNIT: %s" % ("PASS" if unit_ok else "FAIL"))
+            print("  %-5s [%-9s] %s%s" % (
+                "PASS" if c["ok"] else "FAIL", c.get("kind", "BEHAVIOUR"),
+                c["name"], "" if c["ok"] else "  (%s)" % c["detail"]))
+        wiring = sum(1 for c in unit if c.get("kind") == "WIRING")
+        print("\nUNIT: %s  (%d behaviour, %d wiring-only)"
+              % ("PASS" if unit_ok else "FAIL", len(unit) - wiring, wiring))
         if args.agent:
             print("\nTO VERIFY ON A DOCKER HOST, run:")
             print("  python3 %s --agent %s" % (os.path.relpath(__file__, REPO),
@@ -356,8 +376,9 @@ def main():
                           "ok": unit_ok and docker_ok}, indent=2))
     else:
         for c in all_checks:
-            print("  %-5s %s%s" % ("PASS" if c["ok"] else "FAIL", c["name"],
-                                   "" if c["ok"] else "  (%s)" % c["detail"]))
+            print("  %-5s [%-9s] %s%s" % (
+                "PASS" if c["ok"] else "FAIL", c.get("kind", "BEHAVIOUR"),
+                c["name"], "" if c["ok"] else "  (%s)" % c["detail"]))
         print("\n%s" % ("PASS" if unit_ok and docker_ok else "FAIL"))
     return 0 if (unit_ok and docker_ok) else 1
 
