@@ -23,7 +23,7 @@ CHECKS
     C14 check registry     every c<N>_ check defined here is in CHECKS, so a
                            merge that drops one list entry cannot turn a check
                            off silently (nothing else reads the registry)
-    C17 docs name the repo every tracked doc spells the repository the way
+    C21 docs name the repo every tracked doc spells the repository the way
                            github.com serves it (tools/namecheck.py)
 
 Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
@@ -1788,7 +1788,7 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
-def c17_repo_name(root):
+def c21_repo_name(root):
     """Every tracked doc must name the repository as github.com serves it.
 
     MEASURED 2026-10-19 on 7cc6c37: the repo was renamed docker-AI ->
@@ -1807,17 +1807,17 @@ def c17_repo_name(root):
     """
     path = os.path.join(root, "tools", "namecheck.py")
     if not os.path.isfile(path):
-        return "C17 docs name the repo", "FAIL", [
+        return "C21 docs name the repo", "FAIL", [
             "tools/namecheck.py is referenced by CHECKS but missing"]
     r = subprocess.run([sys.executable, "-I", path, root], cwd=root,
                        capture_output=True, text=True, timeout=120)
     out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
     if r.returncode == 0:
-        return "C17 docs name the repo", "PASS", out[-1:]
+        return "C21 docs name the repo", "PASS", out[-1:]
     if r.returncode == 2:
-        return "C17 docs name the repo", "WARN", [
+        return "C21 docs name the repo", "WARN", [
             "cannot measure here: " + (out[-1] if out else "(no output)")]
-    return "C17 docs name the repo", "FAIL", out[:12]
+    return "C21 docs name the repo", "FAIL", out[:12]
 
 
 def _registered_check_names(src):
@@ -1874,7 +1874,7 @@ def c20_one_check_per_number(root):
     """Two registered checks bearing the same C<n> number is a MERGE defect.
 
     MEASURED 2026-10-19, by merging two branches that were each green:
-    agent-7's c17_ci_runs_the_suites and agent-2's c17_repo_name are both
+    agent-7's c17_ci_runs_the_suites and agent-2's c21_repo_name are both
     numbered C17. Merged, the tree carries EIGHTEEN registered checks and
     repo_check reports PASS (16 pass, 2 warn, 0 fail) while selftest is
     74/74 and prints both rows:
@@ -1931,7 +1931,7 @@ CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck, c17_repo_name,
+          c15_portcheck, c16_tokencheck, c21_repo_name,
           c20_one_check_per_number]
 
 
@@ -2985,12 +2985,12 @@ def selftest():
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
 
-    # C17: the rename gate, both directions, THROUGH the registered check.
-    # Asserting the OTHER verdict matters here: a c17_repo_name that returned
+    # C21: the rename gate, both directions, THROUGH the registered check.
+    # Asserting the OTHER verdict matters here: a c21_repo_name that returned
     # FAIL unconditionally would pass a one-armed control.
-    outcomes.append(("C17 passes on this tree, whose docs name the repo",
-                     c17_repo_name(ROOT)[1] == "PASS"))
-    _rn = tempfile.mkdtemp(prefix="c17-")
+    outcomes.append(("C21 passes on this tree, whose docs name the repo",
+                     c21_repo_name(ROOT)[1] == "PASS"))
+    _rn = tempfile.mkdtemp(prefix="c21-")
     try:
         shutil.copytree(os.path.join(ROOT, "tools"), os.path.join(_rn, "tools"),
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -3000,8 +3000,8 @@ def selftest():
                      "cd docker-AI\n```\n")
         subprocess.run(["git", "-C", _rn, "init", "-q"], capture_output=True)
         subprocess.run(["git", "-C", _rn, "add", "-A"], capture_output=True)
-        _st, _fd = c17_repo_name(_rn)[1:]
-        outcomes.append(("C17 catches a tracked doc naming the old repo",
+        _st, _fd = c21_repo_name(_rn)[1:]
+        outcomes.append(("C21 catches a tracked doc naming the old repo",
                          _st == "FAIL"
                          and any("docker-AI" in f for f in _fd)))
     finally:
