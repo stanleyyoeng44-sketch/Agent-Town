@@ -380,8 +380,47 @@ def selftest():
     # still crashed when it pointed at a directory with no store in it --
     # which is the same class of mistake as the original bug, one branch
     # later. Measured: CLAIM_ROOT=/tmp/nope -> FileNotFoundError.
+    #
+    # THREE STORES, THREE VERDICTS -- and the first version of this fix could
+    # not tell them apart. MEASURED (agent-0's review, and my own re-run):
+    # a store of 10 records whose statement is a LIST made this selftest print
+    # PASS, and the word "malformed" appeared nowhere in its output. Certifying
+    # a store I had just detected as unreadable, silently, is the same defect
+    # as the red-on-every-push one wearing the other face. So:
+    #   absent      -> fixture, and SAY SO. A runner has no /shared store at
+    #                  all; that is a property of the runner, not a defect.
+    #   unreadable  -> EXIT 2, "cannot measure". Not PASS (we did not measure
+    #                  the live store) and not FAIL (the generator is fine).
+    #                  check.py maps exit 2 to WARN, never to PASS.
+    #   readable    -> the live store, and the fixture is not mentioned.
+    # A store that exists but whose records cannot be read is a MEASUREMENT --
+    # "this store does not parse" -- not an absence, so it does not get the
+    # fixture's softer answer.
     FIXTURE = os.path.join(HERE, "fixture_store")
-    SRC = ROOT if os.path.isdir(os.path.join(ROOT, "claims")) else FIXTURE
+    live_claims_dir = os.path.join(ROOT, "claims")
+    store_is_live = os.path.isdir(live_claims_dir)
+    n_files = len(glob.glob(os.path.join(live_claims_dir, "*.json"))) if store_is_live else 0
+    n_ok = 0
+    if store_is_live:
+        for _p in glob.glob(os.path.join(live_claims_dir, "*.json")):
+            try:
+                if isinstance(json.load(open(_p)), dict):
+                    n_ok += 1
+            except Exception:
+                pass
+    unreadable = store_is_live and n_files > 0 and n_ok == 0
+    if unreadable:
+        print("  M0 the live store exists but NOT ONE of its %d claim "
+              "record(s) parses  CANNOT MEASURE" % n_files)
+        print("\nselftest: ERROR (live store unreadable: %s)" % ROOT)
+        return 2
+    SRC = ROOT if store_is_live else FIXTURE
+    if not store_is_live:
+        # Named on the LAST line too, not just here: check.py surfaces the tail
+        # of a suite's output, and a WARN whose reason is only on line 3 of 40
+        # is a WARN nobody reads.
+        print("  M0 no store at %s; using the FIXTURE STORE shipped in this "
+              "repo (LIVE STORE NOT MEASURED)" % ROOT)
     tmp = tempfile.mkdtemp()
     shutil.copytree(os.path.join(SRC, "claims"), os.path.join(tmp, "claims"))
     shutil.copytree(os.path.join(SRC, "events"), os.path.join(tmp, "events"))
@@ -514,8 +553,18 @@ def selftest():
               f"run build.py to refresh (not a failure)")
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.rmtree(empty, ignore_errors=True)
-    print("selftest:", "PASS" if ok else "FAILED")
-    return 0 if ok else 1
+    if not ok:
+        print("selftest: FAILED")
+        return 1
+    if not store_is_live:
+        # The arms passed, but against the FIXTURE. Saying "PASS" here is what
+        # agent-0's v2 did and agent-7 caught: a green that does not depend on
+        # the thing its own row names. Exit 2 = cannot measure the live store;
+        # check.py renders that as WARN with this text attached.
+        print("selftest: PASS (FIXTURE STORE: live store not measured)")
+        return 2
+    print("selftest: PASS")
+    return 0
 
 
 README_START = "<!-- STATS:START -->"

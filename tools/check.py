@@ -70,6 +70,18 @@ EXCLUDE = {
     "tools/migrate_agent_volumes.py": (
         None, "skip",
         "a TOOL, not a test: exits 2 with no arguments by design"),
+    # docs/claimgraph/build.py selftest exits 2 when it ran against the FIXTURE
+    # because the live store is absent (a runner) or unreadable (a defect).
+    # MEASURED (my own branch, before this entry): exit 2 with no mapping
+    # rendered as "FAIL selftest: PASS (FIXTURE STORE: ...)" -- a row whose
+    # verdict word and whose text contradict each other. Before the fixture
+    # change the same absence crashed with FileNotFoundError and reddened
+    # every push. Exit 2 is the honest third state: the arms ran, the live
+    # store was not measured, and the reason rides on the line.
+    "docs/claimgraph/build.py": (
+        None, "exit2-is-warn",
+        "exit 2 from selftest = ran on the fixture store, live store not "
+        "measured (absent on a runner, unreadable here); never PASS"),
     "tools/check.py": (
         None, "skip", "this runner"),
 }
@@ -104,6 +116,23 @@ def in_git_tree():
         return False
 
 
+def suite_argv(rel):
+    """THE ARGUMENTS ARE PART OF THE SUITE'S IDENTITY, so they are built in ONE
+    place. MEASURED DEFECT (mine, this life): putting docs/claimgraph/build.py
+    in EXCLUDE to give it exit2-is-warn sent it down the EXCLUDE branch, which
+    built `argv` WITHOUT the `selftest` argument. The runner then ran the REAL
+    build -- the one that renders the page and exits 0 -- and printed
+    `PASS <row label> wrote .../index.html`. The row the gate is supposed to
+    check is the selftest; a special verdict had silently swapped the program.
+    Nothing in the output said so: the word PASS was true of the wrong tool."""
+    argv = [sys.executable, rel]
+    if rel == "tools/verify_context_persistence.py":
+        argv += ["--agent", "check"]
+    if rel.startswith("docs/claimgraph/"):
+        argv.append("selftest")
+    return argv
+
+
 def discover():
     """Every suite in the tree, plus the named exceptions. Sorted, stable."""
     import glob
@@ -112,18 +141,13 @@ def discover():
         paths = sorted(glob.glob(os.path.join(ROOT, pattern)))
         for path in paths:
             rel = os.path.relpath(path, ROOT)
+            argv = suite_argv(rel)
             if rel in EXCLUDE:
                 label, special, _why = EXCLUDE[rel]
                 if special == "skip":
                     continue
-                argv = [sys.executable, rel]
-                if rel == "tools/verify_context_persistence.py":
-                    argv += ["--agent", "check"]
-                found.append((label, argv, special, rel))
+                found.append((label or rel, argv, special, rel))
                 continue
-            argv = [sys.executable, rel]
-            if rel.startswith("docs/claimgraph/"):
-                argv.append("selftest")
             found.append((rel, argv, None, rel))
     # Files that no glob reaches but that are suites with an argument or a
     # special verdict: they are named in EXCLUDE and added here. A file that is
@@ -136,10 +160,7 @@ def discover():
         path = os.path.join(ROOT, rel)
         if not os.path.exists(path):
             continue
-        argv = [sys.executable, rel]
-        if rel == "tools/verify_context_persistence.py":
-            argv += ["--agent", "check"]
-        found.append((label, argv, special, rel))
+        found.append((label or rel, suite_argv(rel), special, rel))
     return found
 
 
