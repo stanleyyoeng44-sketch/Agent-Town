@@ -203,17 +203,38 @@ def build(broken, prior_tip=False):
     # that master authenticates nobody, so a master control makes C8 pass on
     # both builds -- a PASS true of the wrong tool. Revert them on whatever
     # build is under test, leaving the gate in place.
-    if broken or prior_tip:
-        both_lit = ('    presented_all = [headers.get("X-Bank-Token", ""),\n'
-                    '                     headers.get("X-Bank-Sender-Token", "")]\n')
-        assert both_lit in src, (
-            "C8 calibration: the all-headers list is not in bank.py, so the "
-            "both-headers defect cannot be reconstructed")
+    has_new_loop = "presented_all = []" in src
+    if (broken or prior_tip) and has_new_loop:
+        # C8 revert: precedence instead of "check every header". The FIRST
+        # non-empty value of each name wins, which is the defect agent-6 found.
+        # The defect was AGREEMENT ACROSS NAMES (X-Bank-Token or
+        # X-Bank-Sender-Token, first non-empty wins), not within one name.
+        # My first revert sliced each name's list to [:1], which is a NO-OP --
+        # _all() already returns at most one value per name -- so C8 stayed
+        # green on the "previous tip" and the calibration check caught the
+        # vacuous control. This revert restores the actual precedence bug.
+        c8_a = ('    presented_all = []\n'
+                '    for _name in ("X-Bank-Token", "X-Bank-Sender-Token"):\n'
+                '        presented_all.extend(_all(_name))')
+        assert c8_a in src, "C8 revert anchor missing"
         src = src.replace(
-            both_lit,
-            '    presented_all = [headers.get("X-Bank-Token", "")\n'
-            '                     or headers.get("X-Bank-Sender-Token", "")]\n', 1)
-        assert both_lit not in src, "C8 revert did not take effect"
+            c8_a,
+            '    presented_all = [x for x in _all("X-Bank-Token")[:1]]\n'
+            '    if not presented_all:\n'
+            '        presented_all = _all("X-Bank-Sender-Token")[:1]', 1)
+        assert c8_a not in src, "C8 revert did not take effect"
+        # C10 revert: get() instead of get_all(), i.e. the duplicate lockout.
+        c10_a = ("        if getter is not None:\n"
+                 "            return getter(name) or []")
+        assert c10_a in src, (
+            "C10 calibration: the get_all fallback is not in bank.py, so the "
+            "duplicate defect cannot be reconstructed")
+        src = src.replace(
+            c10_a,
+            "        if getter is not None:\n"
+            '            return [headers.get(name, "")]', 1)
+        assert c10_a not in src, "C10 revert did not take effect"
+        # C9 revert: the admin path back to the inline str,str compare.
         admin_lit = ('            if not expected or not _digest_eq(\n'
                      '                    self.headers.get("X-Bank-Admin-Token", ""), '
                      'expected):')
@@ -265,6 +286,32 @@ def call(port, method, route, body=None, headers=None):
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+def call_raw(port, route, body, header_pairs):
+    """POST with DUPLICATE header lines. urllib collapses duplicates into one
+    value, so the only way to express "two X-Bank-Token lines" is a raw socket.
+    agent-6's delta review found the defect this exists to catch; my first
+    suite could not see it because it passes headers as a dict, and a dict
+    cannot hold a duplicate."""
+    import http.client
+    payload = json.dumps(body).encode()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.putrequest("POST", route)
+    for k, v in header_pairs:
+        c.putheader(k, v)
+    c.putheader("Content-Type", "application/json")
+    c.putheader("Content-Length", str(len(payload)))
+    c.endheaders()
+    c.send(payload)
+    r = c.getresponse()
+    out = r.read().decode()
+    st = r.status
+    c.close()
+    try:
+        return st, json.loads(out)
+    except Exception:
+        return st, out
 
 
 def exercise(broken, port, prior_tip=False):
@@ -403,6 +450,24 @@ def exercise(broken, port, prior_tip=False):
                      headers={"X-Bank-Admin-Token": "ADMIN-SECRET"})
         done["C9c CONTROL: the correct admin token still tops up"] = (st == 200)
         detail["C9c_status"] = st
+
+        # ---- C10: DUPLICATE HEADER LINES ---------------------------------
+        # agent-6's delta finding: headers.get() returns only the FIRST
+        # duplicate, so a correct secret in a SECOND X-Bank-Token line was
+        # unreachable -> LOCKOUT of an honest client. Never a bypass: the
+        # wrong value is the only one that arrives if it comes first, and an
+        # attacker with no secret still gets 403.
+        st, _ = call_raw(port, "/transfer",
+                         {"from": "agent-7", "to": "agent-2", "amount": 1},
+                         [("X-Bank-Token", "WRONG"),
+                          ("X-Bank-Token", "s3cret-for-agent-7")])
+        done["C10 duplicate: wrong then correct still authorises"] = (st == 200)
+        detail["C10_status"] = st
+        st, _ = call_raw(port, "/transfer",
+                         {"from": "agent-7", "to": "agent-2", "amount": 1},
+                         [("X-Bank-Token", "WRONG"),
+                          ("X-Bank-Token", "ALSO-WRONG")])
+        done["C10b duplicate: two wrong secrets are still refused"] = (st == 403)
 
         # ---- LEGITIMATE behaviour that must survive -----------------------
         st, _ = call(port, "POST", "/transfer",

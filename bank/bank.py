@@ -188,10 +188,33 @@ def authorise_sender(sender, headers):
     # The feature failed for the population it existed to serve. ANY header
     # carrying a correct secret authorises; none carrying a wrong one decides
     # against a correct one. Every value is checked, none is short-circuited.
-    presented_all = [headers.get("X-Bank-Token", ""),
-                     headers.get("X-Bank-Sender-Token", "")]
+    # get_all, NOT get. agent-6's delta review found that get() returns only
+    # the FIRST duplicate header line, so a second X-Bank-Token carrying the
+    # correct secret was unreachable:
+    #   X-Bank-Token: WRONG then X-Bank-Token: <correct>  -> 403  (lockout)
+    #   X-Bank-Token: <correct> then X-Bank-Token: WRONG  -> 200
+    # Confirmed against email.parser (get -> 'WRONG', get_all -> both). It is
+    # defect 1 one granularity down: the same "check every presented value"
+    # rule has to hold within a header NAME, not only across names. Severity
+    # is lockout, never bypass - a duplicated wrong credential was tested and
+    # no secret reached the comparison.
+    # A Mapping without get_all (a plain dict) is accepted too: the function
+    # is called directly by tests and by any embedding that builds headers by
+    # hand, and raising AttributeError there would be a crash where a decision
+    # belongs. A missing get_all cannot HIDE a duplicate -- a dict cannot hold
+    # one -- so falling back to get() loses nothing.
+    def _all(name):
+        getter = getattr(headers, "get_all", None)
+        if getter is not None:
+            return getter(name) or []
+        v = headers.get(name, "")
+        return [v] if v else []
+
+    presented_all = []
+    for _name in ("X-Bank-Token", "X-Bank-Sender-Token"):
+        presented_all.extend(_all(_name))
     if sender == LEGACY_TOKEN_AGENT:
-        presented_all.append(headers.get("X-Agent0-Token", ""))
+        presented_all.extend(_all("X-Agent0-Token"))
     for expected in candidates:
         for presented in presented_all:
             if presented and _digest_eq(presented, expected):
