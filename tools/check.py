@@ -458,6 +458,37 @@ def selftest():
                                "L13d an absent FILE loads as None",
                                "None" if l13d else "did not return None"))
 
+    # L14: THE WIRING. Every arm above calls the DECISION; none observed what
+    # main() DOES with it. agent-8 measured that gap: leave manifest_state()
+    # perfectly correct and change only the line that consumes it
+    # (states.append("WARN") instead of FAIL) and the selftest stayed 16/16
+    # PASS while the gate exited 0 on a deleted suite -- with the row still
+    # PRINTING the word FAIL. A gate is its exit code; a correct function
+    # wired to the wrong verdict is a wrong gate.
+    l14 = manifest_states(None) == ["FAIL"]
+    ok = ok and l14
+    print("  %-5s %-44s got %r, want ['FAIL']"
+          % ("PASS" if l14 else "FAIL",
+             "L14 absent -> states gets FAIL", manifest_states(None)))
+    l14b = manifest_states(["a/x.py"]) == []
+    ok = ok and l14b
+    print("  %-5s %-44s got %r, want []"
+          % ("PASS" if l14b else "FAIL",
+             "L14b present -> states gets nothing", manifest_states(["a/x.py"])))
+    l14c = manifest_states(None, no_manifest=True) == ["WARN"]
+    ok = ok and l14c
+    print("  %-5s %-44s got %r, want ['WARN']"
+          % ("PASS" if l14c else "FAIL",
+             "L14c --no-manifest -> states gets WARN",
+             manifest_states(None, no_manifest=True)))
+    # L15: the verdict->exit-code mapping, which is the last place a gate can
+    # lie. A FAIL that returns 0 is the whole bug in one line.
+    l15 = exit_code("FAIL") == 1 and exit_code("WARN") == 0 and exit_code("PASS") == 0
+    ok = ok and l15
+    print("  %-5s %-44s FAIL->%d WARN->%d PASS->%d"
+          % ("PASS" if l15 else "FAIL", "L15 FAIL exits 1, WARN/PASS exit 0",
+             exit_code("FAIL"), exit_code("WARN"), exit_code("PASS")))
+
     # L4: the aggregate verdict must follow the worst suite.
     verdict = verdict_of(["PASS", "WARN", "FAIL"])
     good_case = verdict == "FAIL"
@@ -492,6 +523,30 @@ def manifest_state(expected, no_manifest=False):
         # deleting a suite, one level up.
         return "FAIL"
     return None
+
+
+def manifest_states(expected, no_manifest=False):
+    """The manifest's contribution to `states`, as a LIST, or [].
+
+    This is the WIRING, and it needed its own seam for a reason agent-8
+    measured: keep manifest_state() perfectly correct and change only the line
+    that consumes it -- `states.append("WARN")` instead of FAIL -- and the
+    selftest stayed 16/16 PASS while the gate exited 0 on a deleted suite, with
+    the row still PRINTING the word FAIL two lines above a passing verdict.
+    Every arm called the decision; none observed what was done with it.
+
+    A gate is its exit code. A correct pure function wired to the wrong verdict
+    is a wrong gate, and it is worse than an obviously broken one because the
+    row and the exit code disagree.
+    """
+    st = manifest_state(expected, no_manifest)
+    return [] if st is None else [st]
+
+
+def exit_code(verdict):
+    """The one place a verdict becomes an exit status. Extracted so a mutant
+    here can red an arm rather than hiding in main()'s last line."""
+    return 0 if verdict in ("PASS", "WARN") else 1
 
 
 def verdict_of(states):
@@ -530,19 +585,21 @@ def main():
     suites = discover()
     states = []
     expected = load_manifest()
-    state = manifest_state(expected, args.no_manifest)
-    if state == "WARN":
+    # The WIRING, through one function, so an arm can observe it. Do not
+    # inline states.append() here: that is exactly the line agent-8 mutated.
+    _mstates = manifest_states(expected, args.no_manifest)
+    mstate = manifest_state(expected, args.no_manifest)
+    if mstate == "WARN":
         print("  %-5s %-38s --no-manifest: a deleted suite is indistinguishable "
               "from a passing one in this run" % ("WARN", "suite manifest"))
-        states.append("WARN")
-    elif state == "FAIL":
+    elif mstate == "FAIL":
         # See manifest_state(): the only checkout that lacks this file is one
         # where somebody removed it.
         print("  %-5s %-38s tools/suites.txt is missing: a deleted suite is "
               "indistinguishable from a passing one (pass --no-manifest to "
               "accept that risk deliberately)" % ("FAIL", "suite manifest"))
-        states.append("FAIL")
-    else:
+    states.extend(_mstates)
+    if mstate is None:
         vanished, unregistered = manifest_diff(suites, expected)
         if vanished:
             print("  %-5s %-38s expected but NOT FOUND: %s"
@@ -590,7 +647,7 @@ def main():
              # flag that produced it. Put the caveat ON the line people quote.
              "  [--no-manifest: deleted suites are invisible this run]"
              if args.no_manifest else ""))
-    return 0 if verdict in ("PASS", "WARN") else 1
+    return exit_code(verdict)
 
 
 if __name__ == "__main__":
