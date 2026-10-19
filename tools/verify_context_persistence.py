@@ -163,7 +163,17 @@ def parse_births(transcript_dir, agent=None):
     rows, sources = [], set()
     for path in sorted(glob.glob(os.path.join(transcript_dir, "life-*.jsonl"))):
         life = os.path.basename(path)[len("life-"):-len(".jsonl")]
-        birth = None
+        # EVERY birth in the file, not the first (agent-4, life 18). The
+        # docstring says "one row per birth"; the first version took the first
+        # `kind == birth` line and broke, i.e. one row per FILE. On this box's
+        # 11 transcripts that is indistinguishable -- each holds exactly one
+        # birth, which I checked -- so the defect was LATENT and would have
+        # appeared the first time a life restarted or a file was appended to.
+        # A report whose row count is silently capped by file layout cannot
+        # report a per-birth series. This is the same arity mistake as a
+        # checker written for "the second read" only: the loop bound was
+        # chosen by the fixture, not by the claim.
+        births = []
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -175,41 +185,44 @@ def parse_births(transcript_dir, agent=None):
                     except ValueError:
                         continue
                     if rec.get("kind") == "birth":
-                        birth = rec
-                        break
+                        births.append(rec)
         except OSError:
             continue
-        if birth is None:
+        if not births:
             continue
-        source = birth.get("wake_source")
-        # A birth event written before wake_source existed has no field at
-        # all. That is not the same as wake_source="none"; folding the two
-        # would hide exactly the gap this report is for.
-        sources.add("absent" if source is None else source)
-        # The event's own field wins when present (it is a statement about
-        # THAT birth, including births whose note has since moved). Otherwise
-        # ask the filesystem, which is the only witness to where the note is
-        # now -- and say which witness answered, so a reader can tell a
-        # measured MISROUTED from an inherited one.
-        # ONLY MEANINGFUL WHEN THE DAEMON HAD NO NOTE. wake_file=True means it
-        # read one; a note also existing on disk is then either the same file
-        # (a symlink) or a second copy, and neither is a misroute.
-        if birth.get("note_elsewhere") is not None:
-            elsewhere = birth.get("note_elsewhere")
-            elsewhere_from = "event"
-        elif birth.get("wake_file"):
-            elsewhere, elsewhere_from = None, None
-        else:
-            elsewhere = note_elsewhere_for(agent)
-            elsewhere_from = "filesystem" if elsewhere else None
-        rows.append({
-            "life": life,
-            "wake_file": bool(birth.get("wake_file")),
-            "wake_source": "absent" if source is None else source,
-            "wake_fallback": birth.get("wake_fallback"),
-            "note_elsewhere": elsewhere,
-            "note_elsewhere_from": elsewhere_from,
-        })
+        for n_birth, birth in enumerate(births):
+            source = birth.get("wake_source")
+            # A birth event written before wake_source existed has no field
+            # at all. That is not the same as wake_source="none"; folding the
+            # two would hide exactly the gap this report is for.
+            sources.add("absent" if source is None else source)
+            # The event's own field wins when present (it is a statement about
+            # THAT birth, including births whose note has since moved). Otherwise
+            # ask the filesystem, which is the only witness to where the note is
+            # now -- and say which witness answered, so a reader can tell a
+            # measured MISROUTED from an inherited one.
+            # ONLY MEANINGFUL WHEN THE DAEMON HAD NO NOTE. wake_file=True means it
+            # read one; a note also existing on disk is then either the same file
+            # (a symlink) or a second copy, and neither is a misroute.
+            if birth.get("note_elsewhere") is not None:
+                elsewhere = birth.get("note_elsewhere")
+                elsewhere_from = "event"
+            elif birth.get("wake_file"):
+                elsewhere, elsewhere_from = None, None
+            else:
+                elsewhere = note_elsewhere_for(agent)
+                elsewhere_from = "filesystem" if elsewhere else None
+            rows.append({
+                # Disambiguate when a file holds more than one birth, or two
+                # rows read as the same life and the series cannot be followed.
+                "life": life if len(births) == 1
+                        else "%s#%d" % (life, n_birth + 1),
+                "wake_file": bool(birth.get("wake_file")),
+                "wake_source": "absent" if source is None else source,
+                "wake_fallback": birth.get("wake_fallback"),
+                "note_elsewhere": elsewhere,
+                "note_elsewhere_from": elsewhere_from,
+            })
     return rows, sources
 
 
@@ -459,6 +472,23 @@ def unit_simulation():
           "sources=%r" % (sorted(sources),))
     check("parse_births ignores non-birth events",
           len(rows) == 2, "it counted a result line as a birth")
+    # ARITY: two births in ONE file must yield two rows. Latent on this box
+    # (every transcript holds exactly one birth) which is exactly why it needs
+    # an arm -- the real data cannot distinguish the correct loop from the
+    # first-only one, so nothing would have caught it.
+    bt_multi = tempfile.mkdtemp(prefix="ctx-multi-")
+    try:
+        with open(os.path.join(bt_multi, "life-9-z.jsonl"), "w") as f:
+            f.write(json.dumps({"kind": "birth", "wake_file": False}) + "\n")
+            f.write(json.dumps({"kind": "birth", "wake_file": True}) + "\n")
+        rows_m, _sm = parse_births(bt_multi)
+        check("parse_births returns one row PER BIRTH, not per file",
+              len(rows_m) == 2
+              and rows_m[0]["life"] == "9-z#1"
+              and rows_m[1]["life"] == "9-z#2",
+              "rows=%r" % ([r["life"] for r in rows_m],))
+    finally:
+        shutil.rmtree(bt_multi, ignore_errors=True)
 
     # A misrouted note is the silent defect: the daemon had no note, AND a
     # note existed elsewhere. It must be surfaced, not folded into plain
