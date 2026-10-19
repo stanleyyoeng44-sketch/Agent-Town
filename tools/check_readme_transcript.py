@@ -110,6 +110,7 @@ def quoted_responses(lines):
             continue
         cmd = s[2:]
         body = None
+        raw = None
         ellipsis_secs = None
         j = i + 1
         while j < len(lines):
@@ -119,19 +120,62 @@ def quoted_responses(lines):
                 continue
             if t.startswith("$") or t.startswith("```"):
                 break          # next command: the gap ends
-            m = re.fullmatch(r"\.\.\.\s*(\d+)\s+seconds?\s+later\s*\.\.\.", t)
+            # SEARCH, NOT fullmatch, and case-insensitive. MEASURED (agent-4):
+            # fullmatch meant ANY other text on the line -- a trailing
+            # annotation "(approx)", a leading word, a capital "5 Seconds
+            # later", a version with no closing dots -- yielded None, and the
+            # second-balance branch then said "states no interval" about a
+            # document that states one. The numbers were unchanged in all
+            # four variants. A false FAIL is the same defect as a false PASS:
+            # the verdict was decided by the FORMATTING, which is not the
+            # object under test.
+            m = re.search(r"\.\.\.\s*(\d+)\s+seconds?\s+later", t, re.I)
             if m:
                 if ellipsis_secs is None:
                     ellipsis_secs = int(m.group(1))
                 continue
             if t.startswith("..."):
                 continue       # some other prose marker
-            if body is None:
+            if body is None and raw is None:
+                raw = t
                 try:
                     body = json.loads(t)
                 except Exception:
                     body = None
-        out.append((cmd, body, ellipsis_secs))
+        out.append((cmd, body, ellipsis_secs, raw))
+    return out
+
+
+def ledger_disagreements(quoted_transfers, ledger):
+    """The document's transfer lines against the document's own ledger.
+
+    Pure, so the selftest can hand it a disagreement directly. That matters:
+    the end-to-end 940 arm is ALSO caught by the clock bound when the machine
+    is fast, so on its own it cannot show that THIS predicate works -- it
+    would be an arm that passes while never being the reason. (Same lesson as
+    the transfer-decoy arm I deleted: run the arm against the thing it guards.)
+    """
+    if ledger is None:
+        # The document quotes a transfer but no ledger. That is not agreement
+        # and it is not a skip: there is nothing to check the transfer
+        # against, so say so. (My first version called ledger.get() here and
+        # raised AttributeError on the PRISTINE README -- the missing!=None
+        # rule, broken by me, in the fix for someone else's version of it.)
+        return ["the transcript quotes a transfer but never quotes the "
+                "ledger, so the transfer's result has nothing in the "
+                "document to be consistent with"]
+    out = []
+    for frm, to, money, recip in quoted_transfers:
+        for who, want in ((to, recip), (frm, money)):
+            if who is None or want is None:
+                continue
+            have = ledger.get(who)
+            if have != want:
+                out.append(
+                    f"the transcript's ledger and its transfer line disagree "
+                    f"about {who}: the transfer quotes {want}, "
+                    f"`cat accounts.json` quotes {have!r}. Two numbers in the "
+                    f"same document, no clock involved -- one is wrong")
     return out
 
 
@@ -180,7 +224,7 @@ def replay(root, readme_text, verbose=False):
     #     block. The decay branch requires the ellipsis that FOLLOWS THE FIRST
     #     READ, i.e. the interval the two balances are actually separated by.
     decay_secs = None
-    launch_lines = [c for c, _q, _e in pairs if "bank/bank.py" in c]
+    launch_lines = [c for c, _q, _e, _r in pairs if "bank/bank.py" in c]
     # EXACTLY ONE launch line. MEASURED (agent-2, this life): a second launch
     # line inserted ABOVE the real one, stating DECAY_SECONDS=5, became the
     # clock, and a second balance of 999 -- one tick at 5s -- PASSED for a
@@ -192,6 +236,16 @@ def replay(root, readme_text, verbose=False):
         m = re.search(r"\bDECAY_SECONDS=(\d+)\b", launch_lines[0])
         if m:
             decay_secs = int(m.group(1))
+    # A ZERO (OR NEGATIVE) CLOCK IS NOT A CLOCK. MEASURED (agent-4, verified
+    # here): the capture is \d+, so `DECAY_SECONDS=0` is reachable with one
+    # character in the README, and the second-balance branch then evaluates
+    # `later_secs // decay_secs` and raises ZeroDivisionError -- a TRACEBACK
+    # that takes --selftest down, not a named failure. Treat it as the
+    # "no usable clock" case that branch already FAILs on. This is the
+    # missing!=None rule in its other form: an unusable measurement must not
+    # be allowed to look like a verdict, and it must not crash the checker.
+    if decay_secs is not None and decay_secs <= 0:
+        decay_secs = None
     # `decay_secs` stays None when the launch line does not state it, and the
     # second-balance branch FAILs on None instead of skipping -- an unreadable
     # claim is the defect, not a reason to pass.
@@ -251,7 +305,17 @@ def replay(root, readme_text, verbose=False):
                          f"mismatch below can be attributed to the README")
             return fails
 
+        # Every quoted transfer, as (sender, recipient, money, recip_balance).
+        # Used to assert the transcript's OWN ledger line against its OWN
+        # transfer line -- two numbers in the document that must agree, with
+        # no clock and no bank in the assertion.
+        quoted_transfers = []
+
         snapshot = None
+        # The transcript's OWN ledger line, parsed as far as it will parse.
+        # `"last_decay": <float>` is not JSON, so the inner accounts object is
+        # read separately and the `<float>` marker is required to be there.
+        quoted_ledger = {}
         # WHICH READ, NOT WHICH VALUE.
         # MEASURED DEFECT (agent-2, 2026-10-18): the old branch below tested
         # the README's OWN value -- `quoted.get("money") != 1000` -- to decide
@@ -271,7 +335,7 @@ def replay(root, readme_text, verbose=False):
         # read has been seen, and reset on each read so a marker attached to
         # an EARLIER command can never stand in for this interval.
         gap_after_read = None
-        for cmd, quoted, ellipsis_secs in pairs:
+        for cmd, quoted, ellipsis_secs, raw in pairs:
             if verbose:
                 print(f"    replay: {cmd}")
             if cmd.startswith("SEED=") and "bank/bank.py" in cmd:
@@ -283,6 +347,17 @@ def replay(root, readme_text, verbose=False):
                 # reproduce, and require the README to mark the rest.
                 snap = http(port, "GET", "/accounts")
                 snapshot = snap
+                # The DOCUMENT's ledger. Its accounts object is valid JSON
+                # even though the top level is not (<float> for last_decay),
+                # so extract exactly that object rather than trusting a
+                # whole-line parse that must fail.
+                if raw:
+                    lm = re.search(r'"accounts"\s*:\s*(\{[^{}]*\})', raw)
+                    if lm:
+                        try:
+                            quoted_ledger = {"accounts": json.loads(lm.group(1))}
+                        except Exception:
+                            quoted_ledger = {}
                 if quoted is None:
                     # The README shows the ledger shape in prose, not as a
                     # quoted response, and marks the timestamp <float>. The
@@ -338,6 +413,10 @@ def replay(root, readme_text, verbose=False):
                     continue
                 amt = body.get("amount", 0)
                 seed = last_balance_quoted
+                if seed is not None and isinstance(q, int):
+                    quoted_transfers.append(
+                        (body.get("from"), body.get("to"), q,
+                         quoted.get("recipient_balance")))
                 if seed is None:
                     # Without a preceding quoted balance there is nothing to
                     # be consistent WITH, so say so rather than pass. That is
@@ -349,12 +428,37 @@ def replay(root, readme_text, verbose=False):
                 # Seeded decay is 1 coin per DECAY_SECONDS; the harness runs
                 # DECAY_SECONDS=1, so the tick count is bounded by the wall
                 # clock since the bank started. Never a fixed literal.
+                #
+                # THE BOUND IS STILL A CLOCK, AND THE DOCUMENT ALREADY PINS
+                # THE VALUE. MEASURED here (agent-2, this life) after reading
+                # this branch against the transcript: the README states the
+                # transfer's arithmetic twice -- 998 decays to 991 and 998-7 =
+                # 991 -- and the ledger line two commands later quotes
+                # `"agent-2": 991`. But this arm accepted any value in
+                # `seed - amt - ticks .. seed - amt`, so on a slow run the
+                # window widens with the machine: at 60s of harness elapsed a
+                # transfer quoting 970 PASSED, and at 120s one quoting 940
+                # PASSED, while the same document's ledger line still said
+                # 991. That is the harness clock deciding whether the
+                # README's number is right, which is exactly the defect this
+                # file exists to catch -- the SECOND time it appeared in the
+                # transfer arm, once as "any value <= 1000" and now as "any
+                # value within this box's uptime".
+                #
+                # The bound is kept ONLY as the floor for a document that does
+                # not quote the ledger. When the transcript DOES quote the
+                # ledger (it does), the transfer must land on the number the
+                # ledger names, and that assertion is checked after the loop.
                 ticks = int(time.time() - seen_at) + 1
                 lo, hi = seed - amt - ticks, seed - amt
                 if not (lo <= q <= hi):
                     fails.append(
                         f"{cmd}: README money {q} is not {seed} - {amt} minus "
                         f"0..{ticks} decay tick(s), i.e. not in {lo}..{hi}")
+                # (The bound holding is NOT the verdict when the transcript
+                # also quotes the ledger -- see the assertion after the loop.
+                # Nothing is recorded here because `quoted_transfers` already
+                # holds it.)
                 continue
 
             m = re.search(r"localhost:\d+(/\S+)", cmd)
@@ -363,6 +467,24 @@ def replay(root, readme_text, verbose=False):
                 is_balance = path.startswith("/balance/agent-2")
                 if is_balance:
                     balance_seen += 1
+                elif path.startswith("/balance/"):
+                    # A READ OF A DIFFERENT ACCOUNT IS NOT ANOTHER READ OF
+                    # THIS ONE. MEASURED, my own fix: the arity arm below was
+                    # `balance_seen == 2` on a counter incremented for EVERY
+                    # /balance/ path, so the second block's
+                    # `/balance/ghost-x` (the mint-refusal example) was
+                    # counted as the transcript's SECOND agent-2 read and the
+                    # PRISTINE README reported "a third read is not
+                    # modelled". The selector has to be WHICH ACCOUNT, not
+                    # how many balance commands came before -- the same defect
+                    # as the position selector, one field over. It goes
+                    # through the literal comparison, which is right for a
+                    # read whose expected value is stated in full.
+                    got = http(port, "GET", path)
+                    if quoted != got:
+                        fails.append(f"{cmd}\n      README: {quoted}\n"
+                                     f"      bank:   {got}")
+                    continue
                 if is_balance and balance_seen == 1:
                     # FIRST READ: the README claims a SEED -- a freshly seeded
                     # agent starts at 1000. The value is on a clock, so compare
@@ -479,12 +601,55 @@ def replay(root, readme_text, verbose=False):
                     if quoted and isinstance(quoted.get("money"), int):
                         last_balance_quoted = quoted["money"]
                     continue
-                got = http(port, "GET", path)
-                if quoted != got:
-                    fails.append(f"{cmd}\n      README: {quoted}\n"
-                                 f"      bank:   {got}")
+                # A THIRD OR LATER BALANCE READ. MEASURED (agent-4, verified
+                # here on 3d4ba3b): every branch above is written for "the
+                # first read" and "the second read", and this FALL-THROUGH
+                # then compares the quoted value LITERALLY to the bank's live
+                # figure. Three repros:
+                #   a third read of 996 after a consistent "4 seconds later"
+                #     -> FAILED, i.e. a CORRECT document went red;
+                #   a third read of 998 (same as the second, no gap claimed)
+                #     -> FAILED, same reason;
+                #   a third read of 1000 (equal to the bank's live value, and
+                #     inconsistent with the document's own arithmetic)
+                #     -> PASSED. So it is not a bound either: whether the
+                #     third read is accepted is decided by the HARNESS CLOCK,
+                #     not by the transcript.
+                # The selector here is the INDEX, and it is not the object:
+                # "the second read" is an arity the code never states. Say the
+                # limit instead of accusing the document of a mismatch it does
+                # not contain. Failing explicitly (rather than generalising to
+                # N reads) is deliberate: generalising changes what the check
+                # models, and that is a reviewable decision, not a drive-by.
+                fails.append(
+                    f"{cmd}: this is balance read #{balance_seen} in the "
+                    f"transcript. The checker models EXACTLY TWO balance "
+                    f"reads (a seed and one decay), so it has no equation for "
+                    f"a third and will not compare it to a wall clock. "
+                    f"Either state the transcript as two reads or extend the "
+                    f"checker -- a third read is not modelled, which is not "
+                    f"the same as the document being wrong")
                 continue
             fails.append(f"cannot replay this quoted command: {cmd}")
+
+        # THE DOCUMENT AGAINST ITSELF, WHICH NO CLOCK CAN MOVE.
+        # A transcript that quotes a successful transfer and then the ledger
+        # states the same quantity twice -- in THIS README, the transfer says
+        # money 991 / recipient_balance 7 and the next line says
+        # {"agent-2": 991, "agent-3": 7}. If those disagree the document is
+        # wrong, whatever this box's uptime was, and unlike the bound above
+        # the verdict cannot widen with the clock.
+        #
+        # THIS IS THE DOCUMENT'S LEDGER, NOT THE BANK'S. My first version
+        # compared against the /accounts snapshot and reddened on the PRISTINE
+        # README: the transcript's ledger line carries `"last_decay": <float>`
+        # so it does not parse as JSON, and the only parsed ledger available
+        # came from the running bank, whose numbers this harness moved with
+        # its own control transfer. Reading the code that produced the result
+        # before writing the sentence that explained it: the numbers to
+        # compare were in the README the whole time.
+        fails.extend(ledger_disagreements(quoted_transfers,
+                                          quoted_ledger.get("accounts")))
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
@@ -689,9 +854,120 @@ def main():
             print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
             later_results.append(caught)
 
+        # THE ARMS AGENT-4 FOUND, which none of the above could reach.
+        # Every arm before this one mutates a BALANCE, an INTERVAL or a
+        # CLOCK. These mutate the SHAPE of the document: its arity, its
+        # units, its formatting, and the agreement between two numbers it
+        # itself quotes. Each was RED on 3d4ba3b before the fix; the label
+        # says which way v3 got it wrong.
+        third_read = (
+            '{"agent": "agent-2", "money": 998, "exists": true}\n'
+            '   ... 4 seconds later ...\n'
+            '$ curl -s localhost:8941/balance/agent-2\n'
+            '{"agent": "agent-2", "money": %d, "exists": true}\n')
+        shape_lies = [
+            ([('{"agent": "agent-2", "money": 998, "exists": true}',
+               third_read % 996)],
+             "a THIRD balance read at 996 (arithmetic consistent): v3 called "
+             "a correct document a mismatch"),
+            ([('{"agent": "agent-2", "money": 998, "exists": true}',
+               third_read % 998)],
+             "a THIRD balance read at 998 (same as the second, no gap "
+             "claimed): v3 called a correct document a mismatch"),
+            ([("DECAY_SECONDS=2 python3 bank/bank.py",
+               "DECAY_SECONDS=0 python3 bank/bank.py")],
+             "a launch line stating DECAY_SECONDS=0: v3 raised "
+             "ZeroDivisionError instead of a named failure"),
+            ([("   ... 5 seconds later ...",
+               "   ... 5 Seconds later ... (approx)")],
+             "an interval line whose FORMATTING changed and whose NUMBERS did "
+             "not: this is asserted the OTHER WAY, below -- a document that is "
+             "correct must stay clean"),
+            ([('"ok": true, "money": 991, "recipient": "agent-3", '
+               '"recipient_balance": 7',
+               '"ok": true, "money": 940, "recipient": "agent-3", '
+               '"recipient_balance": 7')],
+             "a transfer of 940 with the ledger still quoting 991: the two "
+             "numbers in the document disagree, with no clock involved"),
+        ]
+        shape_results = []
+        must_stay_clean = []
+        for reps, label in shape_lies:
+            mutated = text
+            built = True
+            for old, new in reps:
+                if old not in mutated:
+                    built = False
+                    break
+                mutated = mutated.replace(old, new, 1)
+            if not built or mutated == text:
+                print(f"  FAIL  could not build the lie: {label}; the README "
+                      f"no longer carries the lines this arm mutates")
+                shape_results.append(False)
+                continue
+            if label.startswith("an interval line whose FORMATTING"):
+                must_stay_clean.append(mutated)
+                continue
+            try:
+                caught = bool(replay(ROOT, mutated))
+            except Exception as e:
+                # A CRASH IS NOT A CATCH. The DECAY_SECONDS=0 arm must be
+                # rejected by a NAMED failure, and the pre-fix code raised a
+                # traceback here -- which would otherwise have been counted
+                # as a successful catch by any try/except around this call.
+                print(f"  FAIL  {label} CRASHED ({type(e).__name__}) "
+                      f"instead of failing by name")
+                shape_results.append(False)
+                continue
+            print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
+            shape_results.append(caught)
+
+        # THE LEDGER PREDICATE, ASSERTED IN BOTH DIRECTIONS ON FIXED INPUT.
+        # The end-to-end 940 arm above can be caught by the clock bound on a
+        # fast box, so it does not prove this predicate is what reddens. These
+        # two do: the agreeing pair must return [], the disagreeing pair must
+        # return exactly one failure and name the account.
+        agree = ledger_disagreements(
+            [("agent-2", "agent-3", 991, 7)],
+            {"agent-2": 991, "agent-3": 7})
+        disagree = ledger_disagreements(
+            [("agent-2", "agent-3", 940, 7)],
+            {"agent-2": 991, "agent-3": 7})
+        ledger_ok = (agree == [] and len(disagree) == 1
+                     and "agent-2" in disagree[0])
+        print(f"  {'PASS' if ledger_ok else 'FAIL'}  the ledger predicate "
+              f"accepts an agreeing pair and names the account it rejects")
+        # A missing ledger key must not read as agreement (missing != None).
+        absent_ok = bool(ledger_disagreements(
+            [("agent-2", "agent-nonexistent", 991, 7)], {"agent-2": 991}))
+        print(f"  {'PASS' if absent_ok else 'FAIL'}  an account absent from "
+              f"the ledger is a disagreement, not a skip")
+
+        # THE OTHER VERDICT THIS PREDICATE CAN EMIT. MEASURED (agent-4): on v3
+        # `fullmatch` on the interval line meant a trailing annotation, a
+        # leading word, or a capital S made that line yield None, and the
+        # checker then said "states no interval" about a document that DOES
+        # state one -- a CORRECT document going red. My first version of this
+        # arm asserted "caught" and was GREEN on v4 for the wrong reason:
+        # after the fix the line IS read, so the branch proceeds and compares
+        # a different number, and `bool(replay(...))` cannot tell which
+        # failure fired. Assert the opposite verdict: same numbers, different
+        # formatting, must replay CLEAN.
+        formatting_results = []
+        for mutated in must_stay_clean:
+            try:
+                clean = not replay(ROOT, mutated)
+            except Exception:
+                clean = False
+            print(f"  {'PASS' if clean else 'FAIL'}  an interval line whose "
+                  f"FORMATTING changed (numbers identical) still replays clean")
+            formatting_results.append(clean)
+
         all_ok = (ok_real and built and not ok_bad and all(first_results)
                   and all(clock_results) and all(decoy_results)
-                  and all(later_results))
+                  and all(later_results) and all(shape_results)
+                  and all(formatting_results)
+                  and ledger_ok and absent_ok)
         return 0 if all_ok else 1
 
     fails = replay(ROOT, text, verbose="--verbose" in args)
