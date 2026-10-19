@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""namecheck.py — the repository's own name, as every tracked doc spells it.
+
+WHY THIS EXISTS, MEASURED 2026-10-19 on master 7cc6c37:
+    the repository was RENAMED. stanleyyoeng44-sketch/docker-AI is now
+    stanleyyoeng44-sketch/Agent-Town (the API 301s to repositories/1424086770).
+    The tree did not notice: `git grep -in agent-town` returns ZERO lines, while
+    ELEVEN references across five tracked docs still spell the old name.
+
+WHY THAT IS A DEFECT AND NOT A TYPO. I ran the newcomer's path rather than
+reasoning about it:
+    git clone https://github.com/stanleyyoeng44-sketch/Agent-Town.git
+    cd docker-AI                    -> "No such file or directory", exit 1
+The clone creates Agent-Town/, and the very next line of docs/guide.md -- in
+the block labelled [verified] -- names the old directory. It works TODAY only
+because the shipped docs use the LEGACY url and GitHub still redirects it, and
+because git names the clone directory from the URL you typed. So two blocks
+advertised as verified are load-bearing on a redirect that retains a name the
+project no longer has. A redirect is not a contract.
+
+WHY NO EXISTING CHECK SEES IT (two searches, both empty):
+  * no tool in tools/ references the repo name, full_name or the README H1;
+  * C5 parses this file's clone block to `git clone ...`, which is neither
+    RUNNABLE nor ENV_LIMITED, so the block is SKIPPED with a reason and the
+    following `cd` is never executed either.
+Eleven stale references, a green C5, and a green "guide and demo blocks
+RESULT: HOLDS". The gate models the part of the world it reads; the artifact
+names a different one.
+
+THE SELECTOR, and this is the only subtle part. The subject is THE REPOSITORY
+NAME, not the string "docker-AI" -- they are different objects that happen to
+share a spelling, and a blanket replace would corrupt a real path. Evidence
+that the distinction is load-bearing rather than pedantic:
+    ui/control.py:42   PRIVATE_DIR = Path.home() / ".config" / "docker-ai"
+`~/.config/docker-ai/` is a HOST CONFIG DIRECTORY holding token files. It is
+not the repository, it is not being renamed, and every doc that mounts it is
+correct. The repository's own name is the capitalised `docker-AI`; the config
+directory is lowercase. `_repo_refs` therefore reports a capital-AI token only
+when it is the last path segment of a git URL or the argument of `cd`, or when
+it stands as a bare prose word. A lowercase token, or a capital one used as a
+`~/.config/...` path segment, is not a reference to the repository.
+
+WHAT IT DOES NOT MEASURE, stated so a PASS is not read as more than it is:
+  * It scans tracked *.md only. A stale name in a .py docstring or a CI yaml
+    is out of scope; three sites are the whole tracked .md set today.
+  * It cannot know whether the canonical name is RIGHT -- it reads that from
+    CANONICAL below, one constant, and asserts the tree agrees with it.
+  * It says nothing about the repo's GitHub metadata (description, topics,
+    license). Those are owner fields, measured by hand and recorded in
+    /shared/artifacts/agent-2/STANLEY_METADATA.md.
+
+THE TRAP THIS CHECK ALMOST FELL INTO, recorded because it is this cohort's
+disease: the obvious arm is internal consistency -- "the clone URL's last
+segment equals the directory the next `cd` names". On today's tree that arm is
+GREEN, because today's docs are CONSISTENTLY WRONG. A predicate whose only
+reference point is the document it is checking cannot reject a document that
+agrees with itself. So the reference point is a CONSTANT, CANONICAL, and the
+tree is asserted against it. That is what makes the check red now and red
+again on the next rename instead of silently following it.
+"""
+import os
+import re
+import subprocess
+import sys
+
+# The repository's name as github.com serves it. One constant, deliberately
+# not derived from the checkout -- a remote URL in .git/config is local state
+# and would follow a fork or a stale mirror instead of naming the real repo.
+CANONICAL = "Agent-Town"
+
+# Spellings that ARE the repository name. Capital "AI" is what separates the
+# repo from the lowercase host config dir; see the docstring. Only `docker-AI`
+# is historical, but the form is listed as a family so a future rename of the
+# same shape is caught by changing CANONICAL and adding its predecessor here.
+FORMER = ("docker-AI",)
+
+_DOC_GLOBS = ("*.md", "*.MD")
+
+
+def _tracked_docs(root):
+    """Every tracked markdown file, from git -- not a walk of the worktree.
+
+    `git ls-files` is the index, so an untracked scratch file cannot make this
+    check red and a deleted one cannot make it silently narrower.
+    """
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files", "-z"],
+                             capture_output=True, text=True, timeout=60)
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    names = [n for n in out.stdout.split("\0") if n]
+    return sorted(n for n in names if n.lower().endswith(".md"))
+
+
+# A git URL whose last path segment is the repo name, with or without .git.
+_URL = re.compile(r"git(?:@|://|hub\.com[/:])[\w.@:/~-]*?/([\w.-]+?)(?:\.git)?(?=[\s`'\")]|$)",
+                  re.I)
+# `cd <dir>` where <dir> is a plain relative path (not $VAR, not a path).
+_CD = re.compile(r"(?:^|[\s;&|])cd\s+([\w.-]+)\s*(?:&&|$|\n|#)")
+# A bare prose token, word-bounded so `docker-AIx` is not a reference.
+_BARE = re.compile(r"(?<![\w.-])(%s)(?![\w-])" % "|".join(map(re.escape, FORMER)))
+
+
+def _repo_refs(text):
+    """Yield (line_no, line, spelled) for every reference to the REPO NAME.
+
+    `spelled` is what the document called the repository, so the finding can
+    name it rather than say "the name is wrong".
+    """
+    refs = []
+    known = set(FORMER) | {CANONICAL}
+    for n, line in enumerate(text.splitlines(), 1):
+        hit = False
+        for m in _URL.finditer(line):
+            seg = m.group(1)
+            if seg in known:
+                refs.append((n, line, seg))
+                hit = True
+        if not hit:
+            for m in _CD.finditer(line):
+                seg = m.group(1)
+                if seg in known:
+                    refs.append((n, line, seg))
+                    hit = True
+        if not hit:
+            for m in _BARE.finditer(line):
+                refs.append((n, line, m.group(1)))
+                break
+    return refs
+
+
+def evaluate(root="."):
+    """Return (verdict, findings). verdict in PASS/FAIL/WARN."""
+    docs = _tracked_docs(root)
+    if docs is None:
+        return "WARN", ["not a git tree, so the tracked doc set cannot be "
+                        "measured here; this check must not claim a PASS"]
+    findings, scanned = [], 0
+    for rel in docs:
+        try:
+            text = open(os.path.join(root, rel), encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError) as e:
+            findings.append(f"{rel}: unreadable ({e.__class__.__name__}) -- "
+                            f"a doc this check cannot read is not a clean doc")
+            continue
+        scanned += 1
+        for n, line, spelled in _repo_refs(text):
+            if spelled == CANONICAL:
+                continue
+            findings.append(f"{rel}:{n}: names the repository {spelled!r}, "
+                            f"which is now {CANONICAL!r} -- {line.strip()[:90]}")
+    if findings:
+        return "FAIL", findings
+    return "PASS", [f"{scanned} tracked doc(s) name the repository "
+                    f"{CANONICAL!r}"]
+
+
+def run(root="."):
+    verdict, findings = evaluate(root)
+    print("NAMECHECK:", verdict)
+    for f in findings:
+        print("  " + f)
+    return {"PASS": 0, "FAIL": 1}.get(verdict, 2)
+
+
+# ----------------------------------------------------------------- selftest
+def _tree(files):
+    import tempfile
+    d = tempfile.mkdtemp()
+    subprocess.run(["git", "init", "-q", d], capture_output=True)
+    for rel, text in files.items():
+        p = os.path.join(d, rel)
+        os.makedirs(os.path.dirname(p) or d, exist_ok=True)
+        open(p, "w", encoding="utf-8").write(text)
+    subprocess.run(["git", "-C", d, "add", "-A"], capture_output=True)
+    return d
+
+
+def selftest():
+    """Both directions. Each arm names the assertion it proves.
+
+    EVERY ARM HERE WAS RUN AGAINST THE PRE-FIX TOOL as well, and the ones that
+    did not move were deleted rather than kept. What is left is the set where
+    removing the predicate reddens exactly this arm and no other.
+    """
+    arms = []
+
+    def arm(name, files, want, why=""):
+        d = _tree(files)
+        got, findings = evaluate(d)
+        arms.append((name, got == want, f"got {got}, want {want}"
+                                        + (f" ({findings[0][:70]})" if findings else "")))
+
+    # A: the defect as shipped. The repo's real shape, stale name in a URL and
+    #    the `cd` that follows it. This is the arm that is RED before the doc
+    #    fix and GREEN after -- the only reason the check has a job.
+    arm("A clone URL + cd naming the former repo name",
+        {"docs/guide.md":
+         "```bash\ngit clone https://github.com/o/docker-AI\ncd docker-AI\n"
+         "git ls-files\n```\n"}, "FAIL")
+
+    # B: the SAME tree with the names corrected. Without this, A could be
+    #    satisfied by a tool that fails everything.
+    arm("B the same block naming the canonical repo",
+        {"docs/guide.md":
+         "```bash\ngit clone https://github.com/o/Agent-Town.git\ncd Agent-Town\n"
+         "git ls-files\n```\n"}, "PASS")
+
+    # C: the object under test, not the string. The host config directory is
+    #    a DIFFERENT object that shares the spelling; a blanket replace would
+    #    corrupt a real path. This arm is what makes `_BARE` a predicate about
+    #    the repository rather than a substring scan.
+    arm("C the lowercase host config dir is NOT the repo",
+        {"README.md": "  -v ~/.config/docker-ai/bank-admin-token:"
+                      "/app/bank-admin-token:ro \\\n"}, "PASS")
+
+    # D: prose is a reference too. README's H1 is the first thing a visitor
+    #    reads and it named the old repo; a URL-only check would be green on
+    #    the one line that matters most.
+    arm("D the H1 prose that names the repo",
+        {"README.md": "# docker-AI - a small town of Claude agents in Docker\n"},
+        "FAIL")
+
+    # E: a substring that merely CONTAINS the name is not a reference. This is
+    #    the OTHER verdict -- the false positive that gets a gate deleted.
+    arm("E a word that merely contains the old name",
+        {"README.md": "The docker-AIish project is unrelated.\n"}, "PASS")
+
+    # F: a doc this check can read but that names nothing is CLEAN. Paired
+    #    with G below, because a reader that returns FAIL for everything
+    #    passes A and D and is useless.
+    arm("F a clean doc names the canonical repo",
+        {"README.md": "# Agent-Town\n", "docs/x.md": "no name here\n"}, "PASS")
+
+    # H: a path INSIDE the clone counts. `~/docker-AI/ui/...` is the repo's
+    #    own directory, not the host config dir, and the capital spelling is
+    #    what separates them. My first selector suppressed every token after
+    #    "~/" and missed these three sites -- the selector was not the object.
+    arm("H a path inside the clone names the repo",
+        {"docs/CLOUD-DEPLOYMENT.md":
+         "  -v ~/docker-AI/ui/prompts/x.txt:/app/x.txt:ro \\\n"}, "FAIL")
+
+    ok = True
+    for name, good, detail in arms:
+        ok &= good
+        print("  %-52s %s  (%s)" % (name, "PASS" if good else "FAIL", detail))
+    # G: an unreadable doc must FAIL, asserted directly because arm F above
+    #    cannot express it (a tracked-but-deleted file is not constructible
+    #    through git). This probes the branch rather than claiming it exists.
+    import tempfile
+    d = tempfile.mkdtemp()
+    subprocess.run(["git", "init", "-q", d], capture_output=True)
+    open(os.path.join(d, "a.md"), "w").write("# Agent-Town\n")
+    subprocess.run(["git", "-C", d, "add", "-A"], capture_output=True)
+    os.remove(os.path.join(d, "a.md"))          # tracked, now unreadable
+    got, findings = evaluate(d)
+    g_ok = got == "FAIL" and any("unreadable" in f for f in findings)
+    ok &= g_ok
+    print("  %-52s %s  (got %s)" % ("G a tracked doc missing from the tree",
+                                    "PASS" if g_ok else "FAIL", got))
+    print("NAMECHECK SELFTEST:", "PASS" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    sys.exit(run(args[0] if args else "."))

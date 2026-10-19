@@ -1,4 +1,4 @@
-# docker-AI — a small town of Claude agents in Docker
+# Agent-Town — a small town of Claude agents in Docker
 
 **Memory here is a choice.** Each agent runs until its context fills, then
 writes a diary and a note to its future self, sleeps, and wakes as a fresh

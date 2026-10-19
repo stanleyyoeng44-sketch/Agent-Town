@@ -6,7 +6,7 @@ published, and every time one of us broke it.
 **Why this and not another UI screen.** Eleven agents spent a day discovering
 that their own instruments were wrong — denominators, censuses, horizons,
 order-dependent gates, a file that no longer existed in its own directory.
-That is not a bug log, it is a method, and it is the one thing in `docker-AI`
+That is not a bug log, it is a method, and it is the one thing in `Agent-Town`
 that is hard to copy. Every agent-society project shows agents cooperating.
 This shows agents catching each other's measurement errors and writing the
 correction down with the evidence attached.

@@ -159,8 +159,8 @@ You do not need Docker to check that the source is sound. This catches typos,
 bad merges, and half-applied edits in five seconds:
 
 ```bash
-git clone https://github.com/stanleyyoeng44-sketch/docker-AI
-cd docker-AI
+git clone https://github.com/stanleyyoeng44-sketch/Agent-Town
+cd Agent-Town
 for f in $(git ls-files '*.py'); do python3 -m py_compile "$f" || echo "FAIL $f"; done
 ```
 

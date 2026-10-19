@@ -23,6 +23,8 @@ CHECKS
     C14 check registry     every c<N>_ check defined here is in CHECKS, so a
                            merge that drops one list entry cannot turn a check
                            off silently (nothing else reads the registry)
+    C17 docs name the repo every tracked doc spells the repository the way
+                           github.com serves it (tools/namecheck.py)
 
 Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
 CONTROL per check: it builds a deliberately bad tree and asserts the check
@@ -1786,12 +1788,44 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
+def c17_repo_name(root):
+    """Every tracked doc must name the repository as github.com serves it.
+
+    MEASURED 2026-10-19 on 7cc6c37: the repo was renamed docker-AI ->
+    Agent-Town and the tree did not notice. `git grep -in agent-town` returns
+    ZERO lines; eleven references across five docs still spelled the old name,
+    and docs/guide.md's [verified] clone block ended with a `cd` into a
+    directory the canonical URL does not create (exit 1, measured). It works
+    today only because the docs use the legacy URL and GitHub still redirects.
+
+    NO EXISTING CHECK SEES THIS: nothing in tools/ references the repo name or
+    the README H1, and C5 skips `git clone` as neither RUNNABLE nor
+    ENV_LIMITED, so the following `cd` is never executed either.
+
+    The predicate lives in tools/namecheck.py so its arms travel with it; this
+    is the registration, and C14 is what keeps a registration from vanishing.
+    """
+    path = os.path.join(root, "tools", "namecheck.py")
+    if not os.path.isfile(path):
+        return "C17 docs name the repo", "FAIL", [
+            "tools/namecheck.py is referenced by CHECKS but missing"]
+    r = subprocess.run([sys.executable, "-I", path, root], cwd=root,
+                       capture_output=True, text=True, timeout=120)
+    out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
+    if r.returncode == 0:
+        return "C17 docs name the repo", "PASS", out[-1:]
+    if r.returncode == 2:
+        return "C17 docs name the repo", "WARN", [
+            "cannot measure here: " + (out[-1] if out else "(no output)")]
+    return "C17 docs name the repo", "FAIL", out[:12]
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck]
+          c15_portcheck, c16_tokencheck, c17_repo_name]
 
 
 def _is_git_tree(root):
@@ -2843,6 +2877,28 @@ def selftest():
         CHECKS[:] = _saved
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
+
+    # C17: the rename gate, both directions, THROUGH the registered check.
+    # Asserting the OTHER verdict matters here: a c17_repo_name that returned
+    # FAIL unconditionally would pass a one-armed control.
+    outcomes.append(("C17 passes on this tree, whose docs name the repo",
+                     c17_repo_name(ROOT)[1] == "PASS"))
+    _rn = tempfile.mkdtemp(prefix="c17-")
+    try:
+        shutil.copytree(os.path.join(ROOT, "tools"), os.path.join(_rn, "tools"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        os.makedirs(os.path.join(_rn, "docs"))
+        with open(os.path.join(_rn, "docs", "guide.md"), "w") as _f:
+            _f.write("```bash\ngit clone https://github.com/o/docker-AI\n"
+                     "cd docker-AI\n```\n")
+        subprocess.run(["git", "-C", _rn, "init", "-q"], capture_output=True)
+        subprocess.run(["git", "-C", _rn, "add", "-A"], capture_output=True)
+        _st, _fd = c17_repo_name(_rn)[1:]
+        outcomes.append(("C17 catches a tracked doc naming the old repo",
+                         _st == "FAIL"
+                         and any("docker-AI" in f for f in _fd)))
+    finally:
+        shutil.rmtree(_rn, ignore_errors=True)
 
     bad = 0
     for label, passed in outcomes:
