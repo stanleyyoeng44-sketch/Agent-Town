@@ -49,6 +49,10 @@ AGENT_MODEL = os.environ.get("AGENT_MODEL", "glm-5.3")
 SHARED = "/shared"
 MAILBOX = os.path.join(SHARED, "mailbox")
 MY_INBOX = os.path.join(MAILBOX, AGENT_NAME, "incoming")
+# A file this large is not a chat message. The salvage path in _parse_message
+# reads a non-JSON body into memory and queues it to the model, so it must have
+# a ceiling; a stray dump in an inbox should be reported, not delivered.
+MAX_SALVAGE_BYTES = 256 * 1024
 
 WORKSPACE = "/workspace"
 HUMAN_INBOX = os.path.join(WORKSPACE, "human", "inbox")
@@ -540,6 +544,62 @@ class Death(Exception):
     """Raised inside the message loop when the agent calls restart."""
 
 
+def _parse_message(raw, path="?"):
+    """(message dict | None, how) for a .msg body. Never raises.
+
+    `how` names WHICH rung of the ladder the message came off, so a caller can
+    log that a message was salvaged rather than delivered as sent:
+        "json"      valid JSON, the happy path
+        "ctrl"      valid JSON except for raw control characters in a string
+        "text"      not JSON at all; delivered as a plain-text message
+        None        nothing to deliver; the second element is the error
+
+    WHY A LADDER RATHER THAN A STRICT LOAD. Measured on this box: 30 of 30
+    .msg files were invalid, in exactly three shapes -- raw text, valid JSON
+    followed by extra data, and valid JSON with raw newlines inside a string
+    (which is what a hand-written multi-line message looks like). All three
+    are the SENDER's malformation, and none of them means "this is not a
+    message". A reader whose only response is `continue` turns a formatting
+    bug into a lost message, and it loses the BIG ones first, because a long
+    message is the one most likely to contain a raw newline.
+
+    The budget is what keeps this safe: a file is only salvaged if it is small
+    enough to be a message at all, so a stray multi-megabyte file cannot be
+    read into memory and queued to the model as chat.
+    """
+    if not raw or not raw.strip():
+        return None, "empty file"
+    try:
+        msg = json.loads(raw)
+        if not isinstance(msg, dict):
+            return None, "JSON is %s, not an object" % type(msg).__name__
+        return msg, "json"
+    except json.JSONDecodeError:
+        pass
+    # Rung 2: raw control characters inside a string value. Only this shape is
+    # retried, so a genuinely different error class keeps its own name.
+    try:
+        msg = json.loads(raw, strict=False)
+        if isinstance(msg, dict):
+            return msg, "ctrl"
+    except json.JSONDecodeError:
+        pass
+    # Rung 3: plain text. The whole body becomes the text of a message from
+    # whoever the filename says, because the filename IS the sender record
+    # (`<ns>-<name>.msg`, written by both senders).
+    if len(raw) > MAX_SALVAGE_BYTES:
+        return None, "not JSON and too large to salvage (%d bytes)" % len(raw)
+    # The filename is `<ns>-<agent-name>.msg`, and agent names CONTAIN hyphens
+    # ("agent-2"), so splitting on the last '-' yields "2". Split on the FIRST
+    # hyphen instead: everything after it is the name. Caught by this file's
+    # own assertion on the first run -- the test earned its place immediately.
+    sender = "unknown"
+    stem = os.path.basename(path)[:-4]
+    if "-" in stem:
+        sender = stem.split("-", 1)[1] or "unknown"
+    return {"from": sender, "text": raw}, "text"
+
+
 async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     """Run one complete life: from wake to restart. Returns wake data for
     the next life (None when the agent never slept — e.g. crash)."""
@@ -707,12 +767,60 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 except Exception:
                     continue
                 for path in files:
+                    # A SKIP MUST BE LOUD, AND IT MUST NOT BE PERMANENT.
+                    #
+                    # This block used to be
+                    #     try: msg = json.load(f); os.remove(path)
+                    #     except (OSError, json.JSONDecodeError): continue
+                    # and that `continue` is a SILENT DROP: a .msg that is not
+                    # valid JSON is never consumed, never logged and never
+                    # reported, so it sits in the inbox forever looking like an
+                    # agent who has not read their mail. Measured on this box
+                    # (agent-0, then agent-10): every .msg in every inbox was
+                    # invalid -- 30 files, 0 valid -- including a 3.5 KB message
+                    # to agent-10 that it never received. The failing shapes are
+                    # all WRITE-side malformations (raw text, valid JSON plus
+                    # extra data, raw newlines inside a string), but this reader
+                    # is what made them permanent and invisible.
+                    #
+                    # The fix has three parts, and each is needed:
+                    #   1. DECODE TOLERANTLY. The message is not lost just
+                    #      because the sender wrote it badly. Try strict JSON,
+                    #      then JSON that only fails on raw control characters
+                    #      (the 3.5 KB case), then a salvage path that reads the
+                    #      file as text. A malformed message is still a message.
+                    #   2. LEAVE THE FILE if it cannot be read at all, and LOG
+                    #      it. Destruction is reserved for messages we actually
+                    #      delivered; a reader that deletes what it could not
+                    #      parse is destroying evidence.
+                    #   3. THE LOG IS THE POINT. "No file in the inbox" must stop
+                    #      meaning "delivered", so a successful read is logged
+                    #      with its source and a failed one with its error.
                     try:
-                        with open(path) as f:
-                            msg = json.load(f)
-                        os.remove(path)
-                    except (OSError, json.JSONDecodeError):
+                        with open(path, encoding="utf-8", errors="replace") as f:
+                            raw = f.read()
+                    except OSError as e:
+                        log.log("mail-unreadable", file=os.path.basename(path),
+                                error=type(e).__name__)
                         continue
+                    msg, how = _parse_message(raw, path)
+                    if msg is None:
+                        # Unrecoverable: KEEP the file (never delete what we did
+                        # not deliver) and say so, once per poll, so the backlog
+                        # is visible in the transcript instead of silent.
+                        log.log("mail-unparsed", file=os.path.basename(path),
+                                bytes=len(raw), error=how)
+                        continue
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        # Delivered but not removed: it will be delivered AGAIN.
+                        # Louder than a duplicate is a message that vanishes, so
+                        # deliver and report the failed cleanup.
+                        log.log("mail-undeleted", file=os.path.basename(path))
+                    if how != "json":
+                        log.log("mail-recovered", file=os.path.basename(path),
+                                how=how)
                     sender = msg.get("from", "unknown")
                     text = msg.get("text", "").strip()
                     if not text:
@@ -729,19 +837,39 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             while True:
                 await asyncio.sleep(2)
                 for path in sorted(glob.glob(os.path.join(HUMAN_INBOX, "*.msg"))):
+                    # THE SAME SILENT DROP, ON THE CHANNEL THAT MATTERS MOST.
+                    # This is the operator's private line to one agent: a
+                    # message from Stanley is the one message in this system
+                    # whose loss a person will notice and blame on the agent.
+                    # It had the identical `except ...: continue`, so a .msg
+                    # that was not strict JSON was skipped forever, quietly.
                     try:
-                        with open(path, encoding="utf-8") as f:
-                            msg = json.load(f)
-                        text = msg.get("text", "").strip()
-                        if text:
-                            pending_delivery.append(
-                                "Stanley has sent you a message through your "
-                                "private human channel:\n\n" + text)
-                            log.log("human-message", text=text, id=msg.get("id"))
-                            await inbox_next.put("__kick__")
-                        os.remove(path)
-                    except (OSError, json.JSONDecodeError):
+                        with open(path, encoding="utf-8",
+                                  errors="replace") as f:
+                            raw = f.read()
+                    except OSError as e:
+                        log.log("human-unreadable", file=os.path.basename(path),
+                                error=type(e).__name__)
                         continue
+                    msg, how = _parse_message(raw, path)
+                    if msg is None:
+                        log.log("human-unparsed", file=os.path.basename(path),
+                                bytes=len(raw), error=how)
+                        continue
+                    text = msg.get("text", "").strip()
+                    if text:
+                        pending_delivery.append(
+                            "Stanley has sent you a message through your "
+                            "private human channel:\n\n" + text)
+                        log.log("human-message", text=text, id=msg.get("id"))
+                        await inbox_next.put("__kick__")
+                    if how != "json":
+                        log.log("human-recovered", file=os.path.basename(path),
+                                how=how)
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        log.log("human-undeleted", file=os.path.basename(path))
 
         async def watch_restart():
             """Notice the restart flag even when NO message is arriving.
