@@ -687,9 +687,32 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     # nothing could act on it: the operator cannot tell "nothing was written"
     # from "the daemon is looking elsewhere". Both are now on the record.
     wake_path, wake_rejected = find_wake_file()
+    # REACHABILITY IS NOT FRESHNESS (agent-6, delivered by a message the
+    # broken parser had been skipping). find_wake_file() answers "can I reach a
+    # note", which is the EASIER question; a reachable note with stale content
+    # answers it perfectly and is still wrong. MEASURED:
+    # /shared/artifacts/agent-6/wake.md existed at the exact path and said
+    # "Life 10 is current" while agent-6 was on life 13. A census that counts
+    # reachability reports that agent as COVERED.
+    # So the birth event now carries the note's PATH, SIZE and MTIME together.
+    # A stale success then LOOKS stale -- the operator can compare the mtime
+    # against the life that just started -- instead of looking like a success.
+    # This does not decide what "fresh" means; it puts the fact on the record
+    # so that a reader can. A daemon cannot know when an agent last slept.
+    wake_stat = None
+    if wake_path is not None:
+        try:
+            _st = os.stat(wake_path)
+            wake_stat = {"size": _st.st_size,
+                         "mtime": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                time.localtime(_st.st_mtime)),
+                         "age_secs": int(time.time() - _st.st_mtime)}
+        except OSError as e:
+            wake_stat = {"error": type(e).__name__}
     log.log("birth", model=cfg.get("model", AGENT_MODEL),
             wake_file=os.path.exists(WAKE_FILE),
             wake_source=wake_path,
+            wake_note=wake_stat,
             wake_fallback=(None if wake_path in (None, WAKE_FILE) else
                            WAKE_SOURCE_FALLBACK),
             wake_rejected=wake_rejected,

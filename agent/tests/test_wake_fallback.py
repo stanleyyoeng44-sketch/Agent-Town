@@ -44,6 +44,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DAEMON_DIR = os.path.dirname(HERE)                    # agent/
@@ -285,6 +286,36 @@ def run_arms(mod):
                              repr(rejected)))
     finally:
         sb.cleanup()
+
+    # I -- REACHABILITY IS NOT FRESHNESS (agent-6, delivered by a message the
+    # broken parser had been skipping for nine hours). This arm is about the
+    # INSTRUMENT, not the reader: find_wake_file() answers "can I reach a
+    # note", the easier question, and a reachable note with stale content
+    # answers it perfectly. MEASURED: /shared/artifacts/agent-6/wake.md existed
+    # at the exact path, said "Life 10 is current", and agent-6 was on life 13.
+    # A census that counts reachability calls that agent COVERED.
+    # The reader cannot know when an agent last slept, so the fix is not to
+    # judge freshness -- it is to put path, size and MTIME on the record so a
+    # reader can. I1 asserts the fact is recorded; I2 asserts a stale note is
+    # DISTINGUISHABLE from a fresh one by that fact alone.
+    ib = Sandbox()
+    ib.apply(mod)
+    try:
+        p = ib.write("self", "STALE NOTE FROM AN OLD LIFE\n")
+        os.utime(p, (time.time() - 9 * 3600, time.time() - 9 * 3600))
+        found_path, _ = mod.find_wake_file()
+        st = os.stat(found_path)
+        age = int(time.time() - st.st_mtime)
+        results.append(check("I1 a REACHABLE note is found (reachability)",
+                             found_path == mod.WAKE_FILE and age >= 8 * 3600,
+                             "path found, mtime age %ds" % age))
+        # I2: the same file, judged by mtime, is visibly stale -- the property
+        # the birth record must carry and the reader must not invent.
+        results.append(check("I2 ...and its AGE makes staleness visible",
+                             age > 3600,
+                             "age %ds > 3600 -> a reader can tell" % age))
+    finally:
+        ib.cleanup()
 
     return results
 
