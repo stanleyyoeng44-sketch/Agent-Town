@@ -1551,6 +1551,46 @@ def _publisher_docs(root):
     return sites
 
 
+def _publisher_docs_read(root):
+    """How many DOCS publish a docker -p for the bank, counted from the TREE.
+
+    agent-8's attack on C15, measured on ce5497b: narrow PUBLISHER_DOCS to
+    drop docs/guide.md, then add ONE inline "-p 8787:8787" to a doc that is
+    still listed. portcheck's `checked` is a count of (doc, port) PAIRS a
+    consumer needs, so a new publish in a listed doc returns it to 3 while a
+    third of the SUPPLY side is unread -- and because re.match requires the
+    line to START with -p, the inline publish is invisible to the tree-side
+    SITE counter too. Both numbers the gate had were padable.
+
+    A DOC count is not: you cannot add coverage by editing a doc you already
+    read. Counted as "distinct tracked .md files containing a bank docker run
+    block with at least one -p", which is the supply side stated in the terms
+    the tool claims to read.
+    """
+    import subprocess
+    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
+                           capture_output=True, text=True).stdout.split("\0")
+    n = 0
+    for f in filter(None, files):
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        # A doc counts only if it publishes a -p for the bank, because that
+        # is what portcheck's doc loop reports. A doc that STARTS the bank
+        # with no -p at all is a different defect (portcheck's docstring calls
+        # it "the strongest form of cutting a caller off") and must not be
+        # counted here: doing so made this reach assertion accuse a CORRECT
+        # tool of narrowing its input when the real change was that a doc
+        # stopped publishing. A check that misnames its cause gets deleted.
+        if re.search(r"^\s*docker run\b.*\bagent-bank\b", text, re.M) or \
+           re.search(r"docker run\b[^\n]*\bagent-bank\b", text):
+            if re.search(r"(?:^|\s)-p\s+\S+:\d+", text, re.M):
+                n += 1
+    return n
+
+
 def _required_tokens(root):
     """How many secrets bank.py requires, read from ITS _token_file calls."""
     path = os.path.join(root, "bank", "bank.py")
@@ -1652,7 +1692,16 @@ def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
         m = re.search(reach[0], "\n".join(out))
         got = int(m.group(1)) if m else None
         want = reach[1](root)
-        if got != want:
+        # ONE-DIRECTIONAL on purpose. Under-reporting is the attack: the tool
+        # read FEWER docs than exist because its input set was narrowed. But a
+        # tool may legitimately read MORE than this ground truth counts -- a
+        # doc that starts the bank with no -p at all is still read by the tool
+        # and is still a defect the tool reports separately, while the ground
+        # truth counts only docs that publish. Asserting equality made this
+        # check accuse a CORRECT tool when a doc simply stopped publishing,
+        # which is the "check that bites correct code" failure this repo
+        # deletes checks for. Measured on that exact tree before changing it.
+        if got is None or got < want:
             return label, "FAIL", [
                 f"{tool} checked {got} {reach[2]}(s) but this tree has "
                 f"{want}. A detector that narrows its INPUT SET keeps its "
@@ -1746,8 +1795,9 @@ def c15_portcheck(root):
                       # which is portcheck's owner's call, not a mutant I can
                       # write here.
                       ],
-                     reach=(r"MATCH \((\d+) publish site", _publisher_docs,
-                            "publish site"))
+                     reach=(r"(?:publish site|publish site\(s\))[^\n]*?"
+                            r"(\d+) doc\(s\) read", _publisher_docs_read,
+                            "doc read"))
 
 
 def c16_tokencheck(root):
@@ -1786,12 +1836,270 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
+def _workflow_run_lines(text):
+    """Every COMMAND line a workflow executes, including block scalars.
+
+    A step written as `run: python3 tools/check.py` is one line, but the same
+    step written as a `run: |` block puts its commands on following indented
+    lines. Testing only `line.startswith("run:")` misses the block form --
+    and the block form is what any step asserting a count has to use.
+    """
+    out = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        st = line.strip()
+        # A step is a list item: "- run: ..." and "- name: ..." are the same
+        # indentation as "run: ..." once the dash is stripped. Missing the
+        # dash was why a minimal workflow found ZERO run lines while the
+        # repo's own file parsed -- caught by C17's own PASS arm, which is
+        # exactly what the arm is for.
+        if st.startswith("- "):
+            st = st[2:]
+        if st.startswith("run:"):
+            rest = st[4:].strip()
+            if rest and rest not in ("|", ">", "|-", ">-"):
+                out.append(rest)
+            else:
+                base = len(line) - len(line.lstrip())
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i]
+                    if not nxt.strip():
+                        i += 1
+                        continue
+                    if len(nxt) - len(nxt.lstrip()) <= base:
+                        break
+                    out.append(nxt.strip())
+                    i += 1
+                continue
+        i += 1
+    return out
+
+
+def c17_ci_runs_the_suites(root):
+    """CI must invoke the SUITE RUNNER, and must assert its COUNT.
+
+    TWO DEFECTS, both measured before this check existed:
+
+    (1) DISJUNCTION. tools/check.py discovers and runs the repo's test suites.
+        The workflow ran only tools/repo_check.py, which names NONE of them.
+        agent-6 demonstrated it: severing wake_prompt = read_wake_prompt()
+        left both CI steps exit 0 and "REPO CHECK: PASS". So GitHub-green
+        proved the docs, not the code.
+
+    (2) THE NAIVE FIX LIES. tools/check.py exits 0 on WARN as well as PASS
+        ("CHECK: WARN (16 pass, 1 warn, 0 fail)", exit 0, measured on a clean
+        export; on a runner with docker the dispatched paths change and it is
+        still exit 0). A CI step wired to the EXIT CODE therefore reproduces
+        the defect one level up: a step that runs 0 suites and a step that
+        runs 16 are indistinguishable. The step must assert the DISCOVERED
+        SUITE COUNT that check.py prints -- that is the only line in its
+        output that changes when suites stop being found.
+
+    WHAT THIS CHECK DOES NOT DO: it does not run the suites (that is CI's
+    job, and this check must stay cheap and offline). It asserts the step
+    EXISTS and that it is wired to a COUNT. A workflow that has the right
+    shape and runs the wrong thing is a different defect with a different
+    instrument -- the same boundary C14 states about gutted bodies.
+    """
+    wf_dir = os.path.join(root, ".github", "workflows")
+    if not os.path.isdir(wf_dir):
+        return ("C17 CI runs the test suites", "FAIL",
+                [".github/workflows/ is missing, so nothing runs the suites "
+                 "in CI. A test runner nobody invokes enforces nothing."])
+    files = sorted(f for f in os.listdir(wf_dir)
+                   if f.endswith((".yml", ".yaml")))
+    if not files:
+        return ("C17 CI runs the test suites", "FAIL",
+                [".github/workflows/ holds no workflow file."])
+    findings = []
+    invoked = []
+    for name in files:
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        for st in _workflow_run_lines(text):
+            # tools/check.py, NOT tools/repo_check.py -- a substring test on
+            # "check.py" matches BOTH, and an earlier draft of this check
+            # reported the workflow as invoking the suite runner when it
+            # invoked only the repo checks. That is the "accuses a correct
+            # line" failure this repo deletes checks for; found by running
+            # it on a correct tree before trusting it.
+            # It must be an INVOCATION, not a mention. The step that asserts
+            # the count also ECHOES "check.py" inside its error strings, and
+            # a bare substring test counted those as three extra steps. Require
+            # an interpreter/executable position: the line must start with a
+            # command and the path must be an argument to it, not text after
+            # "echo".
+            if st.lstrip().startswith(("echo", "test ", "#", "printf")):
+                continue
+            if re.search(r"(?:^|[\s|;&])(?:python3?|bash|sh|\.\/)?\s*"
+                         r"(?<![\w-])tools/check\.py\b", st):
+                invoked.append((name, st))
+    # A step that runs the runner and then SWALLOWS its failure is green on a
+    # red tree, and no amount of REACH testing sees it: the step's own shell
+    # is what discards the exit status, not the stub. agent-0 measured this
+    # on the previous tip -- `python3 tools/check.py | tee log || true` left
+    # C17 PASS and the step green while check.py printed
+    # "CHECK: FAIL (13 pass, 1 warn, 3 fail)" on a tree with the
+    # empty-wake-prompt defect. A success that does not depend on the thing
+    # it names is the whole defect class this cohort has been chasing, so it
+    # is asserted here as a TEXT fact on the step, deliberately and narrowly:
+    # `|| true`, `|| :`, `set +e`, or `continue-on-error: true`.
+    _swallow = re.compile(r"\|\|\s*(true|:)\b|\bset\s+\+e\b")
+    for name in files:
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        if re.search(r"continue-on-error:\s*true", text) and invoked:
+            findings.append(
+                "%s sets continue-on-error: true on a job/step, so a failing "
+                "runner cannot fail CI. The step must be allowed to go red."
+                % name)
+        for script in _c17_step_scripts(text):
+            if _swallow.search(script):
+                findings.append(
+                    "%s: the check.py step swallows failures (`|| true`, "
+                    "`|| :`, or `set +e`). Measured: with that in the step, "
+                    "check.py printing 'CHECK: FAIL (13 pass, 1 warn, 3 fail)' "
+                    "still leaves the step exit 0 and C17 green. A step whose "
+                    "success does not depend on the runner is the defect this "
+                    "check exists for." % name)
+                break
+    if not invoked:
+        return ("C17 CI runs the test suites", "FAIL",
+                ["no workflow step invokes tools/check.py. The suites exist "
+                 "and CI names none of them: GitHub-green proves the repo's "
+                 "invariants, not that its code works (agent-6)."])
+    # A step that only runs check.py and trusts its exit code is not enough:
+    # check.py exits 0 on WARN, so a run that discovered 0 suites passes.
+    # The step must ASSERT THE COUNT -- and asserting it TEXTUALLY is not
+    # enough either. agent-6 measured that hole in the first version of this
+    # check: a step that runs `python3 tools/check.py >/dev/null 2>&1 || true`
+    # and then `echo "check: 15 suite(s)"` into the log satisfied every text
+    # pattern. The check proved the WORKFLOW was well-spoken, not that the
+    # number came from the run -- which is the same "output vs connection"
+    # distinction this repo spent the night on, one level up.
+    #
+    # So the arm is a REACH test on the PIPELINE: replace tools/check.py with
+    # a stub that prints a count BELOW the threshold and exits 0, run the
+    # step's own shell, and require the step to go RED. If the workflow reads
+    # the number from the run, a stub printing 3 suites makes `test "$n" -ge
+    # 15` fail. If the number is typed or echoed, nothing happens. A second
+    # stub exits 1 and the step must propagate that too (set -o pipefail).
+    for name, st in invoked:
+        text = open(os.path.join(wf_dir, name), encoding="utf-8").read()
+        ok, why = _c17_reach(text, root)
+        if not ok:
+            findings.append("%s: %s" % (name, why))
+    if findings:
+        return ("C17 CI runs the test suites", "FAIL", findings)
+    return ("C17 CI runs the test suites", "PASS",
+            ["%d workflow step(s) invoke tools/check.py, and the step's own "
+             "shell FAILS when a stub reports too few suites or exits 1: %s"
+             % (len(invoked), ", ".join(sorted({n for n, _ in invoked})))])
+
+
+def _c17_step_scripts(workflow_text):
+    """The shell body of every step whose commands mention tools/check.py."""
+    lines = workflow_text.splitlines()
+    scripts = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        st = raw.strip()
+        if st.startswith("- "):
+            st = st[2:]
+        if st.startswith("run:"):
+            body = []
+            rest = st[4:].strip()
+            base = len(raw) - len(raw.lstrip())
+            if rest and rest not in ("|", ">", "|-", ">-"):
+                body.append(rest)
+            else:
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i]
+                    if not nxt.strip():
+                        i += 1
+                        continue
+                    if len(nxt) - len(nxt.lstrip()) <= base:
+                        break
+                    body.append(nxt.strip())
+                    i += 1
+                if any(re.search(r"(?<![\w-])tools/check\.py\b", b)
+                       for b in body):
+                    scripts.append("\n".join(body))
+                continue
+            if any(re.search(r"(?<![\w-])tools/check\.py\b", b)
+                   for b in body):
+                scripts.append("\n".join(body))
+        i += 1
+    return scripts
+
+
+def _c17_reach(workflow_text, root):
+    """Run each check.py step against STUBBED runners and require a red.
+
+    This is the arm that makes the count assertion mean something. It is
+    deliberately a stub on the PIPELINE, not a text match on the file.
+    """
+    import tempfile
+    import shutil
+    scripts = _c17_step_scripts(workflow_text)
+    if not scripts:
+        return False, ("no runnable step invokes tools/check.py (found the "
+                       "name in prose or an echo, not as a command)")
+    # Two stubs. (a) exits 0 printing a count BELOW the step's threshold --
+    # catches a step that types its own number. (b) exits 1 -- catches a step
+    # that swallows a real failure with `|| true` or a missing pipefail.
+    # (a) a stub reporting too few suites: catches a TYPED/echoed count.
+    # (b) a stub printing a GOOD count but exiting 1: catches a step whose
+    #     trailing assertion masks the runner's failure -- agent-6's Hole 1,
+    #     measured: `set -o pipefail` makes the pipeline nonzero but a step
+    #     exits with its LAST command's status, so a trailing successful
+    #     `test` returned 0 on a failing run. This stub is that defect as a
+    #     permanent arm: the count is right, the run failed, the step must
+    #     still go red.
+    stubs = [
+        ("import sys\nprint('check: 3 suite(s), from /stub')\nsys.exit(0)\n",
+         "a stub reporting 3 suites"),
+        ("import sys\nprint('check: 15 suite(s), from /stub')\nsys.exit(1)\n",
+         "a stub printing a GOOD count and exiting 1"),
+    ]
+    results = []
+    for body, label in stubs:
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "tools"))
+            # The stub IS tools/check.py in the scratch dir, so the step's own
+            # `python3 tools/check.py` runs it. grep and test are the real
+            # binaries; only the runner is stubbed.
+            open(os.path.join(d, "tools", "check.py"), "w").write(body)
+            r = subprocess.run(["bash", "-c", scripts[0]], cwd=d,
+                               capture_output=True, text=True, timeout=120)
+            results.append((label, r.returncode, r))
+        except Exception as exc:  # a check must not crash the whole report
+            results.append((label, None, exc))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    for label, rc, r in results:
+        if rc is None:
+            return False, ("could not run the step against %s (%s), so its "
+                           "count assertion cannot be shown to be connected"
+                           % (label, r))
+        if rc == 0:
+            return False, (
+                "the step stays GREEN when %s -- so the suite count it "
+                "asserts is not read from the run. A step can print the right "
+                "number while measuring nothing." % label)
+    return True, ""
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck]
+          c15_portcheck, c16_tokencheck, c17_ci_runs_the_suites]
 
 
 def _is_git_tree(root):
@@ -2843,6 +3151,112 @@ def selftest():
         CHECKS[:] = _saved
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
+
+    # C15 arms. The attack agent-8 measured on ce5497b: narrow PUBLISHER_DOCS
+    # to drop a doc, then add an INLINE "-p" to a doc that is still listed.
+    # portcheck's pair count returns to its old value, so the tool alone still
+    # says MATCH; the DOC count is the number that moves. Both directions are
+    # asserted: the reach value must equal the tree's doc count on a clean
+    # tree, and must NOT equal it when the constant is narrowed.
+    _c15_clean = _publisher_docs_read(ROOT)
+    outcomes.append(("C15 reach reads the tree's publisher-doc count",
+                     isinstance(_c15_clean, int) and _c15_clean >= 1))
+    try:
+        import importlib.util as _iu
+        _spec = _iu.spec_from_file_location(
+            "_pc_probe", os.path.join(ROOT, "tools", "portcheck.py"))
+        _pc = _iu.module_from_spec(_spec)
+        _spec.loader.exec_module(_pc)
+        _full = _pc.PUBLISHER_DOCS
+        _res_full, _ = _pc.evaluate(ROOT)
+        _n_full = len(_res_full[3]) if _res_full else -1
+        _pc.PUBLISHER_DOCS = tuple(_full[:-1])
+        _res_n, _ = _pc.evaluate(ROOT)
+        _n_narrow = len(_res_n[3]) if _res_n else -1
+        _pc.PUBLISHER_DOCS = _full
+        outcomes.append((
+            "C15 docs-read FALLS when a publisher doc is dropped from the list",
+            _n_full == len(_full) and _n_narrow < _n_full))
+    except Exception as _exc:
+        outcomes.append(("C15 docs-read FALLS when a publisher doc is dropped",
+                         False))
+
+    # C17 arms. Each builds a MINIMAL temp tree with a workflow file, because
+    # the check reads a directory rather than a source string. Three states,
+    # each asserted separately: no step (the shipped defect), a naive step
+    # that trusts the exit code (the fix that lies), and a step that asserts
+    # the printed suite count (the fix that works).
+    import tempfile as _tf
+
+    def _c17_on(workflow_text):
+        d = _tf.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, ".github", "workflows"))
+            if workflow_text is not None:
+                open(os.path.join(d, ".github", "workflows", "ci.yml"),
+                     "w").write(workflow_text)
+            return c17_ci_runs_the_suites(d)[1]
+        finally:
+            import shutil as _sh
+            _sh.rmtree(d, ignore_errors=True)
+
+    outcomes.append((
+        "C17 FAILs when no step invokes tools/check.py",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: python3 tools/repo_check.py .\n") == "FAIL"))
+    outcomes.append((
+        "C17 FAILs on a step that trusts check.py's exit code",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: python3 tools/check.py\n") == "FAIL"))
+    # The PASS arm must be a step whose assertion is CONNECTED to the run,
+    # because C17 now STUBS the runner and requires the step to go red.
+    _good_step = ("name: ci\njobs:\n  t:\n    steps:\n"
+                  "      - run: |\n"
+                  "          set -e\n"
+                  "          set -o pipefail\n"
+                  "          python3 tools/check.py | tee /tmp/c.log\n"
+                  "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
+                  " | grep -oE '[0-9]+' | head -1)\n"
+                  "          test -n \"$n\" || exit 1\n"
+                  "          test \"$n\" -ge 15 || exit 1\n")
+    outcomes.append((
+        "C17 PASSes on a step whose count assertion is read from the run",
+        _c17_on(_good_step) == "PASS"))
+    # agent-6's attack, and the reason this arm exists: a step that throws the
+    # runner's output away and ECHOES a typed count satisfied every textual
+    # pattern the first version of C17 used. It must FAIL now, because the
+    # stubbed runner prints 3 and the echoed 15 hides it.
+    outcomes.append((
+        "C17 FAILs on a step that ECHOES a typed count instead of reading one",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          set -o pipefail\n"
+                "          true && python3 tools/check.py >/dev/null 2>&1 || true\n"
+                "          echo \"check: 15 suite(s)\" > /tmp/c.log\n"
+                "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
+                " | grep -oE '[0-9]+' | head -1)\n"
+                "          test \"$n\" -ge 15 || exit 1\n") == "FAIL"))
+    outcomes.append((
+        "C17 FAILs on a step that swallows check.py's failure (no pipefail)",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          python3 tools/check.py | tee /tmp/c.log || true\n"
+                "          echo \"check: 15 suite(s)\"\n") == "FAIL"))
+    outcomes.append((
+        "C17 FAILs when the step swallows a runner failure (agent-0's `|| true`)",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          set -o pipefail\n"
+                "          python3 tools/check.py | tee /tmp/c.log || true\n"
+                "          n=$(grep -oE 'check: [0-9]+ suite' /tmp/c.log"
+                " | grep -oE '[0-9]+' | head -1)\n"
+                "          test \"$n\" -ge 15 || exit 1\n") == "FAIL"))
+    outcomes.append((
+        "C17 does NOT mistake repo_check.py for the suite runner",
+        _c17_on("name: ci\njobs:\n  t:\n    steps:\n"
+                "      - run: |\n"
+                "          python3 tools/repo_check.py .\n"
+                "          echo check.py\n") == "FAIL"))
 
     bad = 0
     for label, passed in outcomes:

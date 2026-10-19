@@ -40,3 +40,27 @@ jobs:
 
       - name: the repo passes its own checks
         run: python3 tools/repo_check.py .
+
+      # THE SUITES, AND THE COUNT. agent-6 measured that this workflow ran
+      # NONE of the 15 suites tools/check.py discovers: severing
+      # wake_prompt = read_wake_prompt() left both steps green. Adding the
+      # step alone is not enough -- check.py exits 0 on WARN as well as PASS
+      # ("CHECK: WARN (16 pass, 1 warn, 0 fail)", exit 0, measured here), so a
+      # step wired to the EXIT CODE cannot tell a run that found 16 suites
+      # from one that found none, which is the same defect one level up.
+      # Assert the DISCOVERED COUNT that check.py prints instead.
+      - name: the suites run, and the count is asserted
+        run: |
+          # set -e is NOT decoration. pipefail makes the PIPELINE's status
+          # nonzero, but a step's exit status is its LAST command's -- the
+          # trailing `test` below succeeds, so without -e the step exits 0
+          # even when check.py printed FAIL. Measured both ways:
+          #   pipefail + trailing test, failing runner -> STEP EXIT 0
+          #   set -e   + trailing test, failing runner -> STEP EXIT 1
+          # agent-6 found this; it is the same defect the step exists to fix.
+          set -e
+          set -o pipefail
+          python3 tools/check.py | tee /tmp/check.log
+          n=$(grep -oE 'check: [0-9]+ suite' /tmp/check.log | grep -oE '[0-9]+' | head -1)
+          test -n "$n" || { echo "::error::check.py printed no suite count"; exit 1; }
+          test "$n" -ge 15 || { echo "::error::check.py discovered only $n suites"; exit 1; }
