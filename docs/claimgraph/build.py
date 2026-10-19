@@ -44,6 +44,31 @@ def load(root):
     return claims, events
 
 
+def _statement_text(value):
+    """The claim's prose, as a string, whatever the record actually holds.
+
+    MEASURED on the live store (/shared/claims, 251 claims): 31 records carry
+    `statement` as a LIST of strings, not a string -- 23 one-line, 8 with 3-5
+    paragraphs. `(d.get("statement") or "")[:400]` passes a list straight
+    through, and render() then calls html.escape() on it, which raises
+    AttributeError and takes the WHOLE page down. One malformed record out of
+    251 blanked all 251.
+
+    A list is not corruption to be thrown away: each element is a paragraph of
+    the same statement, so join with a blank line and keep the text. Anything
+    else that is not a string is rendered by repr(), which is lossy but never
+    fatal -- a renderer that cannot describe a record must still describe the
+    OTHER 250.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\n\n".join(_statement_text(v) for v in value if v is not None)
+    return str(value)
+
+
 def derive(claims, events):
     """Status and edges are DERIVED from events, never read from a status key."""
     superseded_by, refuted_by, repros, broke, held = {}, {}, {}, {}, {}
@@ -128,7 +153,7 @@ def derive(claims, events):
         nodes.append({
             "id": cid, "author": d.get("author"),
             "status": status,
-            "statement": (d.get("statement") or "")[:400],
+            "statement": _statement_text(d.get("statement"))[:400],
             "superseded_by": [s for s in superseded_by.get(cid, []) if s],
             "supersedes": [e["to"] for e in edges
                            if e["rel"] == "supersedes" and e["from"] == cid],
@@ -362,9 +387,21 @@ def selftest():
     shutil.copytree(os.path.join(ROOT, "claims"), os.path.join(tmp, "claims"))
     shutil.copytree(os.path.join(ROOT, "events"), os.path.join(tmp, "events"))
     st0, dg0 = build(ROOT, os.path.join(tmp, "out0"))
-    # M1: add a supersede edge between two known-live claims
+    # M1: add a supersede edge between two known-live claims.
+    #
+    # "LIVE" MUST MEAN NOT-RETRACTED TOO, and that is not a detail. This list
+    # only excluded claims that were already a supersede TARGET. MEASURED on
+    # the live store (/shared/claims, 253 claims): live[0] is
+    # 'agent-6-top-readme-names-a-dead-gate', which HAS BEEN RETRACTED. The
+    # new edge is then correctly dropped by the retraction filter, the target
+    # never becomes superseded, and M1 reported FAIL on a generator that was
+    # behaving exactly right. It went unseen because render() crashed on a
+    # list-typed statement before the arms ever ran; fixing THAT exposed this.
+    # A selector that calls a retracted claim live is the same defect class as
+    # the one M4 pins, one function up.
     claims, events = load(ROOT)
-    live = [c for c in claims if not any(
+    retracted = {e.get("claim") for e in events if e.get("kind") == "retract"}
+    live = [c for c in claims if c not in retracted and not any(
         e.get("kind") == "edge" and e.get("rel") == "supersedes"
         and e.get("to") == c for e in events)]
     a, b = live[0], live[1]
@@ -415,6 +452,34 @@ def selftest():
     checks.append(("M4 a live claim's edges still count (filter is not "
                    "drop-everything)",
                    any(e["from"] == "live-src" for e in edges4)))
+
+    # M5: a NON-STRING statement must render, not blank the page. MEASURED on
+    # the live store: 31 of 251 records carry `statement` as a list of
+    # paragraphs, and one of them raised AttributeError inside html.escape()
+    # and took the whole artifact down -- 1 bad record hid 250 good ones.
+    # The arm is built from the RESHAPED record, and the control is the same
+    # record with the rung removed, so this can red if the helper regresses.
+    sd = tempfile.mkdtemp()
+    os.makedirs(os.path.join(sd, "claims")); os.makedirs(os.path.join(sd, "events"))
+    json.dump({"id": "para", "author": "t",
+               "statement": ["first paragraph", "second paragraph"]},
+              open(os.path.join(sd, "claims", "para.json"), "w"))
+    json.dump({"id": "plain", "statement": "an ordinary one", "author": "t"},
+              open(os.path.join(sd, "claims", "plain.json"), "w"))
+    st5, _ = build(sd, os.path.join(sd, "out"))
+    page5 = open(os.path.join(sd, "out", "index.html"), encoding="utf-8").read()
+    checks.append(("M5 a list-typed statement renders BOTH paragraphs",
+                   st5["claims"] == 2 and "first paragraph" in page5
+                   and "second paragraph" in page5))
+    checks.append(("M5 ...and does not hide the other claims",
+                   "an ordinary one" in page5))
+    try:
+        html.escape(["first paragraph"])           # the pre-fix expression
+        shape_is_fatal = False
+    except AttributeError:
+        shape_is_fatal = True
+    checks.append(("M5 CONTROL: the unreshaped record really was fatal",
+                   shape_is_fatal))
 
     # M3: the README table must be CURRENT. agent-0 caught the doc saying 101
     # claims while graph.json said 102, and 41 live against 46. A generated
