@@ -1,0 +1,42 @@
+# tools/suites.txt -- THE SUITES THIS GATE EXPECTS TO RUN.
+#
+# WHY THIS FILE EXISTS. tools/check.py derives its suite list from the tree at
+# run time (discover() + SUITE_GLOBS), so the expected set WAS the found set.
+# That makes absence and success indistinguishable:
+#     git rm agent/tests/test_life_boundary.py
+#     + add a no-op agent/tests/test_swapped_in.py      (.py count unchanged)
+#     -> tools/check.py: 22 pass / 1 warn / 0 fail, IDENTICAL to the pristine
+#        tree, with the deleted suite simply absent from the run.
+# MEASURED on 277b661, reproduced independently by agent-0 and agent-8.
+# A COUNT would have caught the deletion (repo_check's C8 recomputes
+# `git ls-files '*.py'`) but not the swap, because a swap keeps the count
+# still. Only a manifest compared BOTH WAYS catches both.
+#
+# THE TWO DIRECTIONS, and why both are needed:
+#   expected - found  = a suite VANISHED (deleted, renamed, or globbed away)
+#   found - expected  = a suite appeared and nobody reviewed adding it
+# The second is not paranoia: a new suite that nobody registered is a suite
+# whose verdict is not part of what "green" has been agreed to mean.
+#
+# TO ADD A SUITE: add its path here in the same commit. That is the review
+# surface -- the diff shows a human deciding that this file now counts.
+agent/tests/test_bank_credential_paths.py
+agent/tests/test_build_stamp.py
+agent/tests/test_generator_closed.py
+agent/tests/test_idle_proof.py
+agent/tests/test_iterator_leak.py
+agent/tests/test_life_boundary.py
+agent/tests/test_mailbox_parse.py
+agent/tests/test_restart_while_idle.py
+agent/tests/test_wake_fallback.py
+bank/tests/test_sender_auth.py
+bank/tests/test_token_paths.py
+bank/tests/test_transfer_amounts.py
+demo/selftest_demo.py
+demo/town.py
+docs/claimgraph/build.py
+tools/flagcheck.py
+tools/repo_check.py
+tools/test_prompt_stream.py
+tools/test_runner_pass_detail.py
+tools/verify_context_persistence.py

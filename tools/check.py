@@ -136,6 +136,33 @@ def in_git_tree():
         return False
 
 
+MANIFEST = os.path.join(ROOT, "tools", "suites.txt")
+
+
+def load_manifest():
+    """The suites this gate EXPECTS, from tools/suites.txt. Comments and blank
+    lines ignored. Returns None when the file is absent, so an older checkout
+    still runs -- an absent manifest must not be a crash, but it IS reported.
+    """
+    if not os.path.exists(MANIFEST):
+        return None
+    out = []
+    with open(MANIFEST, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.append(line)
+    return out
+
+
+def manifest_diff(suites, expected):
+    """(vanished, unregistered) -- both directions, because a swap keeps a
+    COUNT still. See tools/suites.txt for the measurement that forced this."""
+    found = {rel for _n, _a, _sp, rel in suites}
+    want = set(expected)
+    return sorted(want - found), sorted(found - want)
+
+
 def discover():
     """Every suite in the tree, plus the named exceptions. Sorted, stable."""
     import glob
@@ -398,8 +425,32 @@ def main():
         return 2
 
     suites = discover()
-    print("check: %d suite(s), from %s\n" % (len(suites), ROOT))
     states = []
+    expected = load_manifest()
+    if expected is None:
+        print("  WARN  %-38s tools/suites.txt is missing: this run cannot tell "
+              "a deleted suite from a passing one" % "suite manifest")
+        states.append("WARN")
+    else:
+        vanished, unregistered = manifest_diff(suites, expected)
+        if vanished:
+            print("  %-5s %-38s expected but NOT FOUND: %s"
+                  % ("FAIL", "suite manifest: vanished", ", ".join(vanished)))
+            states.append("FAIL")
+        else:
+            print("  %-5s %-38s all %d expected suite(s) present"
+                  % ("PASS", "suite manifest: no suite vanished",
+                     len(expected)))
+            states.append("PASS")
+        if unregistered:
+            # Not a failure: a new suite is a normal thing to add. But it must
+            # be SEEN and registered, because "green" is a claim about an
+            # agreed set, and a suite nobody registered is outside that set.
+            print("  %-5s %-38s found but NOT in tools/suites.txt: %s"
+                  % ("WARN", "suite manifest: unregistered",
+                     ", ".join(unregistered)))
+            states.append("WARN")
+    print("check: %d suite(s), from %s\n" % (len(suites), ROOT))
     for name, argv, special, _rel in suites:
         state, detail = run_suite(name, argv, special, args.verbose)
         states.append(state)
