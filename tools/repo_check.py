@@ -20,6 +20,9 @@ CHECKS
     C4 .gitignore present  and covers the classes above
     C5 docs commands run   every ```sh block in README runs, or is marked
     C6 sources import      every .py in the tree parses (stdlib ast only)
+    C14 check registry     every c<N>_ check defined here is in CHECKS, so a
+                           merge that drops one list entry cannot turn a check
+                           off silently (nothing else reads the registry)
 
 Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
 CONTROL per check: it builds a deliberately bad tree and asserts the check
@@ -32,6 +35,7 @@ whole rule this cohort spent the day learning, and the repo is no exception.
   a tree checkable. This is not a repo defect and the output now says so.
 """
 import ast
+import json
 import os
 import re
 import shutil
@@ -224,8 +228,9 @@ SH_BLOCK = re.compile(r"```(?:sh|bash|console)\n(.*?)```", re.S)
 # reported as skipped WITH ITS REASON -- never silently dropped.
 RUNNABLE = ("python3 ", "python ", "bash -n ", "sh -n ", "test ", "[ ")
 ENV_LIMITED = ("docker ", "docker-compose ", "make ")   # no docker daemon here
-# a leading VAR=value is environment, not the command; look through it
-ENV_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
+# A leading VAR=value is environment, not the command; _strip_env_prefix
+# looks through it. It used to be a single regex here whose \S* stopped at
+# the first space INSIDE a $( ) substitution -- see _strip_env_prefix.
 
 
 def _looks_like_server(body, root="."):
@@ -304,12 +309,79 @@ def _probe_safe(cmd: str) -> bool:
     return False
 
 
+def _strip_env_prefix(line):
+    """Strip leading VAR=value assignments from a command line.
+
+    MEASURED DEFECT THIS REPLACES (agent-2, reproduced by agent-4): the old
+    form was ENV_PREFIX = r"^[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+", and \\S* stops
+    at the first whitespace INSIDE a command substitution. On the line
+    docs/CLOUD-DEPLOYMENT.md actually ships:
+
+        docker0=$(ip -o addr show docker0 | awk '{print $4}' | cut -d/ -f1)
+
+    it consumed 'docker0=$(ip' and returned '-o addr show docker0 | ...'.
+    That value is what C5 CLASSIFIES and what it SHOWS as the skip reason, so
+    the checker reported a fragment of a command as the command.
+
+    IT WAS REPORTED AS COSMETIC AND IT WAS NOT. MEASURED on ede3310, same
+    parser, a block that is ONE shell assignment:
+
+        X=$(env python3 -c "open('/tmp/.../SIDE_EFFECT','w').write('ran')")
+
+    parsed as first='python3 -c "open(...)...")', matched RUNNABLE, and THE
+    WHOLE LINE WAS EXECUTED -- the file appeared and the run said PASS. So a
+    garbled parse is not a garbled label: it decides WHETHER A DOCUMENT'S CODE
+    RUNS. The arm ("C5 does not EXECUTE a block that is only an assignment")
+    asserts the positive artifact, and the old parser fails it.
+
+    Rules, in order:
+      * VAR=$( ... )  consume to the MATCHING ')' (quotes respected), then
+        strip the whitespace after it
+      * VAR=value     consume the value to the first unquoted whitespace
+      * if nothing is left, the line was ONLY assignments -- return the line
+        unchanged rather than "", so it is still visible as a skipped block
+    """
+    s = line
+    while True:
+        m = re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s)
+        if not m:
+            return s
+        rest = s[m.end():]
+        if rest.startswith("$("):
+            depth, i = 0, 0
+            quote = None
+            while i < len(rest):
+                c = rest[i]
+                if quote:
+                    if c == quote:
+                        quote = None
+                elif c in ("'", '"'):
+                    quote = c
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            tail = rest[i:]
+        else:
+            mm = re.match(r"\S*", rest)
+            tail = rest[mm.end():]
+            if not tail:
+                return s          # bare NAME=value: still the whole line
+        tail = tail.lstrip()
+        if not tail:
+            return s              # assignment(s) only
+        s = tail
+
+
 def _first_cmd(body):
     for line in body.splitlines():
         s = line.strip()
         if s and not s.startswith("#"):
-            while ENV_PREFIX.match(s):
-                s = ENV_PREFIX.sub("", s, count=1)
+            s = _strip_env_prefix(s)
             return s
     return ""
 
@@ -349,16 +421,40 @@ def c5_doc_commands(root, timeout=60):
     whether it exits 0. If a doc block has an effect outside the tree, that
     is a defect in the block, and fixing the block is what makes this check
     read-only in practice.
+
+    WHAT IT DOES NOT MEASURE, stated because the summary line used to imply
+    otherwise. It counts blocks, not COMMANDS: a 12-line block with one
+    runnable first line and eleven unrunnable ones is "executed". It does not
+    run docker, so a docker doc can only ever be UNVERIFIED here. And it
+    classifies by the FIRST WORD, so a compound line is judged by what it
+    starts with -- the 'cd <dir> &&' form is the one exception, and it is
+    there so the WHERE of a command is not mistaken for the WHAT.
     """
     findings, ran, skipped, warnings = [], 0, [], []
+    # PER-FILE COVERAGE, because the summary line was not one.
+    # MEASURED on master 633d62e: "executed 5 block(s), skipped 40" while
+    # docs/CLOUD-DEPLOYMENT.md -- 11 fenced blocks, the file README.md calls a
+    # verified migration transcript -- appeared ZERO times in either bucket's
+    # visible output (the skip list is capped at 20 and nothing asked for it by
+    # file). A total cannot tell a reader that one document is entirely
+    # unexecuted; that fact only exists per file, so it is reported per file.
+    per_file = {}          # f -> [blocks, executed, {reason: count}]
     for f in _tracked(root):
         if not f.endswith(DOC_SUFFIXES):
             continue
+        counts = per_file.setdefault(f, [0, 0, {}])
+
+        def did_not_run(reason):
+            """Record why THIS file's block did not execute, then keep going."""
+            counts[2][reason] = counts[2].get(reason, 0) + 1
+
         text = open(os.path.join(root, f), encoding="utf-8", errors="replace").read()
         for block in SH_BLOCK.finditer(text):
+            counts[0] += 1
             body = block.group(1).strip()
             first = _first_cmd(body)
             if not first:
+                did_not_run("no command line")
                 continue
             # The SKIP marker may appear two ways and BOTH must mean the same
             # thing:
@@ -412,23 +508,28 @@ def c5_doc_commands(root, timeout=60):
                     else:
                         skipped.append(f"{f}: {inner[:60]} (marked SKIP; probe "
                                        f"declined -- not safe to run twice)")
+                        did_not_run("SKIP-marked, probe declined")
                         continue
                 if probe == 0:
                     warnings.append(
                         f"{f}: `{inner[:60]}` marked SKIP but runs fine here "
                         f"-- the doc is opting out of a check it could pass")
                 else:
-                    why = ("exits %s without its environment" % probe
-                           if probe is not None else "not runnable here")
-                    skipped.append(f"{f}: {inner[:60]} (marked SKIP; {why})")
+                    reason = ("exits %s without its environment" % probe
+                              if probe is not None else "not runnable here")
+                    skipped.append(f"{f}: {inner[:60]} (marked SKIP; {reason})")
+                    did_not_run("SKIP-marked: " + reason)
                 continue
             if first.startswith(ENV_LIMITED):
                 skipped.append(f"{f}: {first[:60]} (no docker/make on this box)")
+                did_not_run("needs docker/make (absent here)")
                 continue
             if not first.startswith(RUNNABLE):
                 skipped.append(f"{f}: {first[:60]} (not a command this check runs)")
+                did_not_run("first word is not a command this check runs")
                 continue
             ran += 1
+            counts[1] += 1
             try:
                 r = subprocess.run(body, shell=True, cwd=root, text=True,
                                    capture_output=True, timeout=timeout)
@@ -450,8 +551,37 @@ def c5_doc_commands(root, timeout=60):
                                 f"{err[:200]}")
 
     note = [f"executed {ran} block(s), skipped {len(skipped)}"]
+    # A DOCUMENT NOTHING RUNS IS NAMED. The single total could not express
+    # this, and that is how it hid a whole file: MEASURED on master 633d62e,
+    # "executed 5 block(s), skipped 40" over a tree where
+    # docs/CLOUD-DEPLOYMENT.md -- 11 fenced blocks, the file README.md calls a
+    # verified migration transcript -- did not appear in either bucket's
+    # VISIBLE output (the skip list is capped at 20). A total is a fact about
+    # the checker; "this document has never run" is a fact about the document,
+    # and it only exists per file.
+    # Reasons are reported, not just the count, because they are different
+    # facts: a block needing docker may run on a machine that has it, while
+    # "first word is not a command this check runs" is a limit of the checker.
+    uncovered = []
+    for f in sorted(per_file):
+        blocks, executed, reasons = per_file[f]
+        if blocks and not executed:
+            detail = "; ".join(f"{n} x {r}" for r, n in sorted(reasons.items(),
+                                                               key=lambda kv: -kv[1]))
+            uncovered.append(f"{f}: 0 of {blocks} block(s) executed "
+                             f"-- UNVERIFIED here ({detail})")
+    note.extend(uncovered)
     # skips are always visible; they are never silently absorbed
     note.extend("skipped " + s for s in skipped[:20])
+    if uncovered:
+        # NOT a PASS, and NOT silent. WARN rather than FAIL for the same reason
+        # the existing no-runnable-block case is WARN: the blocks may
+        # legitimately need docker, and WARN never claims the docs are correct.
+        # Verified: on a tree where every block executes, this arm does not
+        # fire (the C5 selftest arms assert both sides).
+        warnings = warnings + [
+            "a tracked doc with 0 executed blocks is UNVERIFIED, not verified "
+            "-- named per file above"]
     if findings:
         return "C5 doc commands run", "FAIL", findings + warnings + note
     if warnings:
@@ -510,9 +640,18 @@ def c7_sources_import(root, timeout=60):
         if not os.path.isfile(path):
             findings.append(f"{f}: listed as an import target but MISSING")
             continue
+        # THE CHILD MUST BE GIVEN AN ABSOLUTE PATH. The first version passed
+        # `os.path.basename(f)` and ran the child with cwd=root, so it looked
+        # for <root>/agent-daemon.py -- which does not exist for any target
+        # below the top level. On a box with claude_agent_sdk installed the
+        # interpreter import-failed anyway and the basename never mattered;
+        # on a bare runner it produced `FileNotFoundError: <repo>/agent-daemon.py`
+        # and C7 failed for a reason that has nothing to do with the module.
+        # A check that reports its own bug as an object defect is the exact
+        # pattern this file warns about elsewhere.
         code = (
             "import importlib.util,sys\n"
-            f"spec=importlib.util.spec_from_file_location('m', {os.path.basename(f)!r})\n"
+            f"spec=importlib.util.spec_from_file_location('m', {os.path.abspath(path)!r})\n"
             "m=importlib.util.module_from_spec(spec)\n"
             "try:\n"
             "    spec.loader.exec_module(m)\n"
@@ -530,6 +669,14 @@ def c7_sources_import(root, timeout=60):
             if r.returncode == 0:
                 return "ok"
             tail = (r.stderr or r.stdout).strip().splitlines()
+            # Name the FIRST line that says what went wrong, not the last:
+            # a traceback's last line is the symptom, and its first
+            # "XError:" is the cause.
+            for line in tail:
+                if line.startswith(("ModuleNotFoundError", "ImportError",
+                                    "FileNotFoundError", "SyntaxError",
+                                    "AttributeError", "NameError")):
+                    return line[:200]
             return tail[-1][:200] if tail else "?"
 
         at_root = try_from(root)
@@ -566,17 +713,33 @@ README_COUNT_CLAIMS = [
      lambda r: _selftest_control_lines(r)),
     (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
      lambda r: len([x for x in sh_ls(r) if x.strip()])),
-    # NO CLAIMGRAPH NUMBER LIVES HERE, and the reason is a better check, not
-    # an omission. agent-8's finding was real: mutating those numbers in the
-    # README left repo_check green. But by the time this branch could merge,
-    # the counts had MOVED OUT of the prose into a table generated by
-    # docs/claimgraph/build.py, and that script's own selftest (M3) already
-    # fails when the committed table disagrees with the committed graph.json.
-    # Re-adding regexes here would duplicate a live check against a sentence
-    # that no longer exists -- a control matching nothing, which is the exact
-    # failure mode this whole thread is about. The generated table is the
-    # stronger mechanism: the number cannot be typed wrong because it is not
-    # typed at all.
+    # NO CLAIMGRAPH NUMBER LIVES HERE, and it is C13 there, not an omission.
+    # agent-8's finding was real: mutating the README's claimgraph numbers
+    # left repo_check green. An earlier version of this comment said the
+    # counts had "MOVED OUT of the prose into a table generated by build.py"
+    # and that regexes here would be "a control matching nothing". BOTH HALVES
+    # OF THAT WERE FALSE IN THE TREE IT SHIPPED IN, and it is worth keeping
+    # the correction: only docs/claimgraph/README.md has a generated table;
+    # the TOP-LEVEL README still states the four numbers in a sentence
+    # ("holds 165 claims and 111 typed edges, 102 of them supersessions, plus
+    # 23 retractions"), so a regex here would have matched 4/4 -- measured by
+    # restored by a rebase AFTER the comment was written and no gate could
+    # see the pair.
+    # THE ARM THIS CLAIM RESTS ON IS A FORCED-WRONG ONE, not a historical
+    # sha. Measured by the author of this comment on ede3310 with four
+    # single-group regexes restored: correct numbers -> C8 PASS "recomputed
+    # 8"; all four forced to truth+1 -> C8 FAIL naming all four. A
+    # restore-the-regexes arm alone proves nothing here, because it is GREEN
+    # on any tree where C13 has already corrected the sentence -- a
+    # predicate pinned to an artifact that moves, which is how the sentence
+    # became false in the first place. The historical instance (d791564:
+    # 113/68/60/21 against 165/111/102/23) is agent-8's measurement and is
+    # cited as an instance, not as the proof.
+    # The fix is C13 (c13_claimgraph_prose_numbers): it recomputes those four
+    # values from graph.json, FAILs on a wrong one, and FAILs when the
+    # sentence is DELETED rather than silently shrinking. Putting a second
+    # copy of the same assertions in this table would be the duplicate; one
+    # gate that owns the sentence is the stronger mechanism.
 ]
 _WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
           "seven": 7, "eight": 8, "nine": 9, "ten": 10}
@@ -602,6 +765,7 @@ def sh_ls(root):
     return out.stdout.splitlines()
 
 
+TEMP_ROOT = __import__("tempfile").gettempdir()
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # the repo this file lives in
 
@@ -855,40 +1019,799 @@ def c11_readme_docker_flags(root):
     # 3. The volume MOUNTS are the thing that was missing, so compare the
     #    mount TARGETS, not just the -v flag. A block with one -v and a code
     #    path with three is still the defect.
+    def _target(mount):
+        """Container path of a `host:container[:ro]` mount.
+
+        rstrip(":ro") is a CHARACTER-CLASS strip, not a suffix strip: it turns
+        "ro" into "" and silently erases every read-only mount from both
+        sides. That made the system-prompt and transfer-token mounts
+        invisible to this check (found 2026-10-18 by adding a fourth volume
+        to start_agent and watching C11 stay green). Use removesuffix.
+        """
+        cont = mount.split(":")[-1] if mount.count(":") < 2 else mount.split(":")[1]
+        if mount.endswith(":ro"):
+            cont = mount[:-3].split(":")[-1]
+        return cont
+
     code_mounts = set(re.findall(r'"([^"]*?:/[^"]*)"', body))
-    code_targets = {m.split(":")[-1].rstrip(":ro") for m in code_mounts
-                    if ":" in m}
-    readme_targets = {m.split(":")[-1].rstrip(":ro")
-                      for m in re.findall(r"-v\s+(\S+)", block) if ":" in m}
-    lost = sorted(set(code_targets) - {"/workspace/self", "/workspace/transcripts",
-                                       "/workspace/.claude"} - readme_targets)
-    missing_durable = sorted({"/workspace/self", "/workspace/transcripts",
-                              "/workspace/.claude"} - readme_targets)
-    if missing_durable:
+    code_targets = {_target(m) for m in code_mounts} - {""}
+    readme_targets = {_target(m) for m in re.findall(r"-v\s+(\S+)", block)} - {""}
+    # The transfer token is mounted ONLY for agent-0 (control.py:190) and the
+    # README block is agent-1's, so it is excluded BY NAME, with the reason
+    # here, rather than silently absorbed by a subtraction.
+    conditional = {"/app/agent0-transfer-token"}
+    code_targets -= conditional
+
+    # ONE comparison covers all three failures this check exists for. Listing
+    # the three durable paths separately is how the first version missed a
+    # FOURTH volume: it checked the three names it knew and had no limb for
+    # "a mount the code makes that the block does not have" (it computed that
+    # set and then discarded it with `del lost`). A transcription is wrong if
+    # it omits ANY flag, not only the three that were once forgotten.
+    #
+    # `test -v` and the transfer token are the only deliberate absences; each
+    # is named, and a new one has to be argued for here.
+    lost = sorted(code_targets - readme_targets)
+    if lost:
         return "C11 readme docker flags", "FAIL", [
-            f"README's docker run does not mount {missing_durable} -- these "
-            f"are the durable volumes; without them the agent is a first-boot "
-            f"stranger after every stop/start."]
-    if "CLAUDE_CONFIG_DIR" not in block:
+            f"start_agent mounts {lost} but the README's docker run does not. "
+            f"The block is presented as what the code runs; a mount it omits "
+            f"is a mount an operator will not have."]
+    # THE ENV VARS, AS A SET -- not one hard-coded name. The first version
+    # checked only CLAUDE_CONFIG_DIR, which was the env var that had been
+    # forgotten; adding ANY OTHER -e to start_agent left C11 green while
+    # agent-7's flagcheck (which compares env NAMES) went red. Two
+    # implementations of one fact disagreeing is the signal, and the answer
+    # is to compare the set here too.
+    #
+    # AGENT_NAME/AGENT_MODEL are per-agent values the code sets from `name`
+    # and `model`; the README block is agent-1's, so they are named as
+    # conditional rather than silently excluded.
+    conditional_env = {"AGENT_NAME", "AGENT_MODEL"}
+    code_env = {v for v in re.findall(r'"([A-Z][A-Z0-9_]{2,})=', body)} - conditional_env
+    readme_env = set(re.findall(r"-e\s+(?:[A-Z_]+=)?([A-Z][A-Z0-9_]{2,})=", block))
+    readme_env |= {v for v in re.findall(r"-e\s+([A-Z][A-Z0-9_]{2,})=", block)}
+    missing_env = sorted(code_env - readme_env)
+    if missing_env:
         return "C11 readme docker flags", "FAIL", [
-            "README's docker run does not set CLAUDE_CONFIG_DIR; without it "
-            "the CLI's session records are not on a volume and resume cannot "
-            "work at all."]
-    del lost
+            f"start_agent sets {missing_env} but the README's docker run does "
+            f"not. An env var an operator does not set is a behaviour they do "
+            f"not get (CLAUDE_CONFIG_DIR is the one that already bit us)."]
     return "C11 readme docker flags", "PASS", [
-        "README block carries every durable mount and CLAUDE_CONFIG_DIR"]
+        f"README block carries all {len(code_targets)} mounts and "
+        f"{len(code_env)} env vars the code sets"]
+
+
+CLAIMGRAPH_PROSE_CLAIMS = [
+    # (where, regex with 4 groups, label, truth(stats, graph) -> 4 values)
+    # Each entry pins ONE sentence that retypes a statistic. The sentence is
+    # checked in BOTH files because the same defect had two copies: the
+    # claimgraph README restates the STATS table below it, and the TOP-LEVEL
+    # README restates the graph while naming C8 as the check that owns it --
+    # C8 does not read claimgraph numbers at all, so that sentence named a
+    # gate that did not exist. A number typed beside the thing it describes
+    # is a courier; this is the alarm for both couriers.
+    (
+        "docs/claimgraph/README.md",
+        r"\*\*(\d+) superseded and (\d+) retracted against (\d+)\s*\n?live",
+        "claimgraph README prose (superseded/retracted/live)",
+        lambda s, g: (s["superseded"], s["retracted"], s["live"]),
+        "superseded/retracted/live",
+    ),
+    (
+        "README.md",
+        r"the committed graph holds (\d+) claims and (\d+) typed\s+edges, "
+        r"(\d+) of them supersessions, plus (\d+) retractions",
+        "top-level README (claims/edges/supersessions/retractions)",
+        lambda s, g: (s["claims"], len(g["edges"]), s["supersede_edges"],
+                      s["retracted"]),
+        "claims/edges/supersessions/retractions",
+    ),
+]
+
+
+def c13_claimgraph_prose_numbers(root):
+    """Statistic numbers retyped in PROSE, recomputed from graph.json.
+
+    THE DEFECT THIS PINS (agent-6, 2026-10-18, found by reading, not by a
+    failing check): docs/claimgraph/README.md's STATS table is generated by
+    build.py and its staleness fails the build. The paragraph two below it
+    retypes three of those numbers in a sentence -- "36 superseded and 20
+    retracted against 46 live" -- and nothing checked them. On master 067428e
+    the table said 81 / 23 / 60, so the sentence two paragraphs down from a
+    generated table disagreed with it by two generations of store growth.
+
+    The TOP-LEVEL README has the same defect on the same source, and it is
+    not a rounding error: at 7b84456 it says the graph "holds 113 claims and
+    68 typed edges, 60 of them supersessions, plus 21 retractions" while
+    graph.json has 165 / 111 / 102 / 23 -- wrong by 52 / 43 / 42 / 2. The
+    sentence was EXACTLY TRUE when it was written (commit 583bfec: graph.json
+    held 113/68/60/21), which is why reading it finds nothing: it drifted.
+    It also claims "The counts are checked against the committed graph.json
+    by tools/repo_check.py (C8)" -- and C8 does not read claimgraph numbers.
+    So the sentence named a gate that did not exist, which is worse than an
+    unchecked number: a reader is told the number is maintained.
+
+    WHY BOTH SENTENCES AND NOT A SCANNER: a narrative is allowed numbers
+    ("10x", "a fraction", a quoted historical figure -- the same file quotes
+    "101 claims" as history and means it). Scanning every integer produces
+    false positives and forces a whitelist, and a whitelist is how a scanner
+    gets silenced. Two named sentences with a maintainer beat a scanner.
+
+    A DELETED SENTENCE IS A FAIL, NOT A SKIP. Otherwise the cheapest way to
+    green is to delete the claim, and the check shrinks to nothing -- C8's
+    rule, and this check exists because C8's regex table has a comment
+    saying claimgraph numbers deliberately do NOT live there. They live in
+    prose now, and the comment was written when they had moved into a
+    generated table. They had not all moved.
+    """
+    gj = os.path.join(root, "docs/claimgraph/graph.json")
+    try:
+        graph = json.load(open(gj, encoding="utf-8"))
+        stats = graph["stats"]
+    except (OSError, ValueError, KeyError) as e:
+        return "C13 claimgraph prose numbers", "FAIL", [
+            f"docs/claimgraph/graph.json is unreadable or has no stats: {e!r}"]
+
+    findings, checked = [], []
+    for rel, pat, label, truth, names in CLAIMGRAPH_PROSE_CLAIMS:
+        try:
+            text = open(os.path.join(root, rel), encoding="utf-8").read()
+        except OSError:
+            findings.append(f"{rel} is absent, so its {label} is unverified")
+            continue
+        # The claimgraph README's generated block is build.py's, and
+        # build.py's own M3 already fails when it is stale. Check the prose
+        # OUTSIDE it, so this is not a second opinion on the same bytes.
+        if rel.startswith("docs/claimgraph/"):
+            m = re.search(r"<!-- STATS:START -->.*?<!-- STATS:END -->",
+                          text, re.S)
+            if m:
+                text = text[:m.start()] + text[m.end():]
+        hit = re.search(pat, text)
+        if not hit:
+            findings.append(
+                f"{rel}: the sentence stating {names} is gone or reworded "
+                f"beyond recognition. Deleting a stale number is not a fix "
+                f"(the reader still needs it); this is FAIL, not SKIP")
+            continue
+        got = tuple(int(g) for g in hit.groups())
+        want = tuple(truth(stats, graph))
+        if got != want:
+            findings.append(
+                f"{rel}: {names} says {got}, graph.json has {want}")
+        else:
+            checked.append(f"{rel}: {names} {got}")
+    if findings:
+        return "C13 claimgraph prose numbers", "FAIL", findings
+    return "C13 claimgraph prose numbers", "PASS", checked
+
+
+def c12_undefined_names(root):
+    """A name LOADED but never bound -- the defect class that stopped the daemon.
+
+    WHY THIS CHECK EXISTS, stated as the incident, because the incident is the
+    specification:
+      master fcb2458 could not boot. Commit 718d278 inserted
+      CURRENT_LIFE_FILE directly above `WAKE_NOTICE_TOKENS = int(...)` and, in
+      the same hunk, deleted the assignment while leaving four uses of it.
+
+      C6 (ast.parse) passed: `f"{WAKE_NOTICE_TOKENS}"` is valid syntax. A
+      NameError is not a SyntaxError.
+      C7 (import) passed: the uses are inside main_loop() and watch_context(),
+      and importing a module does not call its functions.
+      The daemon died at the first print() in main_loop(), BEFORE the life
+      loop -- so it wrote no transcript, no birth event, no error file. A
+      container built from that tree restart-loops with the traceback on
+      stderr only. It survived two hours and about a dozen human-visible boot
+      events because it is invisible to every check this repo had.
+
+    The check is a stdlib-only subset of pyflakes (tools/undefined_names.py)
+    rather than a pyflakes dependency: the image does not ship it, and a check
+    that needs a package the image lacks is a check that does not run.
+
+    FALSE POSITIVES ARE THE FAILURE MODE THAT MATTERS. A check that bites
+    correct code gets disabled, and then it catches nothing. So the module
+    stays SILENT wherever it cannot prove a load is unsafe: star imports,
+    globals()/locals()/eval/exec, a caught NameError. Its own suites are run
+    here as the control, in both directions:
+      - tools/tests/undefined_names_cases.py  (10 snippets that MUST be caught)
+      - tools/tests/undefined_names_legal.py  (legal Python that MUST NOT be)
+    A check with a negative control but no positive one is this cohort's most
+    repeated mistake; this one asserts both.
+    """
+    tool = os.path.join(root, "tools", "undefined_names.py")
+    if not os.path.isfile(tool):
+        return "C12 undefined names", "FAIL", [
+            "tools/undefined_names.py is missing; C12 cannot run. This is a "
+            "FAIL and not a skip: C6 and C7 both pass on a daemon that cannot "
+            "boot, and this is the only check that sees that class."]
+    findings = []
+    # 1. the repo itself
+    r = subprocess.run([sys.executable, "-I", tool], cwd=root,
+                       capture_output=True, text=True)
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("UNDEFINED "):
+            findings.append(line[len("UNDEFINED "):])
+    # 2. both controls, run every time. A tool that silently stopped detecting
+    #    would otherwise report PASS on every tree forever.
+    cases = os.path.join(root, "tools", "tests", "undefined_names_cases.py")
+    legal = os.path.join(root, "tools", "tests", "undefined_names_legal.py")
+    if not os.path.isfile(cases) or not os.path.isfile(legal):
+        findings.append("C12's own control suites are missing "
+                        "(tools/tests/undefined_names_{cases,legal}.py); the "
+                        "check is unverified without them")
+        return "C12 undefined names", "FAIL", findings
+    rc = subprocess.run([sys.executable, "-I", cases], cwd=root,
+                        capture_output=True, text=True)
+    if rc.returncode != 0:
+        findings.append("DETECTION CONTROL FAILED: a snippet that uses an "
+                        "undefined name was not reported -- "
+                        + (rc.stdout or rc.stderr).strip().splitlines()[-1])
+    rl = subprocess.run([sys.executable, "-I", tool, legal], cwd=root,
+                        capture_output=True, text=True)
+    if rl.returncode != 0:
+        findings.append("FALSE-POSITIVE CONTROL FAILED: legal Python was "
+                        "reported -- " + (rl.stdout or "").strip()[-300:])
+    if findings:
+        return "C12 undefined names", "FAIL", findings
+    return "C12 undefined names", "PASS", [
+        "no unbound name in any tracked .py (10/10 detection cases, "
+        "legal-code control clean)"]
+def _registry_orphans(source):
+    """Parse a repo_check.py SOURCE and return (defined, registered, orphans).
+
+    A check is a module-level function named c<N>_<words>. It runs only
+    because its name is also an element of the CHECKS list. Those are two
+    separate facts and nothing used to compare them.
+
+    Module-level only, deliberately: the file contains nested helpers named
+    c11_on/c12_on/c13_on, and ast.walk would report them. A check that bites
+    correct code gets deleted, and then it catches nothing.
+    """
+    tree = ast.parse(source)
+
+    # CHECKS may be spelled three ways, all legal: `CHECKS = [...]`,
+    # `CHECKS: list = [...]` (AnnAssign) and `CHECKS = CHECKS + [...]`
+    # (BinOp). The first version tested only ast.Assign, so an annotated
+    # declaration gave registered=[] and C14 then named all fourteen
+    # registered checks as orphans -- fourteen innocent functions called
+    # dead is the output that gets a gate DELETED rather than fixed
+    # (agent-7's second finding, reproduced before this fix).
+    registered, checks_values = [], []
+
+    def names_in(value):
+        """The ast.Name elements of a list/tuple literal, or of either side
+        of a `+`. BOTH sides matter: `CHECKS = [a] + [b]` is two
+        registrations, and reading only the first reports b as a dead check."""
+        if isinstance(value, (ast.List, ast.Tuple)):
+            return [e.id for e in value.elts if isinstance(e, ast.Name)]
+        if isinstance(value, ast.BinOp):
+            return names_in(value.left) + names_in(value.right)
+        return []
+
+    for node in tree.body:
+        target, value, augmented = None, None, False
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.AugAssign):
+            target, value, augmented = node.target, node.value, True
+        if not (isinstance(target, ast.Name) and target.id == "CHECKS"):
+            continue
+        checks_values.append(value)
+        names = names_in(value)
+        # `+=` APPENDS and can never erase, and an append of nothing is a
+        # no-op, not a wipe. `CHECKS = CHECKS + []` and `CHECKS += []` are
+        # both legal and both mean "no change"; the plain-assign branch used
+        # to overwrite registered with [] and then report every check as an
+        # orphan. Two spellings of the same no-op disagreeing is the kind of
+        # thing that gets a gate deleted (agent-7).
+        if augmented or (not names and registered):
+            registered = registered + names
+        else:
+            registered = names
+
+    # A NAME IS A CHECK ONLY IF ITS ONLY REFERENCE IS THE CHECKS LITERAL.
+    # A module-level helper named c11_parse_flags (called by a real check) is
+    # NOT a check, and flagging it is how a gate gets deleted for biting
+    # correct code. agent-7 measured that false positive and this predicate:
+    # every real check is loaded exactly once, as an element of CHECKS. Any
+    # additional Load reference (a call, a variable use) means the function
+    # is used for something other than registration, so it is not a
+    # dead-check candidate.
+    # Count only CALL references, not every Load. C14 references ITSELF
+    # (the self-guard member-tests and the selftest removes it from CHECKS),
+    # and counting those would exclude the very check that guards the
+    # registry. A call -- `c11_parse_flags(...)` -- is the signal that a
+    # function is doing work rather than merely being registered.
+    #
+    # BUT LIVENESS IS NOT REGISTRATION (agent-7's second review, reproduced
+    # here before the fix). A check-shaped function that is NOT in CHECKS but
+    # IS called from selftest() passed C14: the call made it "live", so it
+    # was dropped from the candidate set entirely. That is precisely the
+    # defect C14 exists to catch -- a FAIL-returning check that never runs at
+    # the gate -- and the selftest is the most likely place an unregistered
+    # check gets exercised. So calls made from the TEST HARNESS do not earn a
+    # function an exemption; only calls from production code do.
+    HARNESS = {"selftest", "_self_guard", "registry_status",
+               "_registry_orphans", "main"}
+    # A CALL EARNS A FUNCTION A HELPER EXEMPTION ONLY IF IT RUNS AS PART OF A
+    # CHECK. Two ways a call used to launder a dead check past C14, both
+    # measured by agent-2 on the merged predicate:
+    #   A3  `_C99 = c99_probe('.')` at MODULE LEVEL -- runs once at import,
+    #       its result is a constant, it is not "production code" by any
+    #       reading, but a walk of every tree.body node counted it.
+    #   A2  `def _helper(): return c99_probe('.')` called from selftest() --
+    #       one helper of indirection, and the call sat outside the harness
+    #       nodes so it counted.
+    # So: only calls INSIDE a FunctionDef count (A3 gone), and the harness
+    # exclusion follows the CALL SUBGRAPH, not just the harness bodies (A2
+    # gone) -- a helper reachable from selftest is still the harness.
+    def calls_in(node):
+        """Names called inside `node`."""
+        out = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                out.add(n.func.id)
+        return out
+
+    fdefs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    by_name = {n.name: n for n in fdefs}
+    # Functions reachable (transitively) from a harness function via calls.
+    harness_reach = set(HARNESS)
+    frontier = set(HARNESS)
+    while frontier:
+        nxt = set()
+        for hname in frontier:
+            node = by_name.get(hname)
+            if node is None:
+                continue
+            for callee in calls_in(node):
+                if callee not in harness_reach and callee in by_name:
+                    harness_reach.add(callee)
+                    nxt.add(callee)
+        frontier = nxt
+
+    # `called` = check-shaped names called from a FunctionDef that is NOT in
+    # the harness subgraph. Module-level statements are deliberately excluded.
+    called = set()
+    for node in fdefs:
+        if node.name in harness_reach:
+            continue
+        called |= calls_in(node)
+
+    # TWO SETS, because the two verdicts ask different questions.
+    #
+    # `defined` is every module-level check-shaped NAME. It answers the
+    # phantom question ("does a CHECKS entry point at nothing?") and must
+    # NOT be filtered by calls: a registered check that production code also
+    # calls still EXISTS, and subtracting it made it a phantom on a correct
+    # tree (agent-2's row 4, reproduced here: c5 registered + called from a
+    # helper -> FAIL "REGISTERED BUT NOT DEFINED: c5"). That was a false
+    # FAIL, and a gate that bites correct code gets deleted.
+    #
+    # `dead_candidates` answers the orphan question ("is a check-shaped
+    # function that never runs?"). Only this set is filtered by calls: a
+    # call from PRODUCTION code marks a function as a live helper, not a
+    # check. Calls from the harness are already excluded above, so an
+    # unregistered check exercised only by selftest() stays a candidate.
+    check_names = [n.name for n in tree.body
+                   if isinstance(n, ast.FunctionDef)
+                   and re.fullmatch(r"c[0-9]+_[a-z0-9_]+", n.name)]
+    dead_candidates = [name for name in check_names if name not in called]
+    return (sorted(check_names), sorted(registered),
+            sorted(set(dead_candidates) - set(registered)),
+            sorted(set(registered) - set(check_names)))
+
+
+def registry_status(source):
+    """Return (status, findings) for one source string. Shared by C14 and the
+    C14 control, so the control exercises the same code path."""
+    defined, registered, orphans, phantoms = _registry_orphans(source)
+    findings = []
+    if orphans:
+        findings.append(
+            "DEFINED BUT NEVER REGISTERED: " + ", ".join(orphans) +
+            " -- the function exists, is documented, and would FAIL if it "
+            "ran, but it is not in CHECKS, so nothing ever calls it. A green "
+            "run cannot tell this apart from the check passing.")
+    if phantoms:
+        findings.append(
+            "REGISTERED BUT NOT DEFINED: " + ", ".join(phantoms) +
+            " -- CHECKS names a function that does not exist here.")
+    return ("FAIL" if findings else "PASS"), findings + [
+        f"{len(registered)} checks registered: " + ", ".join(registered)]
+
+
+def c14_check_registry(root):
+    """A check that is defined but never registered is a check that can be
+    erased silently -- and this repo had no guard against it.
+
+    MEASURED (agent-4, 2026-10-18): inject a real check function that would
+    return FAIL, do not add it to CHECKS, and the whole repo reports
+    PASS (10 pass, 1 warn, 0 fail); `--selftest` reports 33/33. The function
+    is dead code wearing the name of a check.
+
+    SCOPE, and it is narrower than it looks: this compares NAMES. A check
+    whose body is gutted to `return ("x", "PASS", [])` is still registered and
+    still named, and C14 passes. Second limit, added after agent-7 asked for
+    the sentence to match the predicate: an unregistered check-shaped function
+    that is CALLED FROM PRODUCTION CODE is treated as a live helper and is not
+    reported as an orphan, so the ORPHAN verdict means every check-shaped
+    function is either registered or called from a function body that is not
+    part of the test harness. The exemption is mechanical and deliberately
+    narrow, because it is the only thing that keeps a legitimate helper from
+    being named dead (the false positive that gets a gate deleted):
+
+      * the call must be INSIDE a FunctionDef. A module-level call such as
+        `_X = c99_probe('.')` runs once at import and is not production code
+        -- it does NOT earn the exemption (agent-2's A3).
+      * the call must not be reachable from the harness. A helper called only
+        by selftest() -- directly or through one level of indirection -- is
+        still the harness, so it does NOT earn the exemption (agent-2's A2,
+        and agent-7's original case). Reachability is followed transitively,
+        so a chain of helpers cannot launder a selftest call.
+
+    BUT THAT EXEMPTION APPLIES ONLY TO THE ORPHAN VERDICT. A registered check
+    that production code also calls is still DEFINED, so the PHANTOM verdict
+    ("CHECKS names a function that does not exist here") must not subtract
+    calls -- doing so reported a registered+called check as REGISTERED BUT
+    NOT DEFINED on a correct tree (agent-2's row 4, reproduced here before
+    the fix, and asserted by arm J). Two verdicts, two sets: `check_names`
+    (unfiltered) answers phantom, `dead_candidates` (minus production calls)
+    answers orphan. That is the boundary of a registry check, not a defect in
+    this one -- catching a gutted body needs a different instrument (inject a
+    defect per check and require red). Stated here so "registry PASS" is not
+    read as more than it is. (agent-2's and agent-7's reviews.)
+
+    This is the same failure the checker already names elsewhere: "a missing
+    replayer is a FAIL, not a skip: otherwise deleting the script turns the
+    check off" (C9). A merge that drops one line from CHECKS turns a check off
+    just as completely, and emits no conflict marker when the added line sits
+    on a line the other side also edited.
+
+    `root` is unused on purpose: the file it audits is the one running, not one
+    looked up under the tree, so the control can hand a mutated source string
+    to registry_status without writing it into a git tree.
+    """
+    return ("C14 check registry",) + registry_status(
+        open(os.path.join(HERE, "repo_check.py"), encoding="utf-8").read())
+
+
+def _mutant_tree(root, rel, old, new, mutate=True):
+    """A FULL COPY of the tree with one line changed, for the connection arm.
+
+    A copy, not a symlink farm: the first version symlinked every top-level
+    entry, and the tools walk `rglob("*.py")` / `glob("*.md")`, which follows
+    symlinked DIRECTORIES into cycles ("Too many levels of symbolic links")
+    and misses files the tools reach by a relative path from a dir symlink.
+    A tree copy of this repo is a few MB; correctness is worth it.
+    """
+    import shutil, tempfile
+    # TEMP_ROOT is fixed to the system temp dir, NOT derived from `root`:
+    # an earlier version put these directories INSIDE the repo when the check
+    # was run there, and the next run then copied the copies, recursing until
+    # the tools' globs hit symlink cycles. A test that writes into the tree
+    # it is testing is a test that changes its own subject.
+    d = tempfile.mkdtemp(prefix="mutant-", dir=TEMP_ROOT)
+    for entry in os.listdir(root):
+        if entry in (".git", "__pycache__") or entry.startswith("mutant-"):
+            continue
+        src, dst = os.path.join(root, entry), os.path.join(d, entry)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(src, dst)
+    target = os.path.join(d, rel)
+    try:
+        text = open(target, encoding="utf-8").read()
+    except OSError:
+        return d, False
+    if not mutate:
+        return d, True
+    if old not in text:
+        return d, False
+    open(target, "w", encoding="utf-8").write(text.replace(old, new, 1))
+    return d, True
+
+
+def _publisher_docs(root):
+    """How many docker PUBLISH SITES the tree actually has.
+
+    NOT read from tools/portcheck.py's PUBLISHER_DOCS: that constant is the
+    thing an attacker narrows, so counting it made the assertion agree with
+    the attacker (it reported 6 vs 1 and PASSED). Ground truth comes from the
+    tree.
+
+    Counted as SITES, because that is what portcheck prints: README and
+    CLOUD-DEPLOYMENT carry one `-p` line each, and CLOUD-DEPLOYMENT carries
+    two, so the tree has three and a tool that reads one file sees one.
+
+    KNOWN LIMIT, measured: docs/guide.md publishes the bank INLINE on the
+    docker run line ('... agent-bank -p 8790:8790 \\'), which this predicate
+    does not count and portcheck does not appear to either. If that is a real
+    coverage gap it should be found by reading guide.md, not by this number
+    quietly including it.
+    """
+    import subprocess
+    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
+                           capture_output=True, text=True).stdout.split("\0")
+    sites = 0
+    for f in filter(None, files):
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        sites += sum(1 for ln in text.splitlines()
+                     if re.match(r"\s*-p\s+[^\s:]+:\d+(:\d+)?", ln))
+    return sites
+
+
+def _required_tokens(root):
+    """How many secrets bank.py requires, read from ITS _token_file calls."""
+    path = os.path.join(root, "bank", "bank.py")
+    src = open(path, encoding="utf-8").read()
+    return len(re.findall(r"^\w+_TOKEN_FILE = _token_file\(", src, re.M))
+
+
+def _bank_blocks(root):
+    """How many tracked .md files contain a `docker run ... agent-bank` line.
+
+    Counted from the TREE. This is the supply side tokencheck has to read; the
+    first version of this gate asserted only the token count, which is the
+    DEMAND side, so narrowing the doc list stayed invisible.
+    """
+    import subprocess
+    files = subprocess.run(["git", "-C", root, "ls-files", "-z", "*.md"],
+                           capture_output=True, text=True).stdout.split("\0")
+    n = 0
+    for f in filter(None, files):
+        try:
+            text = open(os.path.join(root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        if re.search(r"docker run[^\n]*agent-bank", text):
+            n += 1
+    return n
+
+
+def _run_tool(root, tool, label, mutants, reach=None, blocks=None):
+    """Run tools/<tool> as a GATE: exit 0 MATCH, 1 DIFFER, 2 cannot measure.
+
+    These two tools were built and reviewed (agent-7, portcheck+tokencheck)
+    and then registered by a DIFFERENT agent (agent-0) in a separate commit.
+    That separation is deliberate and it is the lesson of the night: a gate
+    that must be invoked by hand enforces nothing, and "PORTCHECK: MATCH" on
+    a board post reads as if it were part of the green. The tool's author is
+    named here so the provenance is not guesswork.
+
+    THREE THINGS ARE ASSERTED, and the third is the one that matters:
+      1. the tool file exists (a check that cannot run must not pass)
+      2. its own selftest exits 0 AND prints the shipped summary with >=4 arms
+      3. THE TOOL IS CONNECTED: run it against a copy of the real tree with
+         one real defect injected and REQUIRE exit 1.
+    (3) exists because (2) is not enough, and that was measured rather than
+    guessed: agent-8 gutted tokencheck's run() to print MATCH and return 0 and
+    its selftest to `good = True`, left every arm line and the summary intact,
+    deleted the transfer-token mount from README, and C16 stayed GREEN. A
+    gate that reads a control's OUTPUT can only verify that the control is
+    well-spoken; it cannot verify that it is connected. The mutant arm is the
+    only one of the three that tests the pipeline instead of the description.
+    """
+    path = os.path.join(root, tool)
+    if not os.path.isfile(path):
+        return label, "FAIL", [f"{tool} is registered in CHECKS but missing"]
+    # THE TOOL'S OWN CONTROL RUNS EVERY TIME. A tool whose selftest is only
+    # run by hand is a control that rots unnoticed -- the exact failure this
+    # repo keeps finding.
+    st = subprocess.run([sys.executable, "-I", path, "--selftest"], cwd=root,
+                        capture_output=True, text=True, timeout=240)
+    st_out = (st.stdout or "") + (st.stderr or "")
+    arms = [ln for ln in st_out.splitlines() if "  PASS" in ln]
+    if st.returncode != 0:
+        return label, "FAIL", [
+            f"{tool} --selftest FAILED, so its verdict below cannot be "
+            f"trusted: " + st_out.strip()[-400:]]
+    if "SELFTEST: PASS" not in st_out or len(arms) < 4:
+        return label, "FAIL", [
+            f"{tool} --selftest exited 0 but does not look like the shipped "
+            f"control: no 'SELFTEST: PASS' summary, or only {len(arms)} "
+            f"arm(s) ran. A gutted selftest passes its own exit code."]
+    r = subprocess.run([sys.executable, "-I", path, root], cwd=root,
+                       capture_output=True, text=True, timeout=120)
+    out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
+    tail = out[-1] if out else "(no output)"
+    # REACH IS ASSERTED, not inferred from the verdict. Measured: a portcheck
+    # whose PUBLISHER_DOCS was narrowed to ONE file passes every mutant arm
+    # here (they all live in CLOUD-DEPLOYMENT.md) and prints MATCH -- while
+    # being blind to the same defect in docs/guide.md. A narrowed INPUT SET is
+    # invisible in a verdict and visible in a count. agent-8's attack, mine to
+    # fix.
+    # THE SUPPLY SIDE IS ASSERTED TOO, and this is agent-8's finding: tokencheck
+    # reads its DEMAND (which tokens) from bank.py, but its SUPPLY (which docs)
+    # from a hand-typed BANK_DOCS tuple that no arm grows. Dropping a doc from
+    # that tuple keeps every arm -- including the one that adds a token to
+    # code -- and loses coverage invisibly. The tool prints how many blocks it
+    # read; compare that to the tree.
+    if blocks is not None:
+        m = re.search(blocks[0], "\n".join(out))
+        got_b = int(m.group(1)) if m else None
+        want_b = blocks[1](root)
+        if got_b != want_b:
+            return label, "FAIL", [
+                f"{tool} read {got_b} doc block(s) but this tree has "
+                f"{want_b} that run the bank. A typed supply-side list is the "
+                f"same defect as a narrowed input set: the verdict survives "
+                f"and the coverage does not."]
+    if reach is not None:
+        m = re.search(reach[0], "\n".join(out))
+        got = int(m.group(1)) if m else None
+        want = reach[1](root)
+        if got != want:
+            return label, "FAIL", [
+                f"{tool} checked {got} {reach[2]}(s) but this tree has "
+                f"{want}. A detector that narrows its INPUT SET keeps its "
+                f"verdict and loses its coverage; the count is the only arm "
+                f"that sees it."]
+    if r.returncode == 2:
+        return label, "WARN", [f"cannot measure here: {tail}"]
+    if r.returncode != 0:
+        return label, "FAIL", out[-6:]
+    # (3) THE CONNECTION ARMS: every mutant, not just one.
+    import shutil
+    notes = []
+    for rel, old, new in mutants:
+        d = None
+        try:
+            d, applied = _mutant_tree(root, rel, old, new, mutate=False)
+            if not applied:
+                return label, "FAIL", [
+                    f"a mutant arm could not be applied: {rel} no longer "
+                    f"contains {old[:60]!r}. The tree changed shape, so this "
+                    f"gate cannot prove the tool is connected. Update the "
+                    f"mutant in repo_check to a defect that still exists."]
+            # CONTROL for this mutant: the SAME copy without the injection
+            # must be exit 0. Otherwise "it went red" could be the copy
+            # rather than the defect -- the confound agent-8's arm C exists
+            # for. Cheap: one extra run of a tool that takes a second.
+            clean = subprocess.run([sys.executable, "-I", path, d],
+                                   cwd=d, capture_output=True, text=True,
+                                   timeout=120)
+            if clean.returncode != 0:
+                return label, "FAIL", [
+                    f"CONTROL CONFOUND: the UNMUTATED copy of the tree "
+                    f"already fails ({tool} exit {clean.returncode}), so the "
+                    f"mutant's red would prove nothing: "
+                    f"{(clean.stdout or '').strip().splitlines()[-1:]}"]
+            tgt = os.path.join(d, rel)
+            txt = open(tgt, encoding="utf-8").read()
+            if old not in txt:
+                return label, "FAIL", [
+                    f"a mutant arm could not be applied: {rel} no longer "
+                    f"contains {old[:60]!r}. Update the mutant in repo_check "
+                    f"to a defect that still exists."]
+            open(tgt, "w", encoding="utf-8").write(txt.replace(old, new, 1))
+            m = subprocess.run([sys.executable, "-I", path, d], cwd=d,
+                               capture_output=True, text=True, timeout=120)
+            if m.returncode != 1:
+                return label, "FAIL", [
+                    f"{tool} stayed GREEN (exit {m.returncode}) on a tree "
+                    f"with a real defect injected ({rel}: the mutant rooted "
+                    f"at {old[:50]!r}). Its selftest speaks correctly, so "
+                    f"either "
+                    f"the tool is disconnected from the docs or this mutant "
+                    f"is no longer a defect. A gate that cannot fail is "
+                    f"decoration."]
+            notes.append(f"mutant arm: {rel} + {old[:40]!r} -> DIFFER")
+        finally:
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+    return label, "PASS", [tail] + notes
+
+
+def c15_portcheck(root):
+    """Every doc's port publish must serve every code-level consumer's class.
+
+    The defect this pins, measured on master: docs/CLOUD-DEPLOYMENT.md
+    published the bank on 127.0.0.1 while agent/mcp-stdio.py reaches it at
+    host.docker.internal (the docker0 bridge). Every check_money/transfer got
+    ECONNREFUSED and the doc's own verification curled from the ONE observer
+    that cannot see it. Fixed in d791564; this makes the invariant a gate.
+    """
+    return _run_tool(root, "tools/portcheck.py", "C15 docs publish serve consumers",
+                     [("docs/CLOUD-DEPLOYMENT.md",
+                       "  -p 127.0.0.1:8790:8790 \\\n", ""),
+                      # BOTH DIRECTIONS of the same publish are injected.
+                      # Measured: removing the bridge publish gives DIFFER
+                      # naming agent/mcp-stdio.py:47 as the cut-off caller,
+                      # while removing the loopback one names
+                      # ui/control.py:432. A detector wired to only one of
+                      # them is as blind as a filter that names its tokens.
+                      ("docs/CLOUD-DEPLOYMENT.md",
+                       "  -p $docker0:8790:8790 \\\n", ""),
+                      # NO PER-DOC MUTANT HERE, and the reason is portcheck's
+                      # semantics, measured while trying to add one: the
+                      # invariant is per PORT across all docs, so deleting
+                      # README's publish of 8790 is NOT a defect while
+                      # CLOUD-DEPLOYMENT still publishes it for both caller
+                      # classes -- portcheck stays MATCH and a gate demanding
+                      # DIFFER would be asserting a bug. Consequence: C15
+                      # cannot catch "the tool ignores one doc" the way C16
+                      # now can; closing that needs a per-document invariant,
+                      # which is portcheck's owner's call, not a mutant I can
+                      # write here.
+                      ],
+                     reach=(r"MATCH \((\d+) publish site", _publisher_docs,
+                            "publish site"))
+
+
+def c16_tokencheck(root):
+    """Every secret bank.py reads must be mounted by every doc's bank block.
+
+    Measured: deleting the admin-token -v from README's bank block left
+    repo_check GREEN, and the bank then answers 503 "admin token unavailable"
+    -- a missing MOUNT presenting as a bank error, which is where nobody
+    looks. The requirement is read from bank.py's own _token_file() call
+    sites, and the tool's arm F adds a new token in code and requires all
+    three docs to go red, so it cannot be satisfied by editing its own list.
+    """
+    return _run_tool(root, "tools/tokencheck.py", "C16 docs mount every bank token",
+                     [("README.md",
+                       "  -v ~/.config/docker-ai/agent0-transfer-token:"
+                       "/app/agent0-transfer-token:ro \\\n", ""),
+                      # THE FOURTH TOKEN. agent-8's v4 attack filtered its
+                      # findings to the three token names every shipped arm
+                      # uses, so it was blind to a token nobody had named and
+                      # indistinguishable from a working detector on the one
+                      # mutant above. A mutant the tool's author never saw is
+                      # the only mutant that cannot have been special-cased.
+                      ("bank/bank.py",
+                       'AGENT0_TOKEN_FILE = _token_file(',
+                       'AUDIT_TOKEN_FILE = _token_file("/run/secrets/audit-'
+                       'token", "/app/audit-token")\nAGENT0_TOKEN_FILE = '
+                       '_token_file('),
+                      # THE THIRD DOC. Both mutants above live in README and
+                      # bank.py, so a tokencheck that silently ignored
+                      # CLOUD-DEPLOYMENT's block passed everything.
+                      ("docs/CLOUD-DEPLOYMENT.md",
+                       "  -v ~/.config/docker-ai/agent0-transfer-token:"
+                       "/run/secrets/agent0-transfer-token:ro \\\n", "")],
+                     reach=(r"MATCH \((\d+) token", _required_tokens,
+                            "token"),
+                     blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
-          c10_readme_links_the_artifact, c11_readme_docker_flags]
+          c10_readme_links_the_artifact, c11_readme_docker_flags,
+          c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
+          c15_portcheck, c16_tokencheck]
 
 
 def _is_git_tree(root):
     r = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
                        capture_output=True, text=True)
     return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _self_guard():
+    """C14 cannot detect its OWN removal from CHECKS: if it is not in the list,
+    it does not run, and no other check reads the registry.
+
+    So the guard lives OUTSIDE the registry, evaluated on every run regardless
+    of CHECKS. It is one line of evidence and it is checked the same way any
+    other fact is: assert it, and prove the assertion can fail (selftest).
+
+    A check that guards everything except its own deletion has a hole exactly
+    the shape of its purpose.
+    """
+    return c14_check_registry in CHECKS
 
 
 def run(root="."):
@@ -908,7 +1831,45 @@ def run(root="."):
                          f"is not a defect in the tree's contents: run inside a "
                          f"clone, or `git init && git add -A && git commit -qm x` "
                          f"to make an export checkable."])]
+    # THE SAME FACT, ONE STEP LATER, AND IT WAS STILL BEING REPORTED AS A
+    # DEFECT IN THE TREE. MEASURED (agent-1's review, reproduced by agent-2):
+    # a `git archive` export on which someone has run `git init` IS a work
+    # tree, so the guard above passes -- but the index is EMPTY, `git ls-files`
+    # returns nothing, and C8 reports
+    #     README says 34 for the module count, measured 0
+    # as a FAIL. Every check that reads the index silently sees a tree with no
+    # files, and the one that compares a COUNT is the one that speaks up -- so
+    # the message accuses the README of a wrong number when the truth is that
+    # the checker cannot see the tree. A reviewer on another box hits this with
+    # no warning and nearly files a false FAIL against a correct branch.
+    # Same rule as above and as C5's skip split: a check must not report its
+    # own blindness as a property of the object.
+    n_indexed = _tracked(root)
+    if not n_indexed:
+        return False, [("check", "FAIL",
+                        [f"{root} is a git work tree with an EMPTY INDEX, so "
+                         f"`git ls-files` returns no files and every check "
+                         f"that reads the index is blind -- C8 then reports a "
+                         f"README number as wrong when the count it measured "
+                         f"is the checker's own zero. This is not a defect in "
+                         f"the tree's contents: run `git add -A` (and commit) "
+                         f"in an export, or run inside a clone."])]
     results = []
+    # The registry check cannot report its own absence (see _self_guard).
+    # Report it here, first, so unticking C14 cannot turn it off. A crash here
+    # is a FAIL, not a skipped row, for the same reason a check crash is.
+    try:
+        guarded = _self_guard()
+    except Exception as e:
+        guarded = False
+        guard_detail = f"self-guard crashed: {e!r}"
+    else:
+        guard_detail = ("c14_check_registry is registered in CHECKS" if guarded
+                        else "c14_check_registry is ABSENT from CHECKS, so the "
+                             "registry check does not run and no other check "
+                             "reads the registry")
+    results.append(("C14 self-guard", "PASS" if guarded else "FAIL",
+                    [guard_detail]))
     for fn in CHECKS:
         try:
             name, status, findings = fn(root)
@@ -1047,6 +2008,89 @@ def selftest():
                      dict((n, o) for n, o, _ in r)["C5 doc commands run"] == "FAIL"))
     shutil.rmtree(d)
 
+    # C5a: a DOCUMENT nothing executes must be NAMED, not folded into a total.
+    # MEASURED defect (agent-2): master printed "executed 5 block(s), skipped
+    # 40" while docs/CLOUD-DEPLOYMENT.md -- 11 blocks -- ran zero of them and
+    # was nowhere in the visible output. The control is a two-document fixture:
+    # one doc executes a block, another doc is entirely unrunnable. The check
+    # must name the SECOND BY FILE while staying green about the first, so this
+    # arm cannot be satisfied by printing every filename unconditionally.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\npython3 -c \"print(1)\"\n```\n")
+    os.makedirs(os.path.join(d, "docs"))
+    open(os.path.join(d, "docs", "DEPLOY.md"), "w").write(
+        "# x\n\nsentence one\n\n```sh\nsudo scp somewhere\n```\n\n"
+        "```sh\nexport PATH=/x\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "one covered doc, one not")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    blob = "\n".join(str(x) for x in c5[1])
+    outcomes.append(("C5 names a document with zero executed blocks",
+                     "docs/DEPLOY.md: 0 of 2 block(s) executed" in blob
+                     and "README.md: 0 of" not in blob))
+    shutil.rmtree(d)
+
+    # C5a2: and a doc that DOES execute is not named, so the line is a
+    # measurement and not a banner. Same fixture as C5a's first half alone.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\npython3 -c \"print(1)\"\n```\n")
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "all covered")
+    _, r = run(d)
+    c5 = dict((n, (o, d2)) for n, o, d2 in r)["C5 doc commands run"]
+    outcomes.append(("C5 does not name a document it did execute",
+                     c5[0] == "PASS" and "0 of" not in "\n".join(map(str, c5[1]))))
+    shutil.rmtree(d)
+
+    # C5a3: _first_cmd must not eat a command substitution. The shipped line
+    # in docs/CLOUD-DEPLOYMENT.md classified as "-o addr show docker0 ..."
+    # because ENV_PREFIX's \S* stopped at the first space INSIDE $( ). This
+    # calls the helper directly, so it fails on the regex and nothing else.
+    # The SECOND assertion is the ordinary case, so a fix that simply never
+    # strips an env prefix cannot pass both.
+    got = _first_cmd("docker0=$(ip -o addr show docker0 | awk '{print $4}' "
+                     "| cut -d/ -f1)")
+    outcomes.append(("C5 _first_cmd keeps a $(...) assignment whole",
+                     got.startswith("docker0=$(ip -o addr show docker0")
+                     and got.endswith("cut -d/ -f1)")))
+    outcomes.append(("C5 _first_cmd still strips an ordinary VAR=value",
+                     _first_cmd("PYTHONPATH=/x python3 -c 'print(1)'")
+                     == "python3 -c 'print(1)'"))
+
+    # C5a4: THE CONSEQUENCE, as an artifact rather than a status word.
+    # The parse bug was reported as cosmetic -- a garbled skip REASON. It was
+    # not: the fragment is what C5 hands to subprocess. MEASURED on ede3310,
+    # a doc block consisting of ONE shell assignment
+    #     X=$(env python3 -c "open('<path>','w').write('ran')")
+    # was parsed as first='python3 -c "open(...)...")', matched RUNNABLE, and
+    # THE WHOLE LINE WAS EXECUTED: the marker file appeared, and the run
+    # reported PASS. That is the docstring's own courier rule -- a doc command
+    # is a new courier -- defeated by a parser. The evidence is the positive
+    # artifact, inside the fixture's own temp directory.
+    d = farm()
+    leak = os.path.join(d, "SIDE_EFFECT")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n```sh\nX=$(env python3 -c \"open(%r,'w').write('ran')\")\n```\n"
+        % leak)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "assignment block")
+    _, r = run(d)
+    written = os.path.exists(leak)
+    # Leave no artifact behind even when the arm FAILS, so the failure is
+    # about the checker and not about the fixture.
+    shutil.rmtree(d)
+    outcomes.append(("C5 does not EXECUTE a block that is only an assignment",
+                     not written))
+
     # C5b: SKIP must not silence a command that would have PASSED.
     # "SKIP" used to be a universal silencer: any doc could disable its own
     # check by writing it. Now a marked command is PROBED -- exit 0 means it
@@ -1183,6 +2227,42 @@ def selftest():
                      (not ok0) and len(r0) == 1
                      and "not inside a git work tree" in r0[0][2][0]
                      and "git ls-files exit 128" not in str(r0)))
+    shutil.rmtree(d)
+
+    # C0b: a git work tree with an EMPTY INDEX. This is the shape a `git
+    # archive` export has after someone runs `git init` to make it checkable,
+    # and MEASURED (agent-1, reproduced here) it used to report
+    #     C8 readme numbers FAIL: README says 34, measured 0
+    # pointing at the README when the checker could see no files at all. The
+    # control is TWO trees that differ only in whether the index is populated:
+    # the empty one must name ITSELF as the cause, and the populated one must
+    # not carry that message. A single fixture could be satisfied by a banner
+    # printed unconditionally.
+    d = farm()   # this one has no files added yet
+    open(os.path.join(d, "README.md"), "w").write(
+        "# x\n\n`git ls-files '*.py'` (34 files)\n")
+    open(os.path.join(d, "a.py"), "w").write("x = 1\n")
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    ok_empty, r_empty = run(d)
+    empty_msg = str(r_empty)
+    # The assertion is the SHAPE of the report, not the absence of a word:
+    # one row, the empty-index cause, and NO per-check row that reads the
+    # index. My first version also required the string "C8" to be absent --
+    # it is present on purpose, because the message explains that C8 is the
+    # check that would have spoken up; the arm was testing the label instead
+    # of the behaviour and failed against a correct fix.
+    outcomes.append(("C0 names an EMPTY INDEX instead of blaming the README",
+                     (not ok_empty) and len(r_empty) == 1
+                     and "EMPTY INDEX" in empty_msg
+                     and "README says" not in empty_msg))
+    # now populate the index: the same tree must get past C0 (whatever else
+    # it says about the README's number is not this arm's subject)
+    _git(d, "add", "-f", ".")
+    _git(d, "commit", "-qm", "indexed")
+    _ok_full, r_full = run(d)
+    outcomes.append(("C0 does NOT claim an empty index on a populated tree",
+                     "EMPTY INDEX" not in str(r_full)))
     shutil.rmtree(d)
 
     # C6: a .py that does not parse
@@ -1374,6 +2454,12 @@ def selftest():
         open(os.path.join(d, "README.md"), "w", encoding="utf-8").write(readme_text)
         open(os.path.join(d, "ui", "control.py"), "w",
              encoding="utf-8").write(ctl_text)
+        # C8 in the farm reads the README's numbers and needs demo/, exactly
+        # as the other C8 arms do; without it the run is red for a reason
+        # having nothing to do with C11, which would make every C11 arm pass.
+        for rel in ("demo/town.py", "demo/selftest_demo.py"):
+            os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
         _git(d, "add", "-f", ".")
         _git(d, "commit", "-qm", "c11 fixture")
         _ok, r = run(d)
@@ -1391,6 +2477,43 @@ def selftest():
     outcomes.append(("C11 catches a dropped durable volume",
                      stripped != readme_src
                      and c11_on(stripped, ctl_src) == "FAIL"))
+
+    # Arm 4: a MOUNT THE CODE MAKES THAT THE BLOCK DOES NOT. This is the limb
+    # that was computed and thrown away (del lost) and the rstrip bug that hid
+    # every :ro mount: adding a fourth volume to start_agent left C11 GREEN
+    # until 14:47 today. The control adds it to the code side only, so the
+    # only way to pass is to compare the two sets for real -- not just the
+    # three known durable paths.
+    four = ctl_src.replace(
+        '"-v", f"{workspace_volume(name, \'claude\')}:/workspace/.claude",',
+        '"-v", f"{workspace_volume(name, \'claude\')}:/workspace/.claude",\n'
+        '        "-v", f"{workspace_volume(name, \'inbox\')}:/workspace/inbox",',
+        1)
+    outcomes.append(("C11 catches a mount the code makes and the README omits",
+                     four != ctl_src and c11_on(readme_src, four) == "FAIL"))
+
+    # Arm 5: a read-only mount must not be invisible. rstrip(":ro") is a
+    # character strip and erased every `:ro` mount from BOTH sides, so the
+    # system prompt and transfer token never reached the comparison at all.
+    # A block that omits the system-prompt mount must FAIL.
+    noprompt = readme_src.replace(
+        "  -v <prompts>/agent-1/system-prompt.txt:/app/system-prompt.txt:ro \\\n",
+        "", 1)
+    outcomes.append(("C11 catches a dropped :ro mount (system prompt)",
+                     noprompt != readme_src
+                     and c11_on(noprompt, ctl_src) == "FAIL"))
+
+    # Arm 6: a NEW env var in start_agent must be caught. The first version
+    # hard-coded CLAUDE_CONFIG_DIR and nothing else, so any other -e added to
+    # the code left C11 green; agent-7's independent flagcheck caught it,
+    # which is what two witnesses are for. This arm fails unless the env
+    # comparison is a SET.
+    newev = ctl_src.replace(
+        '"-e", "CLAUDE_CONFIG_DIR=/workspace/.claude",',
+        '"-e", "CLAUDE_CONFIG_DIR=/workspace/.claude",\n'
+        '        "-e", "AGENT_NEW_ENV=1",', 1)
+    outcomes.append(("C11 catches a NEW env var the README does not set",
+                     newev != ctl_src and c11_on(readme_src, newev) == "FAIL"))
 
     # Arm 2: the env var that makes resume work is dropped.
     noenv = readme_src.replace("  -e CLAUDE_CONFIG_DIR=/workspace/.claude \\\n",
@@ -1413,10 +2536,313 @@ def selftest():
         outcomes.append(("C11 catches a README with no agent docker-run block",
                          c11_on(abridged, ctl_src) == "FAIL"))
 
+
+    # C13 controls: the claimgraph AND top-level READMEs' PROSE numbers must be recomputed
+    # from graph.json, and both failure directions must be exercised -- a
+    # check that passes on the real tree but is disarmed still reads green.
+    cg_readme = open(os.path.join(ROOT, "docs", "claimgraph", "README.md"),
+                     encoding="utf-8").read()
+    cg_graph = open(os.path.join(ROOT, "docs", "claimgraph", "graph.json"),
+                    encoding="utf-8").read()
+
+    def c13_on(cg_text, top_text, graph_text):
+        """Run the whole checker on a two-README fixture; return C13's row."""
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        os.makedirs(os.path.join(d, "docs", "claimgraph"), exist_ok=True)
+        open(os.path.join(d, "docs", "claimgraph", "README.md"), "w",
+             encoding="utf-8").write(cg_text)
+        open(os.path.join(d, "README.md"), "w",
+             encoding="utf-8").write(top_text)
+        open(os.path.join(d, "docs", "claimgraph", "graph.json"), "w",
+             encoding="utf-8").write(graph_text)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c13 fixture")
+        _ok, r = run(d)
+        shutil.rmtree(d)
+        return dict((n, o) for n, o, _ in r).get("C13 claimgraph prose numbers")
+
+    top_readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+
+    outcomes.append(("C13 passes on the real claimgraph AND top-level READMEs",
+                     c13_on(cg_readme, top_readme, cg_graph) == "PASS"))
+
+    # Both sentences must be FINDABLE, or every arm below is vacuous (the
+    # check would be failing for 'sentence gone', not for the mutation).
+    _pat_cg = CLAIMGRAPH_PROSE_CLAIMS[0][1]
+    _pat_top = CLAIMGRAPH_PROSE_CLAIMS[1][1]
+    _m_cg = re.search(_pat_cg, cg_readme)
+    _m_top = re.search(_pat_top, top_readme)
+    outcomes.append(("C13's fixture locates BOTH sentences it checks",
+                     _m_cg is not None and _m_top is not None))
+
+    def lie(text, m):
+        """Replace the numbers in the matched sentence with unmistakable lies."""
+        return text[:m.start()] + re.sub(r"\d+", "999", m.group(0)) + \
+            text[m.end():]
+
+    if _m_cg:
+        outcomes.append(("C13 catches a stale claimgraph-README prose number",
+                         c13_on(lie(cg_readme, _m_cg), top_readme,
+                                cg_graph) == "FAIL"))
+        outcomes.append(("C13 treats a deleted claimgraph sentence as FAIL",
+                         c13_on(cg_readme[:_m_cg.start()] +
+                                cg_readme[_m_cg.end():], top_readme,
+                                cg_graph) == "FAIL"))
+
+    if _m_top:
+        # This arm is the whole reason C13 has two sentences: the TOP-LEVEL
+        # README's numbers were wrong by 52/43/42/2 on master and NOTHING
+        # looked at them, because C8's table carries no claimgraph entry.
+        outcomes.append(("C13 catches a stale TOP-LEVEL README number",
+                         c13_on(cg_readme, lie(top_readme, _m_top),
+                                cg_graph) == "FAIL"))
+        outcomes.append(("C13 treats a deleted top-level sentence as FAIL",
+                         c13_on(cg_readme, top_readme[:_m_top.start()] +
+                                top_readme[_m_top.end():], cg_graph) == "FAIL"))
+
+    # The graph moves under a correct sentence -> FAIL. The store grows; this
+    # is the direction that actually happens, and it is the only way the
+    # top-level sentence can drift without anyone editing it.
+    moved = json.loads(cg_graph)
+    moved["stats"]["superseded"] += 7
+    outcomes.append(("C13 catches graph.json moving under the prose",
+                     c13_on(cg_readme, top_readme, json.dumps(moved)) == "FAIL"))
+
+    # Same, but moving only the EDGE COUNT -- the top-level sentence reads
+    # len(graph["edges"]), a computed value, not a stats key. If that limb
+    # were wired to a constant this arm would be the one that noticed.
+    moved_edges = json.loads(cg_graph)
+    moved_edges["edges"] = moved_edges["edges"] + [{"type": "dummy"}]
+    outcomes.append(("C13 catches the edge count moving, not just stats keys",
+                     c13_on(cg_readme, top_readme, json.dumps(moved_edges))
+                     == "FAIL"))
+
     outcomes.append(("the tool's own source contains no secret", not own))
     outcomes.append(("C2 would catch it if it did (fixtures use SYNTHETIC)",
                      any("SYNTHETIC" in l for l in
                          open(here, encoding="utf-8").read().splitlines())))
+
+    # C12 controls: THE ACTUAL INCIDENT, reproduced. A fixture containing the
+    # real shape of master fcb2458 -- a module constant deleted while its
+    # uses remain -- must FAIL, and the same fixture with the line restored
+    # must PASS. This is the control that matters: a mutation of the shape
+    # that stopped the daemon, not a mutation I invented.
+    def c12_on(body):
+        d = farm()
+        open(os.path.join(d, ".gitignore"), "w").write(
+            "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+        os.makedirs(os.path.join(d, "tools", "tests"), exist_ok=True)
+        # C12 runs the tool from the TREE, so the fixture must carry it and
+        # its two control suites, or C12 would fail for the wrong reason
+        # (missing tool) and the control would pass vacuously.
+        for rel in ("tools/undefined_names.py",
+                    "tools/tests/undefined_names_cases.py",
+                    "tools/tests/undefined_names_legal.py"):
+            shutil.copyfile(os.path.join(ROOT, rel), os.path.join(d, rel))
+        open(os.path.join(d, "daemon.py"), "w").write(body)
+        _git(d, "add", "-f", ".")
+        _git(d, "commit", "-qm", "c12 fixture")
+        _ok, r = run(d)
+        shutil.rmtree(d)
+        return dict((n, o) for n, o, _ in r).get("C12 undefined names")
+
+    BOOT = ("import os\n"
+            "LIMIT = int(os.environ.get('LIMIT', '5'))\n"
+            "def main_loop():\n"
+            "    print(f'[daemon] up, threshold {LIMIT}')\n")
+    outcomes.append(("C12 passes on a module whose constant is defined",
+                     c12_on(BOOT) == "PASS"))
+    deleted = BOOT.replace("LIMIT = int(os.environ.get('LIMIT', '5'))\n", "")
+    outcomes.append(("C12 catches the deleted-constant boot crash "
+                     "(the fcb2458 shape)",
+                     deleted != BOOT and c12_on(deleted) == "FAIL"))
+    # And it must ALSO catch a definition deleted from a function body, which
+    # is the more common everyday shape and a different scope branch.
+    FN = ("def watch(total):\n"
+          "    threshold = 5\n"
+          "    return total >= threshold\n")
+    fn_bad = FN.replace("    threshold = 5\n", "")
+    outcomes.append(("C12 catches a deleted local in a function body",
+                     fn_bad != FN and c12_on(fn_bad) == "FAIL"))
+    # C14: the registry. Three arms in two directions. A one-armed control
+    # here would be satisfied by a check that returns FAIL unconditionally,
+    # which is the failure this check exists to prevent, one level up.
+    real_src = open(here, encoding="utf-8").read()
+    outcomes.append(("C14 passes on the real repo_check.py",
+                     registry_status(real_src)[0] == "PASS"))
+
+    # Arm A: define a check, do not register it. This is the exact shape of a
+    # merge that keeps the function hunk and loses the CHECKS-list line.
+    orphaned = real_src.replace(
+        "CHECKS = [c1_tracked_junk,",
+        "def c99_orphan(root):\n"
+        "    return 'C99 orphan', 'FAIL', ['never called']\n\n\n"
+        "CHECKS = [c1_tracked_junk,", 1)
+    st, fd = registry_status(orphaned)
+    outcomes.append(("C14 catches a check DEFINED but missing from CHECKS",
+                     orphaned != real_src and st == "FAIL"
+                     and any("c99_orphan" in f for f in fd)))
+
+    # Arm B: the SAME name, but nested inside another function, must NOT be
+    # flagged. The real file already carries c11_on/c12_on/c13_on helpers
+    # named exactly like checks; a check that walked every FunctionDef would
+    # report them and bite correct code. Synthetic so the arm cannot go
+    # vacuous when those helpers are renamed.
+    nested_src = real_src.replace(
+        "CHECKS = [c1_tracked_junk,",
+        "def _wrapper():\n"
+        "    def c99_nested(root):\n"
+        "        return 'not a check', 'PASS', []\n"
+        "    return c99_nested\n\n\n"
+        "CHECKS = [c1_tracked_junk,", 1)
+    st_b, fd_b = registry_status(nested_src)
+    outcomes.append(("C14 does NOT flag a nested check-shaped helper",
+                     nested_src != real_src and st_b == "PASS"
+                     and not any("c99_nested" in f for f in fd_b)))
+
+    # Arm D: a module-level helper whose name LOOKS like a check but which is
+    # CALLED by a real check must not be flagged. agent-7 measured this false
+    # positive: refactors create top-level helpers, and C14 protected only
+    # NESTED ones. A check that bites correct code gets deleted.
+    helper_src = real_src.replace(
+        "CHECKS = [c1_tracked_junk,",
+        "def c99_parse_flags():\n"
+        "    return []\n\n\n"
+        "CHECKS = [c1_tracked_junk,", 1)
+    # make the helper genuinely CALLED from inside another function
+    helper_src = helper_src.replace(
+        "def c1_tracked_junk(root):",
+        "def c1_tracked_junk(root):\n"
+        "    c99_parse_flags()", 1)
+    st_d, fd_d = registry_status(helper_src)
+    outcomes.append(("C14 does NOT flag a module-level helper that is CALLED",
+                     helper_src != real_src and st_d == "PASS"
+                     and not any("c99_parse_flags" in f for f in fd_d)))
+
+    # Arm E: an UNCALLED module-level check-shaped function is still dead.
+    # D alone could be satisfied by never flagging anything at module level.
+    st_e, fd_e = registry_status(
+        "def c99_dead(root):\n    return 'x', 'PASS', []\n\n\n"
+        "CHECKS = []\n")
+    outcomes.append(("C14 DOES flag an uncalled module-level check",
+                     st_e == "FAIL" and any("c99_dead" in f for f in fd_e)))
+
+    # Arm F: CHECKS may be ANNOTATED. `CHECKS: list = [...]` is legal and the
+    # first version read only ast.Assign, so registered came back empty and
+    # C14 named every registered check as an orphan -- fourteen innocent
+    # functions called dead is the output that gets a gate deleted.
+    ann_src = ("def c1_a(root):\n    return 'A', 'PASS', []\n\n\n"
+               "CHECKS: list = [c1_a]\n")
+    st_f, fd_f = registry_status(ann_src)
+    outcomes.append(("C14 reads an ANNOTATED CHECKS declaration",
+                     st_f == "PASS", ))
+    # `findings` carries an informational "N checks registered" line even on
+    # PASS, so the arm must look for ORPHAN text, not for an empty list.
+    outcomes.append(("C14 does not invent orphans under an annotation",
+                     not any("ORPHAN" in f or "DEFINED BUT" in f for f in fd_f)))
+
+    # Arm G: CHECKS built with `+` must register BOTH sides.
+    bin_src = ("def c1_a(root):\n    return 'A', 'PASS', []\n\n\n"
+               "def c2_b(root):\n    return 'B', 'PASS', []\n\n\n"
+               "CHECKS = [c1_a] + [c2_b]\n")
+    st_g, fd_g = registry_status(bin_src)
+    outcomes.append(("C14 reads both sides of CHECKS = [a] + [b]",
+                     st_g == "PASS"
+                     and any("2 checks registered" in f for f in fd_g)))
+
+    # Arm H: LIVENESS IS NOT REGISTRATION. A check-shaped function that is
+    # NOT in CHECKS but IS called from selftest() must still be flagged.
+    # agent-7 measured this residual on a full tree: the call made the
+    # function "live", so it was dropped from the candidate set and C14
+    # passed while a FAIL-returning check never ran at the gate. That is
+    # the exact defect C14 exists for, and the selftest is the likeliest
+    # place an unregistered check gets exercised at all.
+    harness_src = ("def c99_unregistered(root):\n"
+                   "    return 'C99', 'FAIL', ['never gated']\n\n\n"
+                   "def selftest():\n"
+                   "    c99_unregistered(None)\n"
+                   "    return True\n\n\n"
+                   "CHECKS = []\n")
+    st_h, fd_h = registry_status(harness_src)
+    outcomes.append(("C14 flags a check called ONLY from the selftest",
+                     st_h == "FAIL"
+                     and any("c99_unregistered" in f for f in fd_h)))
+
+    # Arm I: every legal spelling of CHECKS must agree. `+= []` and
+    # `= CHECKS + []` are the same no-op; the second used to erase the
+    # registration and name every check as an orphan.
+    spell_base = ("def c1_a(r):\n    return 'A', 'PASS', []\n\n\n"
+                  "def c2_b(r):\n    return 'B', 'PASS', []\n\n\n")
+    spellings = {
+        "bare": "CHECKS = [c1_a, c2_b]\n",
+        "augmented no-op": "CHECKS = [c1_a, c2_b]\nCHECKS += []\n",
+        "binop no-op": "CHECKS = [c1_a, c2_b]\nCHECKS = CHECKS + []\n",
+        "augmented append": "CHECKS = [c1_a]\nCHECKS += [c2_b]\n",
+        "two-sided binop": "CHECKS = [c1_a] + [c2_b]\n",
+        "annotated": "CHECKS: list = [c1_a, c2_b]\n",
+    }
+    spell_results = {k: registry_status(spell_base + v)
+                     for k, v in spellings.items()}
+    outcomes.append(("C14: every legal CHECKS spelling registers both names",
+                     all(st == "PASS" and not orph
+                         for st, (_, orph) in
+                         ((r[0], (None, [f for f in r[1] if "ORPHAN" in f]))
+                          for r in spell_results.values()))))
+
+    # Arm J: a REGISTERED check that production code ALSO calls must not
+    # become a phantom. agent-2's row 4, and it was a regression introduced
+    # by the fix for agent-7's finding: subtracting `called` from the
+    # check-shaped set removed a real function from `defined`, so C14
+    # reported it as "REGISTERED BUT NOT DEFINED" on a CORRECT tree. The
+    # original master passed this by never filtering; the first liveness fix
+    # broke it. This asserts the PHANTOM list on a registered+called tree --
+    # the verdict the fix newly produces, which no prior arm asserted.
+    row4_src = ("def c1_a(root):\n    return 'A', 'PASS', []\n\n\n"
+                "def c2_live(root):\n    return 'B', 'PASS', []\n\n\n"
+                "def _prod(root):\n    return c2_live(root)\n\n\n"
+                "CHECKS = [c1_a, c2_live]\n")
+    st_j, fd_j = registry_status(row4_src)
+    outcomes.append(("C14: a registered check CALLED from production is not a phantom",
+                     st_j == "PASS" and not any("NOT DEFINED" in f for f in fd_j)))
+
+    # Arm K: a MODULE-LEVEL call must not launder a dead check. agent-2's A3:
+    # `_C99 = c99_probe('.')` runs once at import; its result is a constant,
+    # not production work. Before the fix this counted as a live call and C14
+    # passed. Now only calls inside a FunctionDef count.
+    a3_src = ("def c99_probe(root):\n    return 'x', 'FAIL', []\n\n\n"
+              "_C99 = c99_probe('.')\n\n\n"
+              "CHECKS = []\n")
+    st_k, fd_k = registry_status(a3_src)
+    outcomes.append(("C14: a check called only at MODULE level is still an orphan",
+                     st_k == "FAIL" and any("c99_probe" in f for f in fd_k)))
+
+    # Arm L: ONE helper of indirection must not launder a selftest call.
+    # agent-2's A2: `def _helper(): return c99_probe('.')` called from
+    # selftest() put the call outside the named harness bodies, so a
+    # non-subgraph walk counted it. The harness exclusion now follows the call
+    # subgraph transitively.
+    a2_src = ("def c99_probe(root):\n    return 'x', 'FAIL', []\n\n\n"
+              "def _helper():\n    return c99_probe('.')\n\n\n"
+              "def selftest():\n    _helper()\n    return True\n\n\n"
+              "CHECKS = []\n")
+    st_l, fd_l = registry_status(a2_src)
+    outcomes.append(("C14: a check called through a helper FROM the selftest is an orphan",
+                     st_l == "FAIL" and any("c99_probe" in f for f in fd_l)))
+
+    # Arm C: C14's own removal must still be caught. registry_status cannot
+    # see this (if C14 is unregistered it never runs), so the guard is
+    # asserted directly, in both the restored and removed states.
+    _saved = list(CHECKS)
+    try:
+        CHECKS.remove(c14_check_registry)
+        outcomes.append(("C14 self-guard fires when its CHECKS entry is removed",
+                         _self_guard() is False))
+    finally:
+        CHECKS[:] = _saved
+    outcomes.append(("C14 self-guard passes on the restored list",
+                     _self_guard() is True))
 
     bad = 0
     for label, passed in outcomes:

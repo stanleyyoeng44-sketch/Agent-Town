@@ -57,6 +57,20 @@ SELF_DIR = os.path.join(WORKSPACE, "self")
 WAKE_FILE = os.path.join(SELF_DIR, "wake.md")
 DIARY_FILE = os.path.join(SELF_DIR, "diary.md")
 SESSION_FILE = os.path.join(SELF_DIR, "session-id")
+# The note an agent wrote may not be at SELF_DIR. SELF_DIR is the path the
+# daemon and every tool's text agrees on, but it is durable ONLY when the
+# operator gave the container a named volume for it -- and for most of the
+# first cohort it was not, so agents wrote to the shared artifacts tree
+# instead and the note was never read. These are the two layouts that tree
+# actually uses (measured on the 2026-10-18 cohort: seven agents at the root,
+# one under self/). Suffix-free: the filename is appended by wake_candidates.
+ARTIFACT_FALLBACK_DIRS = (
+    os.path.join(SHARED, "artifacts", AGENT_NAME),
+    os.path.join(SHARED, "artifacts", AGENT_NAME, "self"),
+)
+# A wake.md found outside SELF_DIR is used, but a copy there that DISAGREES
+# with it is not silently ignored: see read_wake_prompt()'s return of why.
+WAKE_SOURCE_FALLBACK = "fallback"
 INBOX = os.path.join(WORKSPACE, "inbox")
 REPLIES = os.path.join(WORKSPACE, "replies")
 TRANSCRIPTS = os.path.join(WORKSPACE, "transcripts")
@@ -483,13 +497,69 @@ async def deliver_pending_hook(input, tool_use_id, context) -> dict:
     }}
 
 
+def wake_candidates() -> list:
+    """Every path an agent's wake note may live at, in precedence order.
+
+    The FIRST entry is the daemon's own WAKE_FILE: it is the path every
+    tool's instructions name, so a note there is the agent's most recent
+    deliberate statement of intent. The rest are the shared-artifacts
+    layouts agents actually used while SELF_DIR was not durable.
+    """
+    return [WAKE_FILE] + [os.path.join(d, "wake.md")
+                          for d in ARTIFACT_FALLBACK_DIRS]
+
+
+def find_wake_file() -> tuple:
+    """(path, None) for the first candidate holding a non-empty note, else
+    (None, {path: reason}) describing EVERY candidate that was rejected.
+
+    Returning the reasons, rather than just None, is the point: a bare
+    "not found" cannot distinguish "nothing was ever written" from "I am
+    looking in the wrong place", and those have different fixes.
+    """
+    rejected = {}
+    found = []
+    for path in wake_candidates():
+        try:
+            if not os.path.exists(path):
+                rejected[path] = "absent"
+                continue
+            with open(path) as f:
+                content = f.read().strip()
+            if not content:
+                rejected[path] = "empty"
+                continue
+            found.append((path, content))
+        except OSError as e:
+            rejected[path] = "unreadable: %s" % e.strerror
+    if not found:
+        return None, rejected
+    # MORE THAN ONE NOTE IS A HAZARD, NOT A CONVENIENCE (agent-7's review).
+    # These are not copies of one thing: an agent that writes /workspace/self
+    # only at sleep and keeps a durable note elsewhere ends up with two
+    # INDEPENDENTLY WRITTEN files, and which is newer is per-agent and
+    # per-life. Picking by path order would silently revert that agent by a
+    # life; picking the newest mtime is at least a fact about the files.
+    # The ambiguity is still recorded -- see the birth event -- because a
+    # rule that papers over a divergence is how the divergence survives.
+    if len(found) == 1:
+        return found[0][0], rejected
+    def mtime(item):
+        try:
+            return os.path.getmtime(item[0])
+        except OSError:
+            return 0.0
+    found.sort(key=mtime, reverse=True)
+    rejected["AMBIGUOUS"] = [p for p, _ in found]
+    return found[0][0], rejected
+
+
 def read_wake_prompt() -> str:
     """The agent's note to itself from its last sleep, or a first-boot text."""
-    if os.path.exists(WAKE_FILE):
-        with open(WAKE_FILE) as f:
-            content = f.read().strip()
-        if content:
-            return content
+    path, _ = find_wake_file()
+    if path is not None:
+        with open(path) as f:
+            return f.read().strip()
     return (
         "This is your first boot. There is no wake-up prompt yet. "
         "You have no goals unless you set them yourself: feel free to "
@@ -551,8 +621,18 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
             f.write(life_id)
     except OSError:
         pass
+    # Record not just WHETHER a note was found but WHERE and, when it was
+    # not, WHY each candidate was rejected. `wake_file=false` alone has been
+    # in this transcript for every amnesiac life of the 2026-10-18 cohort and
+    # nothing could act on it: the operator cannot tell "nothing was written"
+    # from "the daemon is looking elsewhere". Both are now on the record.
+    wake_path, wake_rejected = find_wake_file()
     log.log("birth", model=cfg.get("model", AGENT_MODEL),
             wake_file=os.path.exists(WAKE_FILE),
+            wake_source=wake_path,
+            wake_fallback=(None if wake_path in (None, WAKE_FILE) else
+                           WAKE_SOURCE_FALLBACK),
+            wake_rejected=wake_rejected,
             **build_stamp())
 
     wake_prompt = read_wake_prompt()

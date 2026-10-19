@@ -28,7 +28,9 @@ Exit: 0 shipped passes AND the control fires; 1 either half failed.
 """
 import ast
 import asyncio
+import os
 import sys
+import tempfile
 import textwrap
 
 DAEMON = sys.argv[1] if len(sys.argv) > 1 else "agent/agent-daemon.py"
@@ -40,6 +42,21 @@ CASES = [
     (True, ["queued"], [], "resumed, mail already queued", True),
     (True, [], ["late"], "resumed, mail arrives at a boundary", True),
 ]
+
+# Cases where the FIRST TURN MUST CONTAIN the wake-up prompt itself.
+# The shipped test asserted only bool(first) -- that a turn exists. Stanley's
+# commit made "the resume path sends the wake-up prompt" its headline claim,
+# and two mutants that DELETE the prompt from the kick passed the old suite:
+#   wake_prompt body -> "(omitted)"        : PASS
+#   wake_prompt body removed entirely      : PASS
+# A turn that opens the session but carries no plan is not the behaviour the
+# commit claims, and only a content assertion can tell the two apart.
+MUST_CARRY_WAKE = {
+    # The activation path THIS commit added. The fresh-life case is not in
+    # this set because the harness stubs opening_message() with a constant,
+    # so a missing prompt there would be the stub's doing, not the code's.
+    "resumed, no mail",
+}
 
 
 def extract(path):
@@ -100,11 +117,53 @@ def run_cases(fn, label):
     for resumed, pending, items, name, must in CASES:
         first = run_case(fn, resumed, pending, items)
         passed = bool(first) == must
-        ok = ok and passed
+        if passed and name in MUST_CARRY_WAKE:
+            passed = "WAKE" in (first or "")
+            if not passed:
+                print("  %-5s %-36s first=%r  (does NOT carry the wake "
+                      "prompt)" % ("FAIL", name, (first or "")[:40]))
+                ok = False
+                continue
         print("  %-5s %-36s first=%r"
               % ("PASS" if passed else "FAIL", name,
                  (first or "<NOTHING>")[:40].replace("\n", " ")))
     return ok
+
+
+def strip_wake_from_kick(body):
+    """Remove f-string interpolation of wake_prompt from the RESUME kick.
+
+    This is the mutant that the old assertions could not see: the turn is
+    still yielded (bool(first) is True), but it no longer carries the plan.
+    Built from the parsed AST so it cannot miss on a whitespace change, and
+    it REFUSES to return a no-op mutation -- a control that did not mutate is
+    not a control.
+    """
+    def visit(src):
+        tree = ast.parse(src)
+        hit = [False]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                keep = []
+                for v in node.values:
+                    if isinstance(v, ast.FormattedValue) and \
+                            isinstance(v.value, ast.Name) and \
+                            v.value.id == "wake_prompt":
+                        hit[0] = True
+                        keep.append(ast.Constant(value="[PROMPT-REMOVED]"))
+                    else:
+                        keep.append(v)
+                node.values = keep
+        return ast.unparse(tree), hit[0]
+
+    src = "async def _x():\n" + textwrap.indent(body, "    ")
+    out, changed = visit(src)
+    if not changed:
+        raise SystemExit("FAIL: could not find wake_prompt in the kick; the "
+                         "control would be a no-op")
+    # strip the synthetic wrapper back off
+    tree = ast.parse(out)
+    return "\n".join(ast.unparse(st) for st in tree.body[0].body)
 
 
 def pre_fix_body(body):
@@ -159,9 +218,186 @@ def pre_fix_body(body):
     return mutated
 
 
+# ---------------------------------------------------------------------------
+# D. THE DELIVERY ARM -- does the daemon HAND the stream the REAL wake prompt?
+#
+# WHY THIS EXISTS (agent-6, measured): the A/B/C sections above prove
+# prompt_stream TRANSMITS whatever wake_prompt it is given -- the harness
+# binds the literal "WAKE" and checks the string comes out. They cannot prove
+# the daemon HANDS IT THE REAL ONE. One line, nothing else touched:
+#
+#     agent/agent-daemon.py:558   wake_prompt = read_wake_prompt()
+#                          ->     wake_prompt = ""
+#     tools/test_prompt_stream.py -> A 4/4 PASS, exit 0
+#
+# Every agent would wake to "Your wake-up prompt to yourself:" followed by
+# nothing. That is Stanley's headline claim (the agent wakes holding the note
+# its last life wrote) delivered as an empty string, with the suite green.
+#
+# The chain has two links and this section measures both:
+#   D1  read_wake_prompt RETURNS the note, for all three file states
+#   D2  the variable prompt_stream interpolates is ASSIGNED FROM that reader
+# Neither link alone is enough: D2 without D1 pins a call to a broken reader;
+# D1 without D2 pins a working reader nobody calls.
+# ---------------------------------------------------------------------------
+
+def extract_function(path, name):
+    """Pull one top-level function out of the shipped file, unparsed."""
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    if fn is None:
+        raise SystemExit("FAIL: no %s in %s" % (name, path))
+    return ast.unparse(ast.Module(body=[fn], type_ignores=[])), tree
+
+
+# The shipped read_wake_prompt is no longer self-contained: it delegates to
+# find_wake_file(), which walks wake_candidates() over ARTIFACT_FALLBACK_DIRS.
+# Extracting just the one function put it in a namespace that had none of
+# them, and the arm died with NameError -- a harness that carried the
+# function but not its dependencies. These are the names it needs, taken from
+# the shipped file by the same AST extraction so they cannot drift from it.
+WAKE_HELPERS = ("wake_candidates", "find_wake_file", "read_wake_prompt")
+
+
+def wake_reader_ns(wake_path):
+    """A namespace with the SHIPPED reader plus everything it calls."""
+    ns = {"os": os, "str": str, "list": list, "tuple": tuple,
+          "WAKE_FILE": wake_path, "ARTIFACT_FALLBACK_DIRS": ()}
+    for name in WAKE_HELPERS:
+        body, _ = extract_function(DAEMON, name)
+        exec(compile(body, "<%s>" % name, "exec"), ns)
+    return ns
+
+
+def d1_reader_returns_the_note():
+    """Run the SHIPPED read_wake_prompt against real files on disk."""
+    work = tempfile.mkdtemp()
+    wake = os.path.join(work, "wake.md")
+    ns = wake_reader_ns(wake)
+    read = ns["read_wake_prompt"]
+
+    ok = True
+    BODY = "# wake\nDO THESE THREE THINGS."
+    FIRST_BODY = "# wake\nFIRST BODY"
+    SECOND_BODY = "# wake\nSECOND BODY"
+
+    open(wake, "w").write(BODY)
+    got = read()
+    hit = (got.strip() == BODY.strip())
+    ok = ok and hit
+    print("  %-5s a real wake.md comes back verbatim          got=%r"
+          % ("PASS" if hit else "FAIL", got[:36]))
+
+    os.remove(wake)
+    got = read()
+    hit = "first boot" in got.lower()
+    ok = ok and hit
+    print("  %-5s no wake.md gives the FIRST-BOOT text        got=%r"
+          % ("PASS" if hit else "FAIL", got[:36]))
+
+    open(wake, "w").write("   \n\n")
+    got = read()
+    hit = "first boot" in got.lower()
+    ok = ok and hit
+    print("  %-5s a whitespace-only wake.md is NOT a plan     got=%r"
+          % ("PASS" if hit else "FAIL", got[:36]))
+
+    # D1d: the value must FOLLOW THE FILE across two reads.
+    # MEASURED GAP, found by agent-7 reviewing this pair: the three arms above
+    # all read the file at most once per state, so a reader that CACHED its
+    # first result passes all of them. Verified rather than reasoned about: a
+    # reader carrying a first-read memo leaves the three arms green and
+    # returns FIRST BODY on the second read. Two different bodies, so a
+    # constant cannot pass either.
+    #
+    # SCOPE, corrected by agent-1's review: this arm covers IN-FUNCTION
+    # caching (a memo/global declared inside read_wake_prompt). It does NOT
+    # cover a MODULE-LEVEL cache -- D1 extracts the function with ast and
+    # execs it in a fresh namespace, so a module-level name is a NameError
+    # there, and the mutant dies with a traceback instead of a clean arm
+    # failure. That is not a hole in the assertion (the shipped function has
+    # no module-level cache to lose) but it is a limit of the harness, and my
+    # first commit message described the C1 mutant as if the new arm caught
+    # it. It does not: C1 fails the two FALLBACK arms, because a cache poisons
+    # every file state, not because the re-read arm fired. Stated here so the
+    # next reader does not over-read this arm.
+    open(wake, "w").write("# wake\nFIRST BODY")
+    first = read()
+    open(wake, "w").write("# wake\nSECOND BODY")
+    second = read()
+    hit = (first.strip() == FIRST_BODY and second.strip() == SECOND_BODY)
+    ok = ok and hit
+    print("  %-5s the value FOLLOWS the file across two reads got=%r -> %r"
+          % ("PASS" if hit else "FAIL", first[:12], second[:12]))
+    return ok
+
+
+def d2_stream_is_handed_the_reader():
+    """The variable the stream interpolates must BE read_wake_prompt().
+
+    Structural on purpose: driving live_one_life needs the SDK, and a fake
+    client would prove the fake, not the daemon. What can fail here is exact:
+    replacing the call with a literal (&quot;", None, a constant) leaves the
+    stream interpolating something that is not the note.
+    """
+    _, tree = extract_function(DAEMON, "read_wake_prompt")   # parse once
+    live = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.AsyncFunctionDef)
+                 and n.name == "live_one_life"), None)
+    if live is None:
+        raise SystemExit("FAIL: no live_one_life in %s" % DAEMON)
+
+    # 1. an assignment `wake_prompt = <call>` where the call is read_wake_prompt
+    assigned_from_reader = False
+    for node in ast.walk(live):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not any(isinstance(t, ast.Name) and t.id == "wake_prompt"
+                       for t in targets):
+                continue
+            v = node.value
+            if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                    and v.func.id == "read_wake_prompt"):
+                assigned_from_reader = True
+
+    # 2. every JoinedStr in the function that interpolates `wake_prompt`
+    interpolated = []
+    for node in ast.walk(live):
+        if isinstance(node, ast.JoinedStr):
+            for v in node.values:
+                if (isinstance(v, ast.FormattedValue)
+                        and isinstance(v.value, ast.Name)
+                        and v.value.id == "wake_prompt"):
+                    interpolated.append(node)
+
+    ok = True
+    print("  %-5s wake_prompt is ASSIGNED FROM read_wake_prompt()"
+          % ("PASS" if assigned_from_reader else "FAIL"))
+    ok = ok and assigned_from_reader
+    hit = len(interpolated) >= 1
+    print("  %-5s the stream INTERPOLATES wake_prompt (%d site(s))"
+          % ("PASS" if hit else "FAIL", len(interpolated)))
+    ok = ok and hit
+    return ok
+
+
 def main():
     body = extract(DAEMON)
     shipped_ok = run_cases(compile_stream(body), "A. SHIPPED prompt_stream")
+
+    print("\nD. DELIVERY -- does the daemon hand the stream the REAL note?")
+    d1_ok = d1_reader_returns_the_note()
+    d2_ok = d2_stream_is_handed_the_reader()
+    delivery_ok = d1_ok and d2_ok
+
+    stripped = strip_wake_from_kick(body)
+    stripped_ok = run_cases(compile_stream(stripped),
+                            "\nC. CONTROL -- a resume kick that DROPS the "
+                            "wake prompt MUST fail")
+    # Inverted, like the pre-fix control: the mutant must be caught.
+    strip_caught = not stripped_ok
 
     mutated = pre_fix_body(body)
     control_ok = run_cases(compile_stream(mutated),
@@ -172,9 +408,12 @@ def main():
     control_fired = not control_ok
 
     print()
+    print("  delivery chain intact (reader returns, stream uses it): %s"
+          % delivery_ok)
+    print("  control fired (resume kick lost the prompt): %s" % strip_caught)
     print("  control fired (pre-fix shape went mute): %s"
           % ("PASS" if control_fired else "FAIL -- this test is blind"))
-    good = shipped_ok and control_fired
+    good = shipped_ok and control_fired and strip_caught and delivery_ok
     print("\n%s" % ("PROMPT-STREAM PASS" if good else "PROMPT-STREAM FAIL"))
     return 0 if good else 1
 

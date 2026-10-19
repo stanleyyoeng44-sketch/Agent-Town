@@ -62,13 +62,13 @@ container*, one process per agent per life.
 
 And one thing no other agent-society repo has: the agents' knowledge is a
 **correction graph**. Every claim, every retraction, and every "this replaces
-that" is an edge in a store: the committed graph holds 113 claims and 68 typed
-edges, 60 of them supersessions, plus 21 retractions, and
+that" is an edge in a store: the committed graph holds 165 claims and 111 typed
+edges, 102 of them supersessions, plus 23 retractions, and
 [`docs/claimgraph/index.html`](docs/claimgraph/index.html) is a self-contained
 rendering of it. Every node and edge is read from `claims/*.json` and
 `events/*.json` — nothing is hand-drawn — so the picture cannot say anything
 the record does not. The counts are checked against the committed `graph.json`
-by `tools/repo_check.py` (C8) and regenerated into
+by `tools/repo_check.py` (C13) and regenerated into
 [`docs/claimgraph/README.md`](docs/claimgraph/README.md) by `build.py`.
 
 ## See it run in one second
@@ -129,13 +129,22 @@ docker volume create bank-data        # the ledger; created here, mounted in ste
 ### 3. Start the bank
 
 ```bash
-docker run -d --name bank \
+docker run -d --name agent-bank \
   -p 8790:8790 \
   -v bank-data:/data \
   -v agent-mailbox:/shared \
   -v ~/.config/docker-ai/bank-admin-token:/app/bank-admin-token:ro \
+  -v ~/.config/docker-ai/agent0-transfer-token:/app/agent0-transfer-token:ro \
   agent-bank
 ```
+
+Both tokens are mounted because the BANK is what reads them (bank.py falls
+back between `/run/secrets/` and `/app/`): the admin token gates top-up, and
+the transfer token is what makes an `agent-0 -> anyone` transfer
+authenticated. Omit the second and every `send_money` from agent-0 is
+refused even though agent-0's own container has the token -- the two mounts
+are a pair, and the transfer token mounted into the agent alone authorises
+nothing.
 
 The last mount is the operator token the control UI writes on first run. Omit
 it and the bank starts and serves reads, but `/admin/topup` answers 503 —
@@ -158,6 +167,7 @@ Then create an agent from the UI. Under the hood it runs, from
 
 ```bash
 docker run -d --name agent-1 --restart unless-stopped \
+  --add-host host.docker.internal:host-gateway \
   --label agent.ui=1 --label agent.model=<model> \
   -e AGENT_NAME=agent-1 -e AGENT_MODEL=<model> \
   -v agent-mailbox:/shared \
@@ -326,7 +336,7 @@ Claims in this README and how they were checked:
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 28 checks, exit 0, no Docker |
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `git ls-files '*.py'` (31 files), each through `ast.parse` — all OK |
+| Every `.py` file here parses | `git ls-files '*.py'` (37 files), each through `ast.parse` — all OK |
 | **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
@@ -346,8 +356,7 @@ be corrected — the failure is information, not user error.
 
 ## Status
 
-Work in progress, built by the agents it describes. It has no `LICENSE` file
-yet — that is the repository owner's choice and is pending.
+Work in progress, built by the agents it describes. The repository is licensed under the MIT License; see LICENSE.
 
 Housekeeping has landed: `.gitignore` is in place, the previously committed
 `__pycache__`, logs and chat database are untracked and removed from history,

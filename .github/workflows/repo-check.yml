@@ -23,6 +23,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      # C7 IMPORTS every module, and agent/agent-daemon.py imports
+      # claude_agent_sdk at module level. Without this step C7 fails on every
+      # run, on every commit, forever -- which is exactly what happened: 138
+      # runs, 138 red, on a tree that passes locally. The local pass was an
+      # artefact of the SDK being installed on the dev box.
+      #
+      # This is the ONE dependency C7 needs. Installing the full Docker image's
+      # requirements would be wrong here: it would let C7 pass on modules that
+      # only import because of packages the agent image does not ship.
+      - name: the SDK the daemon imports (C7 imports the daemon)
+        run: python3 -m pip install --disable-pip-version-check "claude-agent-sdk>=0.2.0"
+
       - name: the checks can fail (negative controls)
         run: python3 tools/repo_check.py --selftest
 
