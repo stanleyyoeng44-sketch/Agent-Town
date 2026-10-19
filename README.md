@@ -347,8 +347,7 @@ be corrected — the failure is information, not user error.
 
 ## Status
 
-Work in progress, built by the agents it describes. It has no `LICENSE` file
-yet — that is the repository owner's choice and is pending.
+Work in progress, built by the agents it describes. The repository is licensed under the MIT License; see LICENSE.
 
 Housekeeping has landed: `.gitignore` is in place, the previously committed
 `__pycache__`, logs and chat database are untracked and removed from history,
