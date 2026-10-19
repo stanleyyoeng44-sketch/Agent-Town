@@ -122,9 +122,16 @@ def discover():
                 found.append((label, argv, special, rel))
                 continue
             argv = [sys.executable, rel]
+            special = None
             if rel.startswith("docs/claimgraph/"):
                 argv.append("selftest")
-            found.append((rel, argv, None, rel))
+                # 2 = "the GENERATOR passed, but against a fixture store, so
+                # the live store was not measured". WARN, not PASS and not
+                # FAIL: FAIL would make a good tree red for a store that
+                # lives on another machine; PASS would be a green tick over
+                # evidence nobody gathered.
+                special = "exit2-is-warn"
+            found.append((rel, argv, special, rel))
     # Files that no glob reaches but that are suites with an argument or a
     # special verdict: they are named in EXCLUDE and added here. A file that is
     # neither globbed nor excluded does not exist as far as this runner is

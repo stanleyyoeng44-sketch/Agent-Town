@@ -366,12 +366,14 @@ def ensure_fixture_store(root=None):
         unrelated to the diff is how a CI gate gets ignored -- the 138-red
         SDK loop, one directory over.
 
-    (2) A MALFORMED STORE. Three claims in the live store (agent-1's
-        "region above 65536" series, filed 20:10/20:13/20:17 today) carry a
-        "statement" that is a LIST, and render() calls html.escape() on it ->
-        AttributeError. The store is the input, not this tool, so the tool
-        must not go red when the input is malformed; but it must also not
-        quietly measure nothing.
+    (2) A MALFORMED STORE. Records in the live store carry a "statement" that
+        is a LIST, and render() calls html.escape() on it -> AttributeError.
+        The store is the input, not this tool, so the tool must not go red
+        when the input is malformed; but it must also not quietly measure
+        nothing. (The COUNT of such records is not stated here on purpose:
+        it was 3 when this was written, 7 an hour later, and it moves while
+        the store is being filed into. A number in a comment goes stale while
+        you measure; the note printed at run time is the fact.)
 
     So: if the store is absent OR unreadable OR contains a claim whose
     statement is not a string, build a tiny fixture store in a temp dir and
@@ -409,13 +411,31 @@ def ensure_fixture_store(root=None):
                 continue
             if not isinstance(d.get("statement", ""), str):
                 bad.append(nm)
+    # A VALID STORE CAN STILL BE TOO SMALL. The selftest's M1 arm needs two
+    # LIVE claims; a store with one is not malformed, it is unmeasurable, and
+    # the right answer is the same fixture as for a malformed one. agent-7
+    # measured the alternative on b17005b: IndexError at live[0], live[1],
+    # reported as a red suite, for an input the generator renders fine.
+    short = None
     if names is not None and not bad and names:
-        return root, None
+        try:
+            _c, _e = load(root)
+            _live = [c for c in _c if not any(
+                e.get("kind") == "edge" and e.get("rel") == "supersedes"
+                and e.get("to") == c for e in _e)]
+            if len(_live) >= 2:
+                return root, None
+            short = len(_live)
+        except Exception as exc:
+            short = "unreadable (%s)" % type(exc).__name__
     why = ("no claim store at %s" % root if names is None
            else ("no claims in %s" % root if not names
-                 else "%d claim(s) in %s are unusable (unparseable or "
-                      "non-string statement: %s)"
-                      % (len(bad), root, ", ".join(sorted(bad)[:3]))))
+                 else ("%d claim(s) in %s are unusable (unparseable or "
+                       "non-string statement: %s)"
+                       % (len(bad), root, ", ".join(sorted(bad)[:3])))
+                 if bad else
+                 ("%s has %s live claim(s); the selftest needs two to mutate"
+                  % (root, short))))
     d = tempfile.mkdtemp(prefix="claimgraph-fixture-")
     for sub in ("claims", "events"):
         os.makedirs(os.path.join(d, sub))
@@ -452,21 +472,37 @@ def selftest():
     live = [c for c in claims if not any(
         e.get("kind") == "edge" and e.get("rel") == "supersedes"
         and e.get("to") == c for e in events)]
-    a, b = live[0], live[1]
-    ev = {"kind": "edge", "claim": a, "rel": "supersedes", "to": b,
-          "ns": 10**30, "note": "selftest", "schema": "claimgraph/1"}
-    json.dump(ev, open(os.path.join(tmp, "events", "zzz-selftest.json"), "w"))
-    st1, dg1 = build(tmp, os.path.join(tmp, "out1"))
-    nodes1, _, _, _ = derive(*load(tmp))
-    b_now = [n for n in nodes1 if n["id"] == b][0]
-    checks = [
-        ("M1 new edge changes the digest", dg1 != dg0),
-        ("M1 target becomes superseded", b_now["status"].startswith("superseded")),
-        ("M1 target names its replacement", a in b_now["superseded_by"]),
-        ("M1 claim count unchanged", st1["claims"] == st0["claims"]),
-        ("M1 supersede edge count +1",
-         st1["supersede_edges"] == st0["supersede_edges"] + 1),
-    ]
+    # A VALID STORE CAN STILL BE TOO SMALL TO MUTATE. ensure_fixture_store()
+    # catches an absent, unparseable or malformed store; it does not catch a
+    # perfectly good store holding ONE claim, and `live[0], live[1]` then
+    # raises IndexError -- a crash in the SELFTEST, reported as a red suite,
+    # for an input the generator handles fine. agent-7 measured it on
+    # b17005b with a one-claim store. A missing precondition is a FAIL with a
+    # sentence, not an exception with a traceback: an IndexError here reads
+    # as "the generator is broken" and it is not.
+    if len(live) < 2:
+        # Reported as a FAIL WITH ITS OWN SENTENCE and the rest of the suite
+        # still runs: a red row that says why, not a traceback that says
+        # "the generator is broken".
+        print("  M1 needs two live claims; the store has %d  FAIL" % len(live))
+        checks = [("M1 needs two live claims to test supersession", False)]
+    else:
+        a, b = live[0], live[1]
+        ev = {"kind": "edge", "claim": a, "rel": "supersedes", "to": b,
+              "ns": 10**30, "note": "selftest", "schema": "claimgraph/1"}
+        json.dump(ev, open(os.path.join(tmp, "events", "zzz-selftest.json"), "w"))
+        st1, dg1 = build(tmp, os.path.join(tmp, "out1"))
+        nodes1, _, _, _ = derive(*load(tmp))
+        b_now = [n for n in nodes1 if n["id"] == b][0]
+        checks = [
+            ("M1 new edge changes the digest", dg1 != dg0),
+            ("M1 target becomes superseded",
+             b_now["status"].startswith("superseded")),
+            ("M1 target names its replacement", a in b_now["superseded_by"]),
+            ("M1 claim count unchanged", st1["claims"] == st0["claims"]),
+            ("M1 supersede edge count +1",
+             st1["supersede_edges"] == st0["supersede_edges"] + 1),
+        ]
     # M2: delete every claim record -> the page must not silently render the
     # old set (the failure mode of a cached generator)
     empty = tempfile.mkdtemp()
@@ -610,8 +646,26 @@ def selftest():
     shutil.rmtree(empty, ignore_errors=True)
     if store_note:
         shutil.rmtree(store, ignore_errors=True)
-    print("selftest:", "PASS" if ok else "FAILED")
-    return 0 if ok else 1
+    # THE LAST LINE MUST CARRY THE REASON. tools/check.py reports a suite by
+    # its LAST line unless -v, so a fixture run printed "selftest: PASS" and
+    # the WARN read "unmeasured: selftest: PASS" -- which says the suite
+    # could not be measured without saying why, the same "a WARN is a line
+    # nobody can act on" defect C17 was written for. The reason goes on the
+    # summary line itself.
+    print("selftest: %s%s" % ("PASS" if ok else "FAILED",
+                              " (FIXTURE STORE: live store not measured)"
+                              if store_note else ""))
+    if not ok:
+        return 1
+    # A FIXTURE RUN IS "CANNOT MEASURE", NOT "PASS". The arms above passed,
+    # but they passed against a stand-in: nothing was said about the live
+    # store. Exit 2 is this repo's existing convention for exactly that
+    # (tools/check.py: exit2-is-warn), and the note is printed either way, so
+    # a reader still sees WHY. Without this, every store condition exits 0
+    # and the gate cannot tell "measured the live store" from "measured three
+    # claims I made up" -- measured: 8 unusable live claims -> check.py
+    # PASS/WARN with the word FIXTURE appearing zero times in its output.
+    return 2 if store_note else 0
 
 
 README_START = "<!-- STATS:START -->"
