@@ -74,7 +74,29 @@ CANONICAL = "Agent-Town"
 # same shape is caught by changing CANONICAL and adding its predecessor here.
 FORMER = ("docker-AI",)
 
-_DOC_GLOBS = ("*.md", "*.MD")
+# SITES THE OWNER HAS NOT YET RULED ON, named rather than silently exempt.
+#
+# agent-0's constraint when approving this work: do not rewrite README's H1 or
+# its voice -- the repository's self-description is Stanley's, and he renamed
+# the repo himself. The H1 is the only remaining stale reference, so it is
+# WAIVED and ASKED, not rewritten and not hidden.
+#
+# A waiver that could outlive its reason is the hand-typed exemption this
+# cohort keeps finding in other people's guards, so it retires itself:
+#   * it is printed on every run, so a PASS never hides the open question;
+#   * if the text at the site no longer names the former repo, the waiver is
+#     STALE and this check FAILS until the entry is deleted. A waiver that has
+#     quietly stopped waiving anything is a lie about coverage.
+WAIVERS = {
+    "README.md:1": "the H1 names the former repo; agent-0 asked that the "
+                   "owner's own self-description not be rewritten, so this "
+                   "is a question for Stanley, not an agent edit",
+}
+# The md5 of README.md as this waiver was written. If README changes, the
+# waiver is stale and this check says so instead of continuing to hide the
+# line. Computed, not typed: see the selftest's arm K, which fails if this
+# constant does not match the README in the tree.
+WAIVED_README_MD5 = "3fb8475905b7a5a4e3f4cd5c8db645c0"
 
 
 def _tracked_docs(root):
@@ -131,13 +153,26 @@ def _repo_refs(text):
     return refs
 
 
-def evaluate(root="."):
-    """Return (verdict, findings). verdict in PASS/FAIL/WARN."""
+def evaluate(root=".", waived_md5=None):
+    """Return (verdict, findings). verdict in PASS/FAIL/WARN.
+
+    Findings carry waived sites as [WAIVED] lines so a PASS still shows them.
+
+    THE WAIVER IS BOUND TO CONTENT, NOT TO A PATH. Keying it on "README.md:1"
+    made every fixture tree inherit a waiver for a line it did not have, and
+    my own arms B/C/E/F caught it -- which is the reason arms exist. A waiver
+    that applies to a file you did not look at is not a waiver of anything.
+    So it fires only for a README whose md5 is the one the waiver was written
+    against, and a stale waiver (text fixed, or README edited since) FAILS
+    until someone deletes the entry.
+    """
     docs = _tracked_docs(root)
     if docs is None:
         return "WARN", ["not a git tree, so the tracked doc set cannot be "
                         "measured here; this check must not claim a PASS"]
-    findings, scanned = [], 0
+    findings, waived = [], []
+    scanned = 0
+    readme_text = None
     for rel in docs:
         try:
             text = open(os.path.join(root, rel), encoding="utf-8").read()
@@ -145,20 +180,39 @@ def evaluate(root="."):
             findings.append(f"{rel}: unreadable ({e.__class__.__name__}) -- "
                             f"a doc this check cannot read is not a clean doc")
             continue
+        if rel == "README.md":
+            readme_text = text
         scanned += 1
         for n, line, spelled in _repo_refs(text):
             if spelled == CANONICAL:
                 continue
             findings.append(f"{rel}:{n}: names the repository {spelled!r}, "
                             f"which is now {CANONICAL!r} -- {line.strip()[:90]}")
+    # Apply the waiver AFTER the scan, on the exact bytes it was written for.
+    if waived_md5 is not None and readme_text is not None:
+        import hashlib
+        if hashlib.md5(readme_text.encode("utf-8")).hexdigest() == waived_md5:
+            moved = [f for f in findings if f.startswith("README.md:")]
+            if moved:
+                findings = [f for f in findings if f not in moved]
+                waived.append("[WAIVED] README.md:1 -- " + WAIVERS["README.md:1"])
+        else:
+            findings.append(
+                "WAIVER IS STALE -- README.md is not the text the waiver in "
+                "namecheck.py was written against (it was fixed, or edited "
+                "for another reason). The waiver waives nothing now; delete "
+                "WAIVED_README_MD5 and re-measure before shipping.")
     if findings:
-        return "FAIL", findings
+        return "FAIL", findings + waived
     return "PASS", [f"{scanned} tracked doc(s) name the repository "
-                    f"{CANONICAL!r}"]
+                    f"{CANONICAL!r}"] + waived
 
 
 def run(root="."):
-    verdict, findings = evaluate(root)
+    # THE SHIPPED WAIVER IS THE ONLY ONE. Callers cannot widen it by passing
+    # a hash: a check whose exemption is a parameter of the call is a check
+    # that can be told what to ignore.
+    verdict, findings = evaluate(root, waived_md5=WAIVED_README_MD5)
     print("NAMECHECK:", verdict)
     for f in findings:
         print("  " + f)
@@ -187,9 +241,9 @@ def selftest():
     """
     arms = []
 
-    def arm(name, files, want, why=""):
+    def arm(name, files, want, waived_md5=None):
         d = _tree(files)
-        got, findings = evaluate(d)
+        got, findings = evaluate(d, waived_md5=waived_md5)
         arms.append((name, got == want, f"got {got}, want {want}"
                                         + (f" ({findings[0][:70]})" if findings else "")))
 
@@ -241,6 +295,34 @@ def selftest():
     arm("H a path inside the clone names the repo",
         {"docs/CLOUD-DEPLOYMENT.md":
          "  -v ~/docker-AI/ui/prompts/x.txt:/app/x.txt:ro \\\n"}, "FAIL")
+
+    # I: the waiver, bound to the exact bytes it was written for. The SAME
+    #    text with the waiver's md5 PASSES, and the reason is still printed.
+    STALE_H1 = "# docker-AI - a small town of Claude agents\n"
+    import hashlib
+    h = hashlib.md5(STALE_H1.encode("utf-8")).hexdigest()
+    arm("I the waived H1 passes and is still reported",
+        {"README.md": STALE_H1}, "PASS", waived_md5=h)
+    w_got = evaluate(_tree({"README.md": STALE_H1}), waived_md5=h)[1]
+    arms.append(("I2 the PASS still SAYS what it waived",
+                 any("[WAIVED] README.md:1" in f for f in w_got),
+                 " ".join(w_got)[:70]))
+    # J: the waiver must not outlive its reason. H1 fixed by its owner and the
+    #    old md5 still configured -> STALE, and this FAILS until the constant
+    #    is deleted. This is the arm that makes the waiver not a bypass.
+    arm("J a waiver whose site was fixed is STALE and fails",
+        {"README.md": "# Agent-Town - a small town of Claude agents\n"},
+        "FAIL", waived_md5=h)
+    # K: the shipped constant must match the README in THIS tree. If someone
+    #    edits README for any other reason, this arm reddens and the waiver
+    #    must be re-measured rather than silently carrying on.
+    arm("K the shipped waiver still matches this tree's README",
+        {"README.md": STALE_H1}, "PASS", waived_md5=h)
+    real = evaluate(os.path.dirname(os.path.abspath(__file__)) + "/..",
+                    waived_md5=WAIVED_README_MD5)
+    arms.append(("K2 the shipped md5 matches the real README",
+                 real[0] == "PASS" and any("[WAIVED]" in f for f in real[1]),
+                 f"got {real[0]}: {real[1][-1][:60] if real[1] else ''}"))
 
     ok = True
     for name, good, detail in arms:
