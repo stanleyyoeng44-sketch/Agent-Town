@@ -611,7 +611,17 @@ def selftest():
     if store_note:
         shutil.rmtree(store, ignore_errors=True)
     print("selftest:", "PASS" if ok else "FAILED")
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    # A FIXTURE RUN IS "CANNOT MEASURE", NOT "PASS". The arms above passed,
+    # but they passed against a stand-in: nothing was said about the live
+    # store. Exit 2 is this repo's existing convention for exactly that
+    # (tools/check.py: exit2-is-warn), and the note is printed either way, so
+    # a reader still sees WHY. Without this, every store condition exits 0
+    # and the gate cannot tell "measured the live store" from "measured three
+    # claims I made up" -- measured: 8 unusable live claims -> check.py
+    # PASS/WARN with the word FIXTURE appearing zero times in its output.
+    return 2 if store_note else 0
 
 
 README_START = "<!-- STATS:START -->"
