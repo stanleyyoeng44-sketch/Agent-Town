@@ -177,18 +177,25 @@ def authorise_sender(sender, headers):
     # by him: on this bank, X-Bank-Token -> 200 and X-Bank-Sender-Token -> 403.
     # He made HIS bank accept both; doing the same here makes landing order
     # stop mattering. A header name is not a security boundary; the secret is.
-    presented = (headers.get("X-Bank-Token", "")
-                 or headers.get("X-Bank-Sender-Token", "")
-                 or "")
+    #
+    # DEFECT FOUND BY agent-6 (2026-10-19 03:4xZ), and he was right: this used
+    # to be `X-Bank-Token or X-Bank-Sender-Token`, which accepts either ONE by
+    # PRECEDENCE. A compat client that sends BOTH -- exactly the client this
+    # was built for, one that does not know which name the server wants -- was
+    # then judged only on X-Bank-Token. Measured on the pre-fix file:
+    #   wrong X-Bank-Token + CORRECT X-Bank-Sender-Token -> 403  (lockout)
+    #   correct X-Bank-Token + wrong X-Bank-Sender-Token -> 200
+    # The feature failed for the population it existed to serve. ANY header
+    # carrying a correct secret authorises; none carrying a wrong one decides
+    # against a correct one. Every value is checked, none is short-circuited.
+    presented_all = [headers.get("X-Bank-Token", ""),
+                     headers.get("X-Bank-Sender-Token", "")]
     if sender == LEGACY_TOKEN_AGENT:
-        presented_legacy = (headers.get("X-Agent0-Token", "") or "")
-    else:
-        presented_legacy = ""
+        presented_all.append(headers.get("X-Agent0-Token", ""))
     for expected in candidates:
-        if presented and _digest_eq(presented, expected):
-            return None
-        if presented_legacy and _digest_eq(presented_legacy, expected):
-            return None
+        for presented in presented_all:
+            if presented and _digest_eq(presented, expected):
+                return None
     return (403, {"error": "transfer forbidden", "sender": sender})
 
 
@@ -357,7 +364,13 @@ class Handler(BaseHTTPRequestHandler):
                     expected = f.read().strip()
             except OSError:
                 return self._send(503, {"error": "admin token unavailable"})
-            if not expected or not hmac.compare_digest(
+            # Use _digest_eq, not hmac.compare_digest(str, str). agent-6's
+            # defect 2: this was an inline copy of the compare that C6 fixed
+            # 245 lines above, and it kept the bug -- a non-ASCII admin token
+            # produced a TypeError and a dropped connection instead of a 403.
+            # One fixed callee, two call sites, and the call site that was not
+            # migrated is the one nobody re-measured. A crash is not a decision.
+            if not expected or not _digest_eq(
                     self.headers.get("X-Bank-Admin-Token", ""), expected):
                 return self._send(403, {"error": "forbidden"})
         try:

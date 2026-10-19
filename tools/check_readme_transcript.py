@@ -55,13 +55,23 @@ def free_port():
     return p
 
 
-def http(port, method, path, body=None, timeout=5):
+def http(port, method, path, body=None, timeout=5, headers=None):
     """stdlib only: the repo has no requests dependency and neither will this."""
     import urllib.request
     import urllib.error
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
                                  data=data, method=method)
+    # The bank authenticates every sender, so replaying a README transfer
+    # means presenting the demo credential for its `from` -- the same way a
+    # real client would. Reads need no credential.
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    elif isinstance(body, dict) and "from" in body:
+        # The harness's own control transfer, which the README never quotes.
+        req.add_header("X-Bank-Sender-Token",
+                       "replay-" + str(body["from"]) + "-secret")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
@@ -129,8 +139,19 @@ def replay(root, readme_text, verbose=False):
     # the README transcript never mentions. Top-up needs the admin token,
     # which this harness does not mount -- seeding is the operator act that
     # is available here and needs no token.
+    # ALSO mount a credential for agent-9: the bank authenticates EVERY sender
+    # now, so without it the control transfer below answers 503 and this whole
+    # check reports "the bank in this tree is broken". agent-10 measured that
+    # on the branch; it is true on a bank that is CORRECT. A replay harness is
+    # a CLIENT, and every client of a per-sender bank needs its own secret.
+    # Temp dir, temp value -- nothing here is a real secret.
+    tokens = os.path.join(os.path.dirname(ledger), "bank-tokens")
+    os.makedirs(tokens, exist_ok=True)
+    control_secret = "replay-agent-9-secret"
+    with open(os.path.join(tokens, "agent-9"), "w", encoding="utf-8") as f:
+        f.write(control_secret + "\n")
     env = dict(os.environ, SEED="agent-2:1000,agent-9:100", DECAY_SECONDS="1",
-               PORT=str(port), DATA=ledger)
+               PORT=str(port), DATA=ledger, BANK_TOKEN_DIR=tokens)
     # The bank binds the port from its own argv/env; read the source to find
     # which, rather than assuming.
     src = open(os.path.join(root, "bank/bank.py"), encoding="utf-8").read()
@@ -180,6 +201,27 @@ def replay(root, readme_text, verbose=False):
                 # The launch line. It is replayed by this script starting the
                 # bank; there is no response to compare.
                 continue
+            if cmd.startswith("mkdir ") or "printf " in cmd:
+                # The README's credential-setup line. Replay it FOR REAL into
+                # this harness's own token dir: a transcript that claims a
+                # credential exists must not be replayed against one that
+                # does not, or the transfer below would fail for a reason
+                # unrelated to the README. The values are parsed out of the
+                # quoted text, so a README that provisions a DIFFERENT secret
+                # than it presents is caught by the transfer refusing.
+                for m in re.finditer(r"printf '([^']*)'\s*>\s*(\S+)", cmd):
+                    secret, target = m.group(1), m.group(2)
+                    # printf INTERPRETS escapes; the README writes
+                    # 'demo-secret\n'. Writing the literal backslash-n would
+                    # store a different secret than the one the next line
+                    # presents, and the replay would 403 for a reason that is
+                    # this harness's, not the README's.
+                    secret = secret.replace("\\n", "\n").replace("\\t", "\t")
+                    name = os.path.basename(target.rstrip("/"))
+                    with open(os.path.join(tokens, name), "w",
+                              encoding="utf-8") as f:
+                        f.write(secret)
+                continue
             if cmd.startswith("cat "):
                 # The ledger file. Compare only the keys the README can
                 # reproduce, and require the README to mark the rest.
@@ -203,10 +245,21 @@ def replay(root, readme_text, verbose=False):
                         fails.append(f"{cmd}: README says {k}={v!r}, "
                                      f"bank has {k}={got!r}")
                 continue
-            m = re.search(r"-X POST -d '(.*?)' localhost:\d+(/\S+)", cmd)
+            m = re.search(
+                r"-X POST(?: -H '([^']*)')? -d '(.*?)' localhost:\d+(/\S+)",
+                cmd)
             if m:
-                body = json.loads(m.group(1))
-                got = http(port, "POST", m.group(2), body)
+                hdr = m.group(1)
+                body = json.loads(m.group(2))
+                # Present EXACTLY the header the README shows. If the README
+                # quotes a credential header, replay it; if it quotes none,
+                # send none -- so a README that forgets the header fails here
+                # rather than being quietly rescued by this harness.
+                headers = {}
+                if hdr:
+                    k, _, v = hdr.partition(":")
+                    headers[k.strip()] = v.strip()
+                got = http(port, "POST", m.group(3), body, headers=headers)
                 if quoted != got:
                     # A field whose value is (1000 - ticks) is a claim about
                     # wall-clock, not about the code. Compare every field

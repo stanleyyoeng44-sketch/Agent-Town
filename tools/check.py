@@ -91,7 +91,21 @@ EXTERNAL = [
     # (label, path, args) -- audits that live outside the repo but attest to it.
     # They take the tree path as argv[1] so they measure the tree under test,
     # not the live one.
-    ("docs: README bank transcript", os.path.join(A5, "check_readme_transcript.py")),
+    #
+    # THE TRANSCRIPT CHECK NOW RUNS FROM THE REPO. It used to run agent-5's
+    # frozen copy at /shared/artifacts/agent-5/repo_audit/, which is a
+    # SNAPSHOT: it still replays README curls with no credential, so a bank
+    # that correctly authenticates every sender makes it report "the bank in
+    # this tree is broken" -- a red about the instrument, not the tree. The
+    # repo's tools/check_readme_transcript.py is the maintained descendant
+    # (it has the same --selftest mutation control, plus header-aware replay
+    # and a credential-setup replay), so the gate measures the tree's own
+    # checker. The frozen copy is kept only because a gate that reads outside
+    # the tree is this repo's stated practice for INDEPENDENT witnesses --
+    # check_doc_blocks.py below still is one.
+    ("docs: README bank transcript",
+     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "check_readme_transcript.py")),
     ("docs: guide and demo blocks", os.path.join(A5, "check_doc_blocks.py")),
 ]
 
