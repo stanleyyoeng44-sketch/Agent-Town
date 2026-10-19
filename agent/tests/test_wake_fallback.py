@@ -71,18 +71,19 @@ class Sandbox:
         os.makedirs(self.self_dir)
         os.makedirs(self.art_self)
 
-    def write(self, where, body):
-        path = {"self": os.path.join(self.self_dir, "wake.md"),
+    def _path(self, where):
+        return {"self": os.path.join(self.self_dir, "wake.md"),
                 "root": os.path.join(self.art_root, "wake.md"),
                 "art_self": os.path.join(self.art_self, "wake.md")}[where]
+
+    def write(self, where, body):
+        path = self._path(where)
         with open(path, "w") as f:
             f.write(body)
         return path
 
     def remove(self, where):
-        path = {"self": os.path.join(self.self_dir, "wake.md"),
-                "root": os.path.join(self.art_root, "wake.md"),
-                "art_self": os.path.join(self.art_self, "wake.md")}[where]
+        path = self._path(where)
         if os.path.exists(path):
             os.remove(path)
 
@@ -90,6 +91,21 @@ class Sandbox:
         mod.WAKE_FILE = os.path.join(self.self_dir, "wake.md")
         mod.ARTIFACT_FALLBACK_DIRS = (self.art_root, self.art_self)
         return mod
+
+    def note_count(self):
+        """How many note files exist anywhere in the sandbox.
+
+        EXISTS BECAUSE A REVERTED ARM A IS OTHERWISE CAUGHT ONLY BY LUCK.
+        agent-8 measured it: put the broken two-write form back and the
+        standalone suite reds about 1 run in 40, while the whole gate reds at
+        the same rate -- because that IS the flake rate. So "the flake is
+        fixed" and "a reverted fix is caught" are different claims, and the
+        gate can only make the second true deterministically if something
+        asserts the STRUCTURE rather than the outcome.
+        A count cannot flake: it does not depend on mtime ordering at all.
+        """
+        return sum(1 for where in ("self", "root", "art_self")
+                   if os.path.exists(self._path(where)))
 
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -142,6 +158,15 @@ def run_arms(mod):
         got = mod.read_wake_prompt()
         results.append(check("A  SELF_DIR note returned verbatim",
                              got == "NOTE-AT-SELF", repr(got)))
+        # A2 -- A WRITES EXACTLY ONE NOTE. THE DETERMINISTIC HALF OF A.
+        # agent-8 measured that reverting A to the old two-write form reds the
+        # suite only about 1 run in 40 -- the same rate as the flake -- so
+        # "A passes" cannot tell you whether the fix is present. A COUNT can:
+        # it does not depend on mtime ordering at all, so it cannot flake, and
+        # it reds on every run if the second write comes back.
+        results.append(check("A2 A  the arm wrote exactly ONE note (no race to lose)",
+                             sb.note_count() == 1,
+                             "%d note(s) in the sandbox" % sb.note_count()))
 
         # D -- both present, different, SELF_DIR NEWER -> SELF_DIR wins.
         # The rule is newest-mtime, not path order: agent-7's box had the
