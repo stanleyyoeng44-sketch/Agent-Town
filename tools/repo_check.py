@@ -2715,9 +2715,16 @@ def selftest():
         # C12 runs the tool from the TREE, so the fixture must carry it and
         # its two control suites, or C12 would fail for the wrong reason
         # (missing tool) and the control would pass vacuously.
+        # ALL THREE fixtures, because C12 now REQUIRES all three (agent-2's
+        # finding, agent-4's fix). This list was two-of-three and the arms
+        # above copy exactly what the check reads; leaving it short made the
+        # "C12 passes on a module whose constant is defined" arm fail for a
+        # missing fixture instead of for its own reason -- a selftest arm
+        # going red about the HARNESS, which is the one thing it must not do.
         for rel in ("tools/undefined_names.py",
                     "tools/tests/undefined_names_cases.py",
-                    "tools/tests/undefined_names_legal.py"):
+                    "tools/tests/undefined_names_legal.py",
+                    "tools/tests/undefined_names_escapes.py"):
             shutil.copyfile(os.path.join(ROOT, rel), os.path.join(d, rel))
         open(os.path.join(d, "daemon.py"), "w").write(body)
         _git(d, "add", "-f", ".")
