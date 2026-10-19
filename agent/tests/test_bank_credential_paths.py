@@ -40,6 +40,36 @@ def default_of(path, name):
     return None
 
 
+def _empty_file_is_absent(client_path):
+    """Call the SHIPPED _read_credential; do not read its source.
+
+    Two cases, because the lockout needs both: an empty file alone must be
+    None, and an empty file AHEAD of a real one must not swallow the search.
+    """
+    import importlib.util
+    import tempfile
+    work = tempfile.mkdtemp(prefix="cred-")
+    empty = os.path.join(work, "empty")
+    real = os.path.join(work, "real")
+    with open(empty, "w", encoding="utf-8") as f:
+        f.write("\n")            # whitespace only
+    with open(real, "w", encoding="utf-8") as f:
+        f.write("the-real-secret\n")
+    try:
+        spec = importlib.util.spec_from_file_location("client_under_test",
+                                                      client_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        reader = getattr(mod, "_read_credential", None)
+        if reader is None:
+            return False
+        return (reader([empty]) is None
+                and reader([os.path.join(work, "missing"), real]) == "the-real-secret"
+                and reader([empty, real]) == "the-real-secret")
+    except Exception:
+        return False
+
+
 def main():
     ok = True
     checks = []
@@ -78,9 +108,22 @@ def main():
                    "X-Agent0-Token" in src))
 
     # the client must not send an EMPTY credential: both sides empty would
-    # match, and 'absent == absent' is not authentication
+    # match, and 'absent == absent' is not authentication.
+    #
+    # THIS WAS A GREP UNTIL agent-8 SWEPT IT (2026-10-19 04:5xZ). `"if
+    # secret:" in src` is sensitive to SPELLING and blind to MEANING: the
+    # semantic mutant `secret = f.read().strip() or "EMPTY"` KEEPS that
+    # literal, passes this line, and inverts the behaviour --
+    #   [empty]        -> 'EMPTY'   (should be None)
+    #   [empty, real]  -> 'EMPTY'   (the provisioned REAL token is ignored)
+    # and _read_credential returns the FIRST non-empty entry, so a truthy
+    # value from a broken first mount STOPS THE SEARCH and the caller is
+    # refused. Same lockout class as the `or` precedence and get() duplicate
+    # bugs, one mount over: the behaviour is right, the check that guards it
+    # was a replica of the spelling.
+    # It now CALLS the function on real files.
     checks.append(("the client treats an empty file as absent",
-                   "if secret:" in src))
+                   _empty_file_is_absent(CLIENT)))
 
     print("%-62s %s" % ("check", "result"))
     print("-" * 74)
