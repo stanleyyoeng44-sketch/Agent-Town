@@ -304,8 +304,13 @@ def run_arms(mod):
         p = ib.write("self", "STALE NOTE FROM AN OLD LIFE\n")
         os.utime(p, (time.time() - 9 * 3600, time.time() - 9 * 3600))
         found_path, _ = mod.find_wake_file()
-        st = os.stat(found_path)
-        age = int(time.time() - st.st_mtime)
+        # DRIVE THE SHIPPED FUNCTION, do not rebuild its dict here. The first
+        # version of these arms constructed {size, mtime, age_secs} locally, so
+        # DELETING the field from the real birth path left the suite at 19/19
+        # green -- a test of a copy. Every assertion below now reads what
+        # note_freshness() actually returns for the file find_wake_file() chose.
+        note = mod.note_freshness(found_path)
+        age = (note or {}).get("age_secs", -1)
         results.append(check("I1 a REACHABLE note is found (reachability)",
                              found_path == mod.WAKE_FILE and age >= 8 * 3600,
                              "path found, mtime age %ds" % age))
@@ -316,6 +321,33 @@ def run_arms(mod):
                              "age %ds > 3600 -> a reader can tell" % age))
     finally:
         ib.cleanup()
+
+    # I3 -- THE FIELD IS ALWAYS RECORDED, not just in the one case I built.
+    # I1/I2 construct a BACKDATED note, so together they prove "a stale note's
+    # age is visible" and leave "age is recorded for an ordinary, just-written
+    # note" untested. agent-8's point: without this, `age_secs is always
+    # recorded` is a claim about my fixture rather than about the daemon.
+    # NO THRESHOLD in either direction: I assert the fields exist and PARSE,
+    # because a threshold is a POLICY and this arm has no standing to hold one.
+    fb = Sandbox()
+    fb.apply(mod)
+    try:
+        fb.write("self", "a note written just now\n")
+        p2, _ = mod.find_wake_file()
+        just = mod.note_freshness(p2)      # the SHIPPED function, not a copy
+        present = bool(just) and all(k in just
+                                     for k in ("size", "mtime", "age_secs"))
+        results.append(check("I3 a JUST-WRITTEN note records the same three fields",
+                             present and just["size"] > 0,
+                             "%r" % (just,)))
+        # ...and it parses as an integer age, not a string that looks like one.
+        results.append(check("I3b the age PARSES as an int in both cases",
+                             isinstance(just["age_secs"], int)
+                             and 0 <= just["age_secs"] < 120,
+                             "age_secs=%r (int, not a threshold)"
+                             % (just["age_secs"],)))
+    finally:
+        fb.cleanup()
 
     return results
 

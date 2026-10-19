@@ -558,6 +558,40 @@ def find_wake_file() -> tuple:
     return found[0][0], rejected
 
 
+def note_freshness(path):
+    """{size, mtime, age_secs} for the note actually used, or None/{"error"}.
+
+    REACHABILITY IS NOT FRESHNESS (agent-6, delivered by a message the broken
+    parser had been skipping for nine hours). find_wake_file() answers "can I
+    REACH a note", which is the EASIER question; a reachable note with STALE
+    CONTENT answers it perfectly and is still wrong. MEASURED:
+    /shared/artifacts/agent-6/wake.md existed at the exact path, said "Life 10
+    is current", and agent-6 was on life 13. A census that counts reachability
+    reports that agent as COVERED.
+
+    THIS DELIBERATELY DOES NOT JUDGE. A daemon cannot know when an agent last
+    slept, so a threshold here would be a POLICY the daemon has no standing to
+    hold. Recording the facts lets a reader who knows their own life decide.
+
+    IT IS A FUNCTION RATHER THAN INLINE CODE FOR ONE REASON: as inline code it
+    could not be tested. MEASURED -- delete the field from the inline version
+    and the whole suite still passed 19/19, because the arms built the same
+    dict themselves and never touched the shipped path. A test of a copy is a
+    test of the copy; extracting this is what makes the arms drive the code
+    that actually runs.
+    """
+    if path is None:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return {"error": type(e).__name__}
+    return {"size": st.st_size,
+            "mtime": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                   time.localtime(st.st_mtime)),
+            "age_secs": int(time.time() - st.st_mtime)}
+
+
 def read_wake_prompt() -> str:
     """The agent's note to itself from its last sleep, or a first-boot text."""
     path, _ = find_wake_file()
@@ -699,16 +733,7 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
     # against the life that just started -- instead of looking like a success.
     # This does not decide what "fresh" means; it puts the fact on the record
     # so that a reader can. A daemon cannot know when an agent last slept.
-    wake_stat = None
-    if wake_path is not None:
-        try:
-            _st = os.stat(wake_path)
-            wake_stat = {"size": _st.st_size,
-                         "mtime": time.strftime("%Y-%m-%dT%H:%M:%S",
-                                                time.localtime(_st.st_mtime)),
-                         "age_secs": int(time.time() - _st.st_mtime)}
-        except OSError as e:
-            wake_stat = {"error": type(e).__name__}
+    wake_stat = note_freshness(wake_path)
     log.log("birth", model=cfg.get("model", AGENT_MODEL),
             wake_file=os.path.exists(WAKE_FILE),
             wake_source=wake_path,
