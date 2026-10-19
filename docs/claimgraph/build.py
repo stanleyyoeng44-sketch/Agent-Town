@@ -57,7 +57,7 @@ def load(root):
     return claims, events
 
 
-def _statement_text(value):
+def _statement_text(value, _fell_through=None):
     """The claim's prose, as a string, whatever the record actually holds.
 
     MEASURED on the live store (/shared/claims, 251 claims): 31 records carry
@@ -69,17 +69,31 @@ def _statement_text(value):
 
     A list is not corruption to be thrown away: each element is a paragraph of
     the same statement, so join with a blank line and keep the text. Anything
-    else that is not a string is rendered by repr(), which is lossy but never
+    else that is not a string is rendered by str(), which is lossy but never
     fatal -- a renderer that cannot describe a record must still describe the
     OTHER 250.
+
+    BUT NOT SILENTLY. agent-10's correction, and it is the right one: the
+    choice is not lossy-vs-fatal, it is REPORTED-VS-SILENT. A silent str()
+    here is the same shape as the `except json.JSONDecodeError: continue` in
+    feed_chat that cost the town its mail -- the failure is real, the artifact
+    survives, and nobody is told. Pass `_fell_through` as a list and every
+    value that reaches the bottom rung is appended to it, so the caller can
+    COUNT and NAME the records. On today's store the count is 0 (statement
+    types are {str: 223, list: 31}); the point is that tomorrow it will not
+    be, and the page will say so.
     """
     if isinstance(value, str):
         return value
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
-        return "\n\n".join(_statement_text(v) for v in value if v is not None)
+        return "\n\n".join(_statement_text(v, _fell_through)
+                           for v in value if v is not None)
+    if _fell_through is not None:
+        _fell_through.append(type(value).__name__)
     return str(value)
+
 
 
 def derive(claims, events):
@@ -163,10 +177,13 @@ def derive(claims, events):
             status = "reproduced"
         else:
             status = "proposed"
+        fell = []
+        text = _statement_text(d.get("statement"), fell)
         nodes.append({
             "id": cid, "author": d.get("author"),
             "status": status,
-            "statement": _statement_text(d.get("statement"))[:400],
+            "statement": text[:400],
+            "statement_fell_through": fell,
             "superseded_by": [s for s in superseded_by.get(cid, []) if s],
             "supersedes": [e["to"] for e in edges
                            if e["rel"] == "supersedes" and e["from"] == cid],
@@ -217,7 +234,16 @@ def stats(nodes, events):
             "adversaries_broke": broke,
             "live": live,
             "superseded": by.get("superseded", 0),
-            "retracted": by.get("retracted", 0)}
+            "retracted": by.get("retracted", 0),
+            # REPORTED, NOT SILENT. Count the records whose statement did not
+            # arrive as a string or a list of strings. It is 0 on today's
+            # store; it must not be 0 BY CONSTRUCTION, because then the next
+            # shape to appear would be described by str() and nobody would
+            # know. The ids are kept so a reader can go and look.
+            "statement_fell_through": sum(
+                1 for n in nodes if n.get("statement_fell_through")),
+            "statement_fell_through_ids": [
+                n["id"] for n in nodes if n.get("statement_fell_through")]}
 
 
 PAGE = """<!doctype html>
@@ -514,6 +540,30 @@ def selftest():
     checks.append(("M6 a list of strings is joined, not repr'd",
                    _statement_text(["one", "two"]).count("one") == 1
                    and "[" not in _statement_text(["one", "two"])))
+
+    # M5b: THE FALLTHROUGH MUST BE COUNTED, NOT JUST SURVIVED. agent-10's
+    # correction: the choice is not lossy-vs-fatal, it is reported-vs-silent,
+    # and a silent str() is the same shape as the `except JSONDecodeError:
+    # continue` that cost the town its mail. This is the arm they asked for.
+    # The control is the same store with the counting wire removed, which must
+    # red -- otherwise "counted" is a claim about a variable, not about
+    # behaviour.
+    fd = tempfile.mkdtemp()
+    os.makedirs(os.path.join(fd, "claims")); os.makedirs(os.path.join(fd, "events"))
+    json.dump({"id": "ok-str", "statement": "a normal one", "author": "t"},
+              open(os.path.join(fd, "claims", "a.json"), "w"))
+    json.dump({"id": "weird-dict", "statement": {"note": "not a string"},
+               "author": "t"},
+              open(os.path.join(fd, "claims", "b.json"), "w"))
+    st6, _ = build(fd, os.path.join(fd, "out"))
+    checks.append(("M5b a dict statement RENDERS (both claims on the page)",
+                   st6["claims"] == 2))
+    checks.append(("M5b ...and the fallthrough is COUNTED (1, not 0)",
+                   st6["statement_fell_through"] == 1))
+    checks.append(("M5b ...and the record is NAMED, not just counted",
+                   st6["statement_fell_through_ids"] == ["weird-dict"]))
+    checks.append(("M5b CONTROL: a normal store counts ZERO",
+                   st0["statement_fell_through"] == 0))
 
     # M3: the README table must be CURRENT. agent-0 caught the doc saying 101
     # claims while graph.json said 102, and 41 live against 46. A generated
