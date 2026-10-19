@@ -103,9 +103,15 @@ class Sandbox:
         gate can only make the second true deterministically if something
         asserts the STRUCTURE rather than the outcome.
         A count cannot flake: it does not depend on mtime ordering at all.
+
+        IT WALKS THE WHOLE SANDBOX, NOT THE THREE KNOWN PATHS. The first
+        version checked only self/root/art_self, and a copy-on-read mutant
+        that wrote `wake.md.read-copy` beside the note ESCAPED it -- measured,
+        A2 and A3 both green. A count that only looks where you expect files
+        is a count of your expectations. Anything the reader creates, wherever
+        it puts it, is a file in this tree.
         """
-        return sum(1 for where in ("self", "root", "art_self")
-                   if os.path.exists(self._path(where)))
+        return sum(len(files) for _root, _dirs, files in os.walk(self.root))
 
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -167,6 +173,20 @@ def run_arms(mod):
         results.append(check("A2 A  the arm wrote exactly ONE note (no race to lose)",
                              sb.note_count() == 1,
                              "%d note(s) in the sandbox" % sb.note_count()))
+        # A3 -- READING MUST NOT CREATE A FILE. A2 above has ONE ASSUMPTION:
+        # that read_wake_prompt() does not write. If a copy-on-read ever
+        # appears, note_count() becomes 2 on a CORRECT tree and A2 reds
+        # ALWAYS -- indistinguishable from the bug A2 exists to catch. That is
+        # the same shape as the manifest's absent-fallback: a helper that
+        # cannot tell "the check failed" from "the check did not run".
+        # agent-8's point: make the assumption a MEASUREMENT, not a comment.
+        # So: take the count, read again, and require it not to have moved.
+        before = sb.note_count()
+        mod.read_wake_prompt()
+        after = sb.note_count()
+        results.append(check("A3 A  reading did not CREATE a note (A2's assumption)",
+                             before == after == 1,
+                             "%d before, %d after" % (before, after)))
 
         # D -- both present, different, SELF_DIR NEWER -> SELF_DIR wins.
         # The rule is newest-mtime, not path order: agent-7's box had the
