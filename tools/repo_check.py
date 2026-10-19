@@ -23,6 +23,8 @@ CHECKS
     C14 check registry     every c<N>_ check defined here is in CHECKS, so a
                            merge that drops one list entry cannot turn a check
                            off silently (nothing else reads the registry)
+    C21 docs name the repo every tracked doc spells the repository the way
+                           github.com serves it (tools/namecheck.py)
 
 Each check returns (name, ok, [findings]). `--selftest` runs a NEGATIVE
 CONTROL per check: it builds a deliberately bad tree and asserts the check
@@ -1786,12 +1788,151 @@ def c16_tokencheck(root):
                      blocks=(r"all (\d+) bank block", _bank_blocks))
 
 
+def c21_repo_name(root):
+    """Every tracked doc must name the repository as github.com serves it.
+
+    MEASURED 2026-10-19 on 7cc6c37: the repo was renamed docker-AI ->
+    Agent-Town and the tree did not notice. `git grep -in agent-town` returns
+    ZERO lines; eleven references across five docs still spelled the old name,
+    and docs/guide.md's [verified] clone block ended with a `cd` into a
+    directory the canonical URL does not create (exit 1, measured). It works
+    today only because the docs use the legacy URL and GitHub still redirects.
+
+    NO EXISTING CHECK SEES THIS: nothing in tools/ references the repo name or
+    the README H1, and C5 skips `git clone` as neither RUNNABLE nor
+    ENV_LIMITED, so the following `cd` is never executed either.
+
+    The predicate lives in tools/namecheck.py so its arms travel with it; this
+    is the registration, and C14 is what keeps a registration from vanishing.
+    """
+    path = os.path.join(root, "tools", "namecheck.py")
+    if not os.path.isfile(path):
+        return "C21 docs name the repo", "FAIL", [
+            "tools/namecheck.py is referenced by CHECKS but missing"]
+    r = subprocess.run([sys.executable, "-I", path, root], cwd=root,
+                       capture_output=True, text=True, timeout=120)
+    out = [ln for ln in (r.stdout or "").strip().splitlines() if ln.strip()]
+    if r.returncode == 0:
+        return "C21 docs name the repo", "PASS", out[-1:]
+    if r.returncode == 2:
+        return "C21 docs name the repo", "WARN", [
+            "cannot measure here: " + (out[-1] if out else "(no output)")]
+    return "C21 docs name the repo", "FAIL", out[:12]
+
+
+def _registered_check_names(src):
+    """Names in the CHECKS literal of one source string, or None if unparsed.
+
+    Reuses C14's reading of the three legal spellings (plain, annotated,
+    concatenated) by going through the same ast walk C14 uses, so this check
+    cannot disagree with the registry about what is registered.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    names = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "CHECKS"
+                   for t in targets):
+            continue
+        for part in _checks_list_parts(value):
+            if isinstance(part, ast.Name):
+                names.append(part.id)
+    return names
+
+
+def _checks_list_parts(value):
+    """Flatten `[...]`, `[...] + [...]`, and `CHECKS + [...]` into elements."""
+    if isinstance(value, ast.List):
+        return list(value.elts)
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        return _checks_list_parts(value.left) + _checks_list_parts(value.right)
+    if isinstance(value, ast.Name) and value.id == "CHECKS":
+        return []
+    return []
+
+
+def _duplicate_numbers(names):
+    """{number: [names]} for every number carried by more than one check."""
+    by_num = {}
+    for name in names:
+        m = re.match(r"c(\d+)_", name)
+        if not m:
+            continue
+        by_num.setdefault(int(m.group(1)), []).append(name)
+    return {n: v for n, v in by_num.items() if len(v) > 1}
+
+
+def c20_one_check_per_number(root):
+    """Two registered checks bearing the same C<n> number is a MERGE defect.
+
+    MEASURED 2026-10-19, by merging two branches that were each green:
+    agent-7's c17_ci_runs_the_suites and agent-2's c21_repo_name are both
+    numbered C17. Merged, the tree carries EIGHTEEN registered checks and
+    repo_check reports PASS (16 pass, 2 warn, 0 fail) while selftest is
+    74/74 and prints both rows:
+
+        [ok  ] C17 docs name the repo
+        [ok  ] C17 CI runs the test suites
+
+    Nothing was red. C14, the check whose whole job is registration, compares
+    NAMES and is structurally blind to this: two names, one number, both
+    registered. A number is how a check is referred to in prose, in the
+    commit log and on the board, so two checks sharing one is the registry
+    defect one level up from the one C14 catches.
+
+    WHY THE NUMBER COMES FROM THE FUNCTION NAME, statically: the first
+    version of this check CALLED every registered check to read its label and
+    re-ran the whole suite (network probes, subprocesses) inside itself, and
+    because it was itself in CHECKS it recursed. A guard that runs its
+    siblings is a guard that inherits their cost and their failure modes.
+    The name is already the registry's key (C14 asserts name->CHECKS), so the
+    number parsed from `c<N>_` is the same object, without executing anything.
+
+    SCOPE: this asserts no two registered checks share a number. It does NOT
+    assert the numbers are contiguous or sorted -- C12 and C13 are registered
+    out of numeric order on master today, and a branch legitimately skips a
+    number another agent holds. It does not assert the LABEL matches the
+    name; that is a separate predicate and this one does not claim it.
+    """
+    path = os.path.join(root, "tools", "repo_check.py")
+    try:
+        with open(path) as fh:
+            src = fh.read()
+    except OSError as exc:
+        return "C20 one check per number", "WARN", [f"cannot read: {exc}"]
+    names = _registered_check_names(src)
+    if names is None:
+        return "C20 one check per number", "FAIL", [
+            "tools/repo_check.py does not parse -- the registry cannot be read"]
+    dupes = _duplicate_numbers(names)
+    if dupes:
+        findings = []
+        for num in sorted(dupes):
+            findings.append(
+                f"C{num} is used by {len(dupes[num])} checks: "
+                + ", ".join(sorted(dupes[num])))
+        return "C20 one check per number", "FAIL", findings
+    distinct = len({int(re.match(r"c(\d+)_", n).group(1))
+                    for n in names if re.match(r"c(\d+)_", n)})
+    return "C20 one check per number", "PASS", [
+        f"{len(names)} registered checks, {distinct} distinct numbers"]
+
+
 CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c4_gitignore, c5_doc_commands, c6_sources_parse, c7_sources_import,
           c8_readme_numbers, c9_readme_transcript,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
-          c15_portcheck, c16_tokencheck]
+          c15_portcheck, c16_tokencheck, c21_repo_name,
+          c20_one_check_per_number]
 
 
 def _is_git_tree(root):
@@ -2843,6 +2984,56 @@ def selftest():
         CHECKS[:] = _saved
     outcomes.append(("C14 self-guard passes on the restored list",
                      _self_guard() is True))
+
+    # C21: the rename gate, both directions, THROUGH the registered check.
+    # Asserting the OTHER verdict matters here: a c21_repo_name that returned
+    # FAIL unconditionally would pass a one-armed control.
+    outcomes.append(("C21 passes on this tree, whose docs name the repo",
+                     c21_repo_name(ROOT)[1] == "PASS"))
+    _rn = tempfile.mkdtemp(prefix="c21-")
+    try:
+        shutil.copytree(os.path.join(ROOT, "tools"), os.path.join(_rn, "tools"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        os.makedirs(os.path.join(_rn, "docs"))
+        with open(os.path.join(_rn, "docs", "guide.md"), "w") as _f:
+            _f.write("```bash\ngit clone https://github.com/o/docker-AI\n"
+                     "cd docker-AI\n```\n")
+        subprocess.run(["git", "-C", _rn, "init", "-q"], capture_output=True)
+        subprocess.run(["git", "-C", _rn, "add", "-A"], capture_output=True)
+        _st, _fd = c21_repo_name(_rn)[1:]
+        outcomes.append(("C21 catches a tracked doc naming the old repo",
+                         _st == "FAIL"
+                         and any("docker-AI" in f for f in _fd)))
+    finally:
+        shutil.rmtree(_rn, ignore_errors=True)
+
+    # C20: one check per number. Both directions, driven through the SAME
+    # parser and the SAME duplicate predicate the real check uses -- the
+    # first version mutated a COPY of this file with two string replaces and
+    # the anchor had moved, so the first replace was a no-op, the second
+    # still changed the text, the "mutant changed" assert passed, and the arm
+    # was red for a reason that had nothing to do with the number. Driving
+    # the pure functions removes the copy, the anchor and the assert.
+    outcomes.append(("C20 passes on a registry with distinct numbers",
+                     _duplicate_numbers(["c1_a", "c2_b", "c17_x"]) == {}))
+    outcomes.append(("C20 catches two checks sharing one number",
+                     _duplicate_numbers(["c17_x", "c17_y"]) ==
+                     {17: ["c17_x", "c17_y"]}))
+    # The registry has THREE legal spellings (C14 asserts all three). My
+    # first parser read only `CHECKS = [...]`; the annotated form returned []
+    # and this check would have reported PASS on a registry it never read. A
+    # parser gap is reported as a clean tree, so assert each spelling.
+    outcomes.append(("C20 reads an ANNOTATED CHECKS declaration",
+                     _registered_check_names(
+                         "CHECKS: list = [c1_a, c2_b]\n") == ["c1_a", "c2_b"]))
+    outcomes.append(("C20 reads both sides of CHECKS = [a] + [b]",
+                     _registered_check_names(
+                         "CHECKS = [c1_a] + [c2_b]\n") == ["c1_a", "c2_b"]))
+    outcomes.append(("C20 FAILs on unparseable source rather than passing",
+                     _registered_check_names("CHECKS = [\n") is None))
+    # And the end-to-end direction: the REAL registry on this tree is unique.
+    outcomes.append(("C20 passes on this tree's own CHECKS",
+                     c20_one_check_per_number(ROOT)[1] == "PASS"))
 
     bad = 0
     for label, passed in outcomes:

@@ -39,8 +39,8 @@ itself, and it cannot drift from what is running.
 ## 1. Rebuild the agent image from current master
 
 ```bash
-git clone https://github.com/stanleyyoeng44-sketch/docker-AI
-cd docker-AI
+git clone https://github.com/stanleyyoeng44-sketch/Agent-Town
+cd Agent-Town
 git log --oneline -1                    # note this commit; it is what you deploy
 docker build -t agent-glm ./agent
 ```

@@ -61,7 +61,7 @@ the whole build in ~8 min. Do not "simplify" the Dockerfile back to the
 upstream URLs from a CN-region host.
 
 ```bash
-cd docker-AI/agent && cp "../system prompt.md" system-prompt.md
+cd Agent-Town/agent && cp "../system prompt.md" system-prompt.md
 docker build -t agent-glm .
 cd ../bank && docker build -t agent-bank .
 ```
@@ -74,7 +74,7 @@ stack refuses to run without (`agent0-transfer-token`, `bank-admin-token`,
 credentials — never expose this beyond loopback/bridge):
 
 ```bash
-scp -r docker-AI <user>@<vm>:docker-AI            # the repo, any way you like
+scp -r Agent-Town <user>@<vm>:Agent-Town            # the repo, any way you like
 scp -r ~/proxy <user>@<vm>:proxy                 # cbproxyv4.py + creds.json
 ssh <user>@<vm> "mkdir -p ~/.config"
 scp -r ~/.config/docker-ai <user>@<vm>:~/.config/docker-ai
@@ -151,7 +151,7 @@ docker run -d --name agent-bank --restart unless-stopped \
   agent-bank
 
 # control UI
-cd ~/docker-AI/ui && setsid nohup python3 control.py > control.log 2>&1 < /dev/null &
+cd ~/Agent-Town/ui && setsid nohup python3 control.py > control.log 2>&1 < /dev/null &
 ```
 
 Two hard-won details:
@@ -197,7 +197,7 @@ for i in $(seq 1 10); do
     -v agent-workspace-agent-$i-transcripts:/workspace/transcripts \
     -v agent-workspace-agent-$i-claude:/workspace/.claude \
     -e CLAUDE_CONFIG_DIR=/workspace/.claude \
-    -v ~/docker-AI/ui/prompts/agent-$i/system-prompt.txt:/app/system-prompt.txt:ro \
+    -v ~/Agent-Town/ui/prompts/agent-$i/system-prompt.txt:/app/system-prompt.txt:ro \
     agent-glm
 done
 # agent-0 additionally mounts its transfer token:
@@ -210,7 +210,7 @@ docker run -d --name agent-0 --restart unless-stopped \
   -v agent-workspace-agent-0-transcripts:/workspace/transcripts \
   -v agent-workspace-agent-0-claude:/workspace/.claude \
   -e CLAUDE_CONFIG_DIR=/workspace/.claude \
-  -v ~/docker-AI/ui/prompts/agent-0/system-prompt.txt:/app/system-prompt.txt:ro \
+  -v ~/Agent-Town/ui/prompts/agent-0/system-prompt.txt:/app/system-prompt.txt:ro \
   -v ~/.config/docker-ai/agent0-transfer-token:/app/agent0-transfer-token:ro \
   agent-glm
 ```
