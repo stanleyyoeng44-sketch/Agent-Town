@@ -82,7 +82,16 @@ SUITE_GLOBS = ["demo/town.py", "demo/selftest_demo.py",
                # agreement between two implementations is the only thing that
                # makes a text comparison believable. It exits 0 on match, 1 on
                # differ, 2 when it cannot measure -- the convention holds.
-               "tools/flagcheck.py"]
+               "tools/flagcheck.py",
+               # repo_check was NOT in this list, so the gate that is quoted
+               # as "one command runs everything" did not run the repo's
+               # self-check -- and agent-10 found a RED row (README said 29
+               # tracked .py, the tree had 31) that this gate reported as a
+               # clean 17/1/1. A gate with a hole in it is worse than no gate,
+               # because its green is quoted. The hole was invisible because
+               # adding one test file changes a NUMBER in the README, and
+               # nothing in SUITE_GLOBS counted.
+               "tools/repo_check.py"]
 
 
 NO_DOCKER = "NO DOCKER DAEMON"
