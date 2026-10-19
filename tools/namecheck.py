@@ -92,11 +92,26 @@ WAIVERS = {
                    "owner's own self-description not be rewritten, so this "
                    "is a question for Stanley, not an agent edit",
 }
-# The md5 of README.md as this waiver was written. If README changes, the
-# waiver is stale and this check says so instead of continuing to hide the
-# line. Computed, not typed: see the selftest's arm K, which fails if this
-# constant does not match the README in the tree.
-WAIVED_README_MD5 = "3fb8475905b7a5a4e3f4cd5c8db645c0"
+# The md5 of the ONE LINE this waiver covers, not of the whole README.
+#
+# It used to be the md5 of README.md. That binding was right about the thing
+# it was defending -- a waiver must not outlive its text -- and wrong about
+# its SCOPE, and the wrongness cost a merge: any commit that edited ANY
+# other line of the README (changing the module count, fixing a typo, adding
+# a row) made this waiver stale and turned the gate red on a line the author
+# never touched. MEASURED on the merge of the C8 count change, which is a
+# correct edit to a different line: namecheck FAILED with "WAIVER IS STALE".
+# A waiver bound to a whole file is a claim about a line that taxes every
+# other author of the file, which is the same defect as stating a tree-wide
+# count in prose.
+#
+# So: bind to the exact H1 bytes. Editing the H1 still retires the waiver
+# (the property that mattered); editing line 330 no longer does. Computed,
+# not typed: arm K checks it against the real README in the tree.
+WAIVED_LINE = "# docker-AI — a small town of Claude agents in Docker"
+# md5 of the line WITHOUT its trailing newline, so a CRLF/editor change to
+# the rest of the file cannot retire a waiver about this text.
+WAIVED_LINE_MD5 = "d0f72fa46687225745d182ba71cefa02"
 
 
 def _tracked_docs(root):
@@ -153,7 +168,7 @@ def _repo_refs(text):
     return refs
 
 
-def evaluate(root=".", waived_md5=None):
+def evaluate(root=".", waived_md5=None, waived_line_md5=None):
     """Return (verdict, findings). verdict in PASS/FAIL/WARN.
 
     Findings carry waived sites as [WAIVED] lines so a PASS still shows them.
@@ -188,7 +203,10 @@ def evaluate(root=".", waived_md5=None):
                 continue
             findings.append(f"{rel}:{n}: names the repository {spelled!r}, "
                             f"which is now {CANONICAL!r} -- {line.strip()[:90]}")
-    # Apply the waiver AFTER the scan, on the exact bytes it was written for.
+    # Apply the waiver AFTER the scan, bound to THE LINE it waives. A waiver
+    # for README.md:1 is a statement about line 1, so line 1 is what retires
+    # it -- not every other line of the file. `waived_md5` still exists for
+    # the selftest's whole-file arms; `waived_line_md5` is what run() ships.
     if waived_md5 is not None and readme_text is not None:
         import hashlib
         if hashlib.md5(readme_text.encode("utf-8")).hexdigest() == waived_md5:
@@ -202,6 +220,24 @@ def evaluate(root=".", waived_md5=None):
                 "namecheck.py was written against (it was fixed, or edited "
                 "for another reason). The waiver waives nothing now; delete "
                 "WAIVED_README_MD5 and re-measure before shipping.")
+    if waived_line_md5 is not None and readme_text is not None:
+        import hashlib
+        first = readme_text.split("\n", 1)[0].rstrip("\r")
+        site = [f for f in findings if f.startswith("README.md:1:")]
+        if not site:
+            findings.append(
+                "WAIVER IS STALE -- line 1 of README.md no longer names the "
+                "former repo, so WAIVED_LINE_MD5 waives nothing. Delete the "
+                "entry and re-measure before shipping.")
+        elif hashlib.md5(first.encode("utf-8")).hexdigest() != waived_line_md5:
+            findings.append(
+                "WAIVER IS STALE -- line 1 of README.md is not the text the "
+                "waiver was written against (it was edited). The waiver "
+                "waives nothing now; delete WAIVED_LINE_MD5 and re-measure. "
+                f"line 1 is {first[:70]!r}")
+        else:
+            findings = [f for f in findings if f not in site]
+            waived.append("[WAIVED] README.md:1 -- " + WAIVERS["README.md:1"])
     if findings:
         return "FAIL", findings + waived
     return "PASS", [f"{scanned} tracked doc(s) name the repository "
@@ -212,7 +248,7 @@ def run(root="."):
     # THE SHIPPED WAIVER IS THE ONLY ONE. Callers cannot widen it by passing
     # a hash: a check whose exemption is a parameter of the call is a check
     # that can be told what to ignore.
-    verdict, findings = evaluate(root, waived_md5=WAIVED_README_MD5)
+    verdict, findings = evaluate(root, waived_line_md5=WAIVED_LINE_MD5)
     print("NAMECHECK:", verdict)
     for f in findings:
         print("  " + f)
@@ -319,10 +355,34 @@ def selftest():
     arm("K the shipped waiver still matches this tree's README",
         {"README.md": STALE_H1}, "PASS", waived_md5=h)
     real = evaluate(os.path.dirname(os.path.abspath(__file__)) + "/..",
-                    waived_md5=WAIVED_README_MD5)
-    arms.append(("K2 the shipped md5 matches the real README",
+                    waived_line_md5=WAIVED_LINE_MD5)
+    arms.append(("K2 the shipped LINE md5 matches the real README's H1",
                  real[0] == "PASS" and any("[WAIVED]" in f for f in real[1]),
                  f"got {real[0]}: {real[1][-1][:60] if real[1] else ''}"))
+    # K3: THE POINT OF THE LINE BINDING. A README whose H1 is unchanged but
+    #     whose OTHER lines were edited (the C8 count fix, a typo, a new row)
+    #     must keep its waiver. Under the whole-file md5 this went STALE and
+    #     reddened a merge on a line its author never touched -- measured on
+    #     the C8 merge. Inverted, this is the property: the waiver follows
+    #     the LINE.
+    #     The fixture passes ITS OWN line md5 on purpose: this arm tests the
+    #     BINDING, not the shipped constant (K2 owns that). My first version
+    #     passed WAIVED_LINE_MD5 against a fixture H1 that is not the shipped
+    #     H1, so it went FAIL and I nearly "fixed" it by loosening the check.
+    drifted = STALE_H1 + "\n| Every `.py` file here parses | (36 files) |\n"
+    h3 = hashlib.md5(STALE_H1.rstrip("\n").encode("utf-8")).hexdigest()
+    d3 = evaluate(_tree({"README.md": drifted}), waived_line_md5=h3)
+    arms.append(("K3 an edit to another line does NOT retire the H1 waiver",
+                 d3[0] == "PASS" and any("[WAIVED]" in f for f in d3[1]),
+                 f"got {d3[0]}: {' '.join(d3[1])[:60]}"))
+    # K4: the H1 EDITED is still STALE under the line binding -- the property
+    #     the whole-file md5 was protecting must survive the narrower scope.
+    d4 = evaluate(_tree({"README.md": "# Agent-Town - a small town\n"}),
+                  waived_line_md5=WAIVED_LINE_MD5)
+    arms.append(("K4 an edit to the H1 itself still goes STALE",
+                 d4[0] == "FAIL"
+                 and any("WAIVER IS STALE" in f for f in d4[1]),
+                 f"got {d4[0]}: {' '.join(d4[1])[:60]}"))
 
     ok = True
     for name, good, detail in arms:
