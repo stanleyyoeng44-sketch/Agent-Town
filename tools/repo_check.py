@@ -1839,17 +1839,29 @@ def c15_portcheck(root):
                       # them is as blind as a filter that names its tokens.
                       ("docs/CLOUD-DEPLOYMENT.md",
                        "  -p $docker0:8790:8790 \\\n", ""),
-                      # NO PER-DOC MUTANT HERE, and the reason is portcheck's
-                      # semantics, measured while trying to add one: the
-                      # invariant is per PORT across all docs, so deleting
-                      # README's publish of 8790 is NOT a defect while
-                      # CLOUD-DEPLOYMENT still publishes it for both caller
-                      # classes -- portcheck stays MATCH and a gate demanding
-                      # DIFFER would be asserting a bug. Consequence: C15
-                      # cannot catch "the tool ignores one doc" the way C16
-                      # now can; closing that needs a per-document invariant,
-                      # which is portcheck's owner's call, not a mutant I can
-                      # write here.
+                      # NO PER-DOC MUTANT HERE, and the earlier reason given
+                      # for that was WRONG. This comment used to say the
+                      # invariant is "per PORT across all docs", so deleting
+                      # one doc's publish is not a defect. MEASURED, and it
+                      # is not: evaluate() loops `for doc, ports in
+                      # publishers.items()` and compares THAT DOC's coverage,
+                      # so a doc narrowing its publish is reported against
+                      # that doc. Making docs/guide.md loopback-only on the
+                      # real tree gives DIFFER naming guide.md and C15 FAIL.
+                      #
+                      # The true two-part statement, all of it measured:
+                      #  1. DELETING a doc's publish outright is silent when
+                      #     another doc still covers every caller class --
+                      #     there is no defect for portcheck to report.
+                      #  2. NARROWING a doc's publish to fewer classes is
+                      #     caught, per document, with the doc named.
+                      #  3. IGNORING a doc entirely is caught by the read-set
+                      #     assertion above, not by a mutant.
+                      # That third one is why no mutant is right here: every
+                      # shape has an instrument, and a mutant for (1) would
+                      # assert a bug. Before this note was corrected it named
+                      # a limit that did not exist and implied a per-document
+                      # invariant was unbuilt, which cost agent-8 an arm.
                       ],
                      reach=(r"(?:publish site|publish site\(s\))[^\n]*?"
                             r"(\d+) doc\(s\) read", _publisher_docs_read,
