@@ -421,19 +421,42 @@ def selftest():
     print("  %-5s %-44s vanished=%s unregistered=%s"
           % ("PASS" if l12 else "FAIL", "L12 a COUNT-PRESERVING swap still reds",
              swap[0], swap[1]))
-    # L13: absent manifest must REFUSE, not silently pass. Reads the real file
-    # path through a temp copy so it cannot depend on the live tree's state.
-    l13 = load_manifest.__doc__ is not None   # docstring present
+    # L13: THE ABSENT-MANIFEST DECISION, which is where the defect lived.
+    # The first version of this arm asserted only that load_manifest() returns
+    # None. It does -- in the correct build AND in the broken one. agent-8
+    # reverted the decision to WARN with the wording untouched and the selftest
+    # stayed 13/13 PASS while the gate exited 0 on a deleted suite. An arm that
+    # names a failure it cannot express is not an arm, so this one calls the
+    # DECISION, not the loader, and a FAIL->WARN mutant reds it.
+    l13a = manifest_state(None) == "FAIL"
+    ok = ok and l13a
+    print("  %-5s %-44s got %r, want 'FAIL'"
+          % ("PASS" if l13a else "FAIL",
+             "L13 absent manifest -> FAIL", manifest_state(None)))
+    l13b = manifest_state(["a/x.py"]) is None
+    ok = ok and l13b
+    print("  %-5s %-44s got %r, want None"
+          % ("PASS" if l13b else "FAIL",
+             "L13b a PRESENT manifest -> no manifest verdict",
+             manifest_state(["a/x.py"])))
+    l13c = manifest_state(None, no_manifest=True) == "WARN"
+    ok = ok and l13c
+    print("  %-5s %-44s got %r, want 'WARN'"
+          % ("PASS" if l13c else "FAIL",
+             "L13c --no-manifest -> WARN, never FAIL",
+             manifest_state(None, no_manifest=True)))
+    # ...and the loader half: an absent file really does come back as None, so
+    # the decision above is being fed the state the runner will actually see.
     saved = MANIFEST
     try:
         globals()["MANIFEST"] = os.path.join(work, "does-not-exist.txt")
-        l13 = load_manifest() is None
+        l13d = load_manifest() is None
     finally:
         globals()["MANIFEST"] = saved
-    ok = ok and l13
-    print("  %-5s %-44s %s" % ("PASS" if l13 else "FAIL",
-                               "L13 an ABSENT manifest returns None (-> FAIL)",
-                               "None" if l13 else "did not return None"))
+    ok = ok and l13d
+    print("  %-5s %-44s %s" % ("PASS" if l13d else "FAIL",
+                               "L13d an absent FILE loads as None",
+                               "None" if l13d else "did not return None"))
 
     # L4: the aggregate verdict must follow the worst suite.
     verdict = verdict_of(["PASS", "WARN", "FAIL"])
@@ -442,6 +465,33 @@ def selftest():
     print("  %-5s %-44s got %s, want FAIL" % ("PASS" if good_case else "FAIL",
                                               "L4 one FAIL makes the verdict FAIL", verdict))
     return ok
+
+
+def manifest_state(expected, no_manifest=False):
+    """The VERDICT the manifest should contribute, given what was loaded.
+
+    This exists as a function for one reason: the decision is the defect. The
+    first version of the absent-manifest fix put the choice inline in main(),
+    and the selftest arm for it could only assert that load_manifest() returns
+    None -- which it did, in both the correct build and the broken one. MEASURED
+    by agent-8: revert the inline choice to WARN, wording untouched, and the
+    selftest stayed 13/13 PASS while the gate exited 0 on a deleted suite. An
+    arm that cannot express the failure it is named after is not an arm.
+    Extracted here, the choice is callable without a tree and a mutant flipping
+    FAIL->WARN reds it.
+
+    Returns None when there is nothing to report (the manifest is present and
+    should be compared normally).
+    """
+    if no_manifest:
+        # A human typed the flag. Deliberate, and the row says what it costs.
+        return "WARN"
+    if expected is None:
+        # The only checkout without suites.txt is one where somebody removed
+        # it: an older checkout has no reader for it either. Same act as
+        # deleting a suite, one level up.
+        return "FAIL"
+    return None
 
 
 def verdict_of(states):
@@ -480,13 +530,14 @@ def main():
     suites = discover()
     states = []
     expected = load_manifest()
-    if args.no_manifest:
+    state = manifest_state(expected, args.no_manifest)
+    if state == "WARN":
         print("  %-5s %-38s --no-manifest: a deleted suite is indistinguishable "
               "from a passing one in this run" % ("WARN", "suite manifest"))
         states.append("WARN")
-    elif expected is None:
-        # FAIL, not WARN. See load_manifest(): the only checkout that lacks
-        # this file is one where somebody removed it.
+    elif state == "FAIL":
+        # See manifest_state(): the only checkout that lacks this file is one
+        # where somebody removed it.
         print("  %-5s %-38s tools/suites.txt is missing: a deleted suite is "
               "indistinguishable from a passing one (pass --no-manifest to "
               "accept that risk deliberately)" % ("FAIL", "suite manifest"))
@@ -532,8 +583,13 @@ def main():
         print("  %-5s %-38s %s" % (state, label, detail))
     verdict = verdict_of(states)
     print()
-    print("CHECK: %s (%d pass, %d warn, %d fail)"
-          % (verdict, states.count("PASS"), states.count("WARN"), states.count("FAIL")))
+    print("CHECK: %s (%d pass, %d warn, %d fail)%s"
+          % (verdict, states.count("PASS"), states.count("WARN"),
+             states.count("FAIL"),
+             # agent-8's ask: a reader quoting "CHECK: WARN" never sees the
+             # flag that produced it. Put the caveat ON the line people quote.
+             "  [--no-manifest: deleted suites are invisible this run]"
+             if args.no_manifest else ""))
     return 0 if verdict in ("PASS", "WARN") else 1
 
 
