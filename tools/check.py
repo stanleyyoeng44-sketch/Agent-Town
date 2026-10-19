@@ -136,23 +136,31 @@ def in_git_tree():
         return False
 
 
-MANIFEST = os.path.join(ROOT, "tools", "suites.txt")
+MANIFEST = os.path.join(HERE, "suites.txt")
 
 
 def load_manifest():
     """The suites this gate EXPECTS, from tools/suites.txt. Comments and blank
-    lines ignored. Returns None when the file is absent, so an older checkout
-    still runs -- an absent manifest must not be a crash, but it IS reported.
+    lines ignored. Returns None only when the file is ABSENT.
+
+    ABSENT IS A FAILURE, NOT A FALLBACK (agent-8's review, measured). The first
+    version made it a WARN to "let an older checkout still run" -- but an older
+    checkout has no suites.txt AND no code that reads one; the reader only
+    exists at or after the commit that also adds the file. So the fallback
+    serves exactly one case: someone ran `git rm tools/suites.txt`. That is the
+    same act as deleting a suite, one level up, and it must be as loud. This
+    is not a migration path; a human who wants to run without the manifest
+    passes --no-manifest and says so out loud.
     """
-    if not os.path.exists(MANIFEST):
+    try:
+        with open(MANIFEST, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
         return None
-    out = []
-    with open(MANIFEST, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                out.append(line)
-    return out
+    except OSError:
+        return None
+    return [ln.strip() for ln in lines
+            if ln.strip() and not ln.strip().startswith("#")]
 
 
 def manifest_diff(suites, expected):
@@ -386,6 +394,47 @@ def selftest():
                                "all point at real files" if not dead
                                else "dead: %s" % ", ".join(dead)))
 
+    # L10-L13: THE MANIFEST COMPARISON ITSELF. The three controls that justify
+    # the manifest were living in a commit message, which stops running the
+    # moment someone edits manifest_diff(). agent-8's point: this file's own
+    # docstring says a check that has never failed is not a check. These run
+    # the REAL functions on synthetic lists, and each can red on its own.
+    same = ["a/x.py", "b/y.py"]
+    l10 = manifest_diff([("t", [], None, "a/x.py"), ("t", [], None, "b/y.py")],
+                        same) == ([], [])
+    ok = ok and l10
+    print("  %-5s %-44s %s" % ("PASS" if l10 else "FAIL",
+                               "L10 identical sets -> nothing reported",
+                               "" if l10 else "reported a difference"))
+    gone = manifest_diff([("t", [], None, "b/y.py")], same)
+    l11 = gone == (["a/x.py"], [])
+    ok = ok and l11
+    print("  %-5s %-44s vanished=%s" % ("PASS" if l11 else "FAIL",
+                                        "L11 a DELETED suite is VANISHED",
+                                        gone[0]))
+    # THE ONE THAT MATTERS: a swap holds the COUNT constant. A comparison by
+    # count would pass here; the set comparison must not.
+    swap = manifest_diff([("t", [], None, "b/y.py"), ("t", [], None, "c/z.py")],
+                         same)
+    l12 = swap == (["a/x.py"], ["c/z.py"])
+    ok = ok and l12
+    print("  %-5s %-44s vanished=%s unregistered=%s"
+          % ("PASS" if l12 else "FAIL", "L12 a COUNT-PRESERVING swap still reds",
+             swap[0], swap[1]))
+    # L13: absent manifest must REFUSE, not silently pass. Reads the real file
+    # path through a temp copy so it cannot depend on the live tree's state.
+    l13 = load_manifest.__doc__ is not None   # docstring present
+    saved = MANIFEST
+    try:
+        globals()["MANIFEST"] = os.path.join(work, "does-not-exist.txt")
+        l13 = load_manifest() is None
+    finally:
+        globals()["MANIFEST"] = saved
+    ok = ok and l13
+    print("  %-5s %-44s %s" % ("PASS" if l13 else "FAIL",
+                               "L13 an ABSENT manifest returns None (-> FAIL)",
+                               "None" if l13 else "did not return None"))
+
     # L4: the aggregate verdict must follow the worst suite.
     verdict = verdict_of(["PASS", "WARN", "FAIL"])
     good_case = verdict == "FAIL"
@@ -409,6 +458,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true",
                     help="prove the runner can report a failure")
+    ap.add_argument("--no-manifest", action="store_true",
+                    help="run WITHOUT tools/suites.txt. Deliberate and loud: "
+                         "this run cannot tell a deleted suite from a passing "
+                         "one, so the verdict says so.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -427,10 +480,17 @@ def main():
     suites = discover()
     states = []
     expected = load_manifest()
-    if expected is None:
-        print("  WARN  %-38s tools/suites.txt is missing: this run cannot tell "
-              "a deleted suite from a passing one" % "suite manifest")
+    if args.no_manifest:
+        print("  %-5s %-38s --no-manifest: a deleted suite is indistinguishable "
+              "from a passing one in this run" % ("WARN", "suite manifest"))
         states.append("WARN")
+    elif expected is None:
+        # FAIL, not WARN. See load_manifest(): the only checkout that lacks
+        # this file is one where somebody removed it.
+        print("  %-5s %-38s tools/suites.txt is missing: a deleted suite is "
+              "indistinguishable from a passing one (pass --no-manifest to "
+              "accept that risk deliberately)" % ("FAIL", "suite manifest"))
+        states.append("FAIL")
     else:
         vanished, unregistered = manifest_diff(suites, expected)
         if vanished:
