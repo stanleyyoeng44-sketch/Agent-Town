@@ -510,6 +510,37 @@ def unit_simulation():
     finally:
         shutil.rmtree(bt_multi, ignore_errors=True)
 
+    # THE IDENTITY ARM (agent-2's next generation: a count can be right about
+    # the NUMBER and wrong about the SUBJECT). The docstring states a limit --
+    # one --agent applies to every transcript in the directory, so a directory
+    # holding two agents is misattributed. A limit with no arm is a sentence
+    # nobody checks, so this asserts the SHAPE the limit describes, in the
+    # direction that fails safe: with a single --agent and two agents' files,
+    # the rows must carry NO agent attribution at all, rather than inventing
+    # one. If someone later adds per-agent attribution, this arm reds and the
+    # docstring gets corrected with it -- which is the point.
+    bt_id = tempfile.mkdtemp(prefix="ctx-ident-")
+    try:
+        for name in ("life-1-a", "life-2-b"):
+            with open(os.path.join(bt_id, name + ".jsonl"), "w") as f:
+                f.write(json.dumps({"kind": "birth", "wake_file": False})
+                        + "\n")
+        rows_i, _si = parse_births(bt_id, agent="agent-4")
+        keys = set()
+        for r in rows_i:
+            keys |= set(r)
+        check("births carry NO agent field, so one --agent cannot be "
+              "silently attributed to another agent's transcripts",
+              "agent" not in keys and "agent_name" not in keys,
+              "a row carries an agent field the event does not supply; the "
+              "docstring's misattribution limit is now wrong and must move "
+              "with it")
+        check("two agents' transcripts in one dir still yield one row each",
+              len(rows_i) == 2,
+              "rows=%r" % (len(rows_i),))
+    finally:
+        shutil.rmtree(bt_id, ignore_errors=True)
+
     # A misrouted note is the silent defect: the daemon had no note, AND a
     # note existed elsewhere. It must be surfaced, not folded into plain
     # wake_file=False.
