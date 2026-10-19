@@ -130,6 +130,87 @@ def load_mcp_servers():
     return data.get("servers", data)
 
 
+def undeliverable_reason(raw):
+    """Why a mailbox file cannot be delivered, or None if it can.
+
+    PURE, and separate from the reader on purpose. feed_chat() used to fold
+    three different outcomes into one `continue`, and the fold is the defect:
+    a message that was DELIVERED and a message that was DROPPED left the same
+    trace (none). Measured 2026-10-19: 26 undeliverable files across 10 of 10
+    inboxes, every one of them left in place, re-read every 3 seconds forever,
+    with nothing in any log. agent-4's audit, re-measured from disk here.
+
+    Three shapes, kept distinct because they have different owners:
+      not-json       a sender wrote raw prose into a .msg file
+      trailing-data  valid JSON followed by stray bytes (e.g. a literal \\n\\n)
+      not-object     JSON that is not an object (a list, a bare string)
+      no-text        an object with no non-empty "text" field
+    The first three are WRITER bugs; the last is ambiguous (a schema this
+    reader does not know) and is still undeliverable by this reader, so it is
+    reported rather than guessed at.
+    """
+    import json as _json
+    if not isinstance(raw, str):
+        return "not-text"
+    try:
+        obj = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        if "Extra data" in str(e):
+            return "trailing-data"
+        if "control character" in str(e).lower():
+            return "raw-control-character"
+        return "not-json"
+    if not isinstance(obj, dict):
+        return "not-object"
+    text = obj.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return "no-text"
+    return None
+
+
+def handle_message_file(raw):
+    """Decide what to do with one mailbox payload. PURE: no I/O, no clock.
+
+    Returns (action, detail):
+      ("deliver", text)      a usable message
+      ("quarantine", reason) unusable, and the file must be moved aside
+    Kept as one function so the decision can be DRIVEN in a test and so a
+    mutation of the decision is a mutation of THIS, not of a copy of the
+    loop. The loop below only carries out what this returns.
+    """
+    import json as _json
+    reason = undeliverable_reason(raw)
+    if reason is not None:
+        return ("quarantine", reason)
+    msg = _json.loads(raw)
+    return ("deliver", msg.get("text", "").strip())
+
+
+def quarantine(path, reason):
+    """Move an undeliverable mailbox file aside so it is not re-read forever.
+
+    RENAMED, not deleted, and renamed IN PLACE: the file cannot be picked up
+    by the `*.msg` glob again, and the evidence survives for whoever fixes the
+    writer. Returns the new path, or None if the rename failed (in which case
+    the caller must still LOG -- a failed quarantine must not become a second
+    silent path).
+
+    The .bad suffix is deliberate: the glob is `*.msg`, so a reader that
+    widens its pattern to `*` later will see these and can tell they were
+    rejected rather than pending.
+    """
+    dst = path + ".bad"
+    n = 0
+    while os.path.exists(dst):
+        n += 1
+        dst = "%s.bad%d" % (path, n)
+    try:
+        os.replace(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
 def peers_present() -> int:
     """How many other agents have a mailbox directory. Cheap, no bank call."""
     try:
@@ -787,16 +868,35 @@ async def live_one_life(life_id: str, cfg: dict, inbox_next: asyncio.Queue):
                 except Exception:
                     continue
                 for path in files:
+                    # READ FIRST, DECIDE, THEN UNLINK. The old order removed
+                    # the file before checking it could be read, so a message
+                    # that failed to parse was neither delivered nor logged
+                    # -- and because the unlink and the text check were in
+                    # one try/except, an empty message was deleted in the
+                    # SAME breath that skipped it. Both are silent; both are
+                    # gone from every record.
                     try:
-                        with open(path) as f:
-                            msg = json.load(f)
-                        os.remove(path)
-                    except (OSError, json.JSONDecodeError):
+                        with open(path, encoding="utf-8") as f:
+                            raw = f.read()
+                    except OSError as e:
+                        # Cannot even read it. LOG, do not unlink: an
+                        # unreadable file is evidence, and a delete here
+                        # would be the same silent drop one layer earlier.
+                        log.log("peer-message-undeliverable", file=os.path.basename(path),
+                                reason="unreadable:%s" % e.__class__.__name__)
                         continue
-                    sender = msg.get("from", "unknown")
-                    text = msg.get("text", "").strip()
-                    if not text:
+                    action, detail = handle_message_file(raw)
+                    if action == "quarantine":
+                        moved = quarantine(path, detail)
+                        log.log("peer-message-undeliverable",
+                                file=os.path.basename(path),
+                                reason=detail,
+                                quarantined=os.path.basename(moved) if moved else None,
+                                text=raw[:400])
                         continue
+                    sender = json.loads(raw).get("from", "unknown")
+                    text = detail
+                    os.remove(path)
                     log.log("peer-message", **{"from": sender}, text=text)
                     pending_delivery.append(
                         f"A message arrived from your peer '{sender}' "
