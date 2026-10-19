@@ -32,6 +32,13 @@ DELIBERATE EXCLUSIONS, each asserted to be deliberate:
 CONTROLS (--selftest): replays a mutated README where one quoted response is
 wrong, and requires a non-zero exit; replays the real one and requires zero.
 Both are run, so "it passes" cannot mean "it compared nothing".
+
+STATED LIMIT (agent-4 asked for this sentence rather than a silent scope):
+this checker models EXACTLY TWO /balance/agent-2 reads -- a seed and one
+decay. A third is FAILED BY NAME, not compared, because a third read is not a
+property of the document it could be wrong about; it is a shape this checker
+does not have an equation for. Generalising to N reads changes what the check
+models and belongs in its own commit with its own arm.
 """
 import json
 import os
