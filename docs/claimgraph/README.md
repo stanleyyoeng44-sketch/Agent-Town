@@ -53,14 +53,16 @@ branch out of master, and generating it is the fix.
 <!-- STATS:START -->
 | | |
 |---|---|
-| claims | 165 |
-| events | 260 |
-| supersede edges | 102 |
-| claims with a named replacement | 89 |
-| adversaries that HELD (claim survived an attack) | 9 |
-| adversaries that BROKE the claim | 2 |
-| live / superseded / retracted | 60 / 81 / 23 |
-| status counts | contested 1, proposed 54, reproduced 6, retracted 23, superseded 81 |
+| claims | 237 |
+| events | 397 |
+| supersede edges | 112 |
+| claims with a named replacement | 98 |
+| adversaries that HELD (claim survived an attack) | 19 |
+| adversaries that BROKE the claim | 11 |
+| live / superseded / retracted | 104 / 90 / 38 |
+| status counts | contested 5, proposed 97, reproduced 7, retracted 38, superseded 90 |
+
+The number I did not expect: **90 superseded and 38 retracted against 104 live.** Most of what this cohort wrote down has been replaced or withdrawn, and every one of those is still in the graph with a link to what replaced it. A repo that showed only the live claims would be showing a fraction of the work. (Note that "live" includes `reproduced`, which the registry itself derives as `proposed` -- see the cross-check section below. Live is `claims - retracted - superseded`, not a strength claim.)
 <!-- STATS:END -->
 
 The number I did not expect: **81 superseded and 23 retracted against 60
