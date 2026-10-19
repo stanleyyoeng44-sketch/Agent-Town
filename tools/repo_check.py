@@ -1870,7 +1870,7 @@ def _duplicate_numbers(names):
     return {n: v for n, v in by_num.items() if len(v) > 1}
 
 
-def c18_one_check_per_number(root):
+def c20_one_check_per_number(root):
     """Two registered checks bearing the same C<n> number is a MERGE defect.
 
     MEASURED 2026-10-19, by merging two branches that were each green:
@@ -1907,10 +1907,10 @@ def c18_one_check_per_number(root):
         with open(path) as fh:
             src = fh.read()
     except OSError as exc:
-        return "C18 one check per number", "WARN", [f"cannot read: {exc}"]
+        return "C20 one check per number", "WARN", [f"cannot read: {exc}"]
     names = _registered_check_names(src)
     if names is None:
-        return "C18 one check per number", "FAIL", [
+        return "C20 one check per number", "FAIL", [
             "tools/repo_check.py does not parse -- the registry cannot be read"]
     dupes = _duplicate_numbers(names)
     if dupes:
@@ -1919,10 +1919,10 @@ def c18_one_check_per_number(root):
             findings.append(
                 f"C{num} is used by {len(dupes[num])} checks: "
                 + ", ".join(sorted(dupes[num])))
-        return "C18 one check per number", "FAIL", findings
+        return "C20 one check per number", "FAIL", findings
     distinct = len({int(re.match(r"c(\d+)_", n).group(1))
                     for n in names if re.match(r"c(\d+)_", n)})
-    return "C18 one check per number", "PASS", [
+    return "C20 one check per number", "PASS", [
         f"{len(names)} registered checks, {distinct} distinct numbers"]
 
 
@@ -1932,7 +1932,7 @@ CHECKS = [c1_tracked_junk, c2_secrets_head, c3_secrets_history,
           c10_readme_links_the_artifact, c11_readme_docker_flags,
           c13_claimgraph_prose_numbers, c12_undefined_names, c14_check_registry,
           c15_portcheck, c16_tokencheck, c17_repo_name,
-          c18_one_check_per_number]
+          c20_one_check_per_number]
 
 
 def _is_git_tree(root):
@@ -3007,33 +3007,33 @@ def selftest():
     finally:
         shutil.rmtree(_rn, ignore_errors=True)
 
-    # C18: one check per number. Both directions, driven through the SAME
+    # C20: one check per number. Both directions, driven through the SAME
     # parser and the SAME duplicate predicate the real check uses -- the
     # first version mutated a COPY of this file with two string replaces and
     # the anchor had moved, so the first replace was a no-op, the second
     # still changed the text, the "mutant changed" assert passed, and the arm
     # was red for a reason that had nothing to do with the number. Driving
     # the pure functions removes the copy, the anchor and the assert.
-    outcomes.append(("C18 passes on a registry with distinct numbers",
+    outcomes.append(("C20 passes on a registry with distinct numbers",
                      _duplicate_numbers(["c1_a", "c2_b", "c17_x"]) == {}))
-    outcomes.append(("C18 catches two checks sharing one number",
+    outcomes.append(("C20 catches two checks sharing one number",
                      _duplicate_numbers(["c17_x", "c17_y"]) ==
                      {17: ["c17_x", "c17_y"]}))
     # The registry has THREE legal spellings (C14 asserts all three). My
     # first parser read only `CHECKS = [...]`; the annotated form returned []
     # and this check would have reported PASS on a registry it never read. A
     # parser gap is reported as a clean tree, so assert each spelling.
-    outcomes.append(("C18 reads an ANNOTATED CHECKS declaration",
+    outcomes.append(("C20 reads an ANNOTATED CHECKS declaration",
                      _registered_check_names(
                          "CHECKS: list = [c1_a, c2_b]\n") == ["c1_a", "c2_b"]))
-    outcomes.append(("C18 reads both sides of CHECKS = [a] + [b]",
+    outcomes.append(("C20 reads both sides of CHECKS = [a] + [b]",
                      _registered_check_names(
                          "CHECKS = [c1_a] + [c2_b]\n") == ["c1_a", "c2_b"]))
-    outcomes.append(("C18 FAILs on unparseable source rather than passing",
+    outcomes.append(("C20 FAILs on unparseable source rather than passing",
                      _registered_check_names("CHECKS = [\n") is None))
     # And the end-to-end direction: the REAL registry on this tree is unique.
-    outcomes.append(("C18 passes on this tree's own CHECKS",
-                     c18_one_check_per_number(ROOT)[1] == "PASS"))
+    outcomes.append(("C20 passes on this tree's own CHECKS",
+                     c20_one_check_per_number(ROOT)[1] == "PASS"))
 
     bad = 0
     for label, passed in outcomes:
