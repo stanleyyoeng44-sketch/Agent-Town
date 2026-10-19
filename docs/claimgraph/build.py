@@ -16,7 +16,20 @@ generator that ignores its input would still pass a visual check.
 OUTPUT: a single self-contained index.html (no network, no CDN), plus
 graph.json, so both a human and a program can read it.
 """
-import json, os, sys, glob, html, hashlib, shutil, tempfile
+import json, os, sys, glob, html, hashlib, shutil, tempfile, atexit
+
+
+def _restore(path, data):
+    """Put a committed file back exactly as we found it. Never raises: this
+    runs at interpreter exit, where an exception would mask the real result."""
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
 
 ROOT = os.environ.get("CLAIM_ROOT", "/shared/claims")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -480,6 +493,27 @@ def selftest():
         shape_is_fatal = True
     checks.append(("M5 CONTROL: the unreshaped record really was fatal",
                    shape_is_fatal))
+    # M6: the NON-STRING fallback, which M5 does NOT reach. agent-8 measured
+    # that on the live store (254 claims) statement types are {str: 223,
+    # list: 31} and ZERO records reach `return str(value)` -- so the fallback
+    # was both untested and unexercised, and their mutation of it passed
+    # because the list branch returns first. A branch no record can reach
+    # still needs an arm, or the day a record reaches it is the day it is
+    # wrong and nobody finds out. The input here has to be a shape the ladder
+    # does not name: dict, int, bool, None-inside-a-list.
+    for label, val, want in [
+            ("dict", {"a": 1}, "a"),
+            ("int", 1234, "1234"),
+            ("bool", True, "True"),
+    ]:
+        got = _statement_text(val)
+        checks.append((f"M6 a {label} statement renders without raising or "
+                       f"vanishing", isinstance(got, str) and want in got))
+    checks.append(("M6 None-in-a-list does not print the word 'None'",
+                   "None" not in _statement_text(["real prose", None])))
+    checks.append(("M6 a list of strings is joined, not repr'd",
+                   _statement_text(["one", "two"]).count("one") == 1
+                   and "[" not in _statement_text(["one", "two"])))
 
     # M3: the README table must be CURRENT. agent-0 caught the doc saying 101
     # claims while graph.json said 102, and 41 live against 46. A generated
@@ -510,7 +544,20 @@ def selftest():
     # the doc to the artifact it ships with; staleness against the LIVE store
     # is a separate, non-fatal warning (see store_status below).
     committed = base_readme.split(README_START, 1)[1].split(README_END, 1)[0]
-    committed_graph = json.load(open(os.path.join(HERE, "graph.json")))
+    # GRAPH.JSON IS COMMITTED, AND A REVIEWER'S CHECKOUT IS NOT OURS TO WRITE.
+    # build() writes its artifacts to `outdir`, which defaults to HERE, so a
+    # bare build() inside the selftest regenerates the committed graph.json in
+    # the tree under test. agent-8 hit exactly this: they ran build.py, then
+    # ran selftest in the SAME copy, M3 compared the freshly written artifact
+    # against the older committed README table and went red -- and they were
+    # one step from reporting that this tree was red. A test that rewrites the
+    # artifact it then measures is the same class as a test of a copy.
+    # So: capture it first, and put it back when we are done, whatever happens.
+    graph_path = os.path.join(HERE, "graph.json")
+    with open(graph_path, "rb") as f:
+        _committed_graph_bytes = f.read()
+    atexit.register(_restore, graph_path, _committed_graph_bytes)
+    committed_graph = json.loads(_committed_graph_bytes)
     checks.append(
         ("M3 committed README table equals committed graph.json",
          committed.strip() == stats_markdown(committed_graph["stats"]).strip()))
