@@ -711,8 +711,26 @@ README_COUNT_CLAIMS = [
      lambda r: _demo_pass_lines(r)),
     (r"mutates the bank\s+(\w+)\s+ways",
      lambda r: _selftest_control_lines(r)),
-    (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
-     lambda r: len([x for x in sh_ls(r) if x.strip()])),
+    # THE MODULE-COUNT CLAIM WAS REMOVED FROM THE README ON PURPOSE, and the
+    # paragraph that used to defend it is worth keeping because its reasoning
+    # was right and its scope was wrong.
+    #
+    # It reasoned that a count in prose is a courier that drifts. True. But
+    # `git ls-files '*.py' | wc -l` is a claim about THE WHOLE TREE, so it is
+    # invalidated by ANY commit that adds or removes a .py file -- which is
+    # most commits. Nobody who adds a module should have to edit a table row
+    # in the README, and the person MERGING two branches inherits the
+    # arithmetic silently: each branch was green on its own, and the merge
+    # was red on a number neither author touched. Measured twice: master 35 +
+    # one new file in a branch = a red merge, reported by the merger, not by
+    # either branch's gate. That is a check that taxes a third party.
+    #
+    # The alternative considered and REJECTED was to keep the number and
+    # derive it: a README that must be edited by a generator on every commit
+    # has the same tax with more machinery. What remains in the README is the
+    # claim that carries the VALUE -- "every .py file parses" -- and C6 is
+    # that claim's check: it walks every tracked .py and ast.parses it, with
+    # no number typed anywhere. A count was never the checkable part.
     # NO CLAIMGRAPH NUMBER LIVES HERE, and it is C13 there, not an omission.
     # agent-8's finding was real: mutating the README's claimgraph numbers
     # left repo_check green. An earlier version of this comment said the
@@ -744,6 +762,22 @@ README_COUNT_CLAIMS = [
 _WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
           "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
+# Claims that carry no NUMBER but must still EXIST. C8's rule is that a claim
+# whose sentence is gone is a FAIL, not a skip, "otherwise the cheapest way to
+# get green is to delete the claim". Removing the module count from the README
+# (see README_COUNT_CLAIMS above) created exactly that hole: the row was
+# deletable in silence, because a regex that no longer matches cannot tell
+# "deleted" from "never stated". MEASURED, and it is why this table exists:
+# with only the count claim removed, deleting the whole `.py` parses row left
+# C8 at PASS. These entries are checked for PRESENCE only -- the number that
+# made the row deletable is what was removed, not the assertion that the row
+# is there. The claim's TRUTH is still C6's job; this only refuses to let the
+# README stop making it.
+README_REQUIRED_CLAIMS = [
+    (r"git ls-files '\*\.py'`?[^|\n]*ast\.parse",
+     "the README must still say the tracked .py files are parsed (C6)"),
+]
+
 
 def _demo_pass_lines(root):
     out = subprocess.run([sys.executable, "-I", "demo/town.py"], cwd=root,
@@ -759,10 +793,26 @@ def _selftest_control_lines(root):
                 if _re.match(r"^(guard|single|grant|env-var|unknown)", l)])
 
 
-def sh_ls(root):
+def _py_files(root):
+    """Tracked .py paths in `root`, relative to it.
+
+    C6 walks these; the C8 deletion arm copies them so its fixture can RUN
+    the demo (which needs bank/ and the rest) instead of counting 0 PASS
+    lines and going red for the fixture. There is deliberately no separate
+    count helper: the number that used to be a README claim is gone.
+    """
     out = subprocess.run(["git", "-C", root, "ls-files", "*.py"],
                          text=True, capture_output=True)
-    return out.stdout.splitlines()
+    return [x for x in out.stdout.splitlines() if x.strip()]
+
+
+def _copy_data_deps(src, dst):
+    """Copy the non-.py files the demo reads, if present. Currently none are
+    required (town.py builds its own ledger and mailbox), so this is a hook
+    that does nothing rather than a hidden assumption; kept explicit so the
+    day town.py grows a data file, the arm fails loudly here instead of
+    silently counting 0 PASS lines again."""
+    return None
 
 
 TEMP_ROOT = __import__("tempfile").gettempdir()
@@ -807,13 +857,18 @@ def c8_readme_numbers(root):
         measured[rx] = actual
         if stated != actual:
             findings.append(f"README says {stated} for /{rx}/, measured {actual}")
+    for rx, why in README_REQUIRED_CLAIMS:
+        import re as _re
+        if not _re.search(rx, text):
+            findings.append(f"required claim is gone: {why} /{rx}/")
     if absent:
         findings.append(f"{len(absent)} README claim(s) are no longer worded "
                         f"so they can be checked: {absent}")
     if findings:
         return "C8 readme numbers", "FAIL", findings
     return "C8 readme numbers", "PASS", \
-        [f"recomputed {len(measured)} README numbers"]
+        [f"recomputed {len(measured)} README numbers, "
+         f"{len(README_REQUIRED_CLAIMS)} presence-only claim(s) intact"]
 
 
 # (text in README.md, its lie, label). Lives beside the check so the two
@@ -847,9 +902,7 @@ def _c8_controls():
             (r"—\s*(\d+)\s+checks", "demo caption", 1),
             (r"`python3 demo/town\.py`,\s*(\d+)\s+checks",
              "verification table", 1),
-            (r"mutates the bank\s+(\w+)\s+ways", "selftest mutations", None),
-            (r"`git ls-files '\*\.py'`\s*\((\d+)\s+files\)",
-             "tracked modules", 5)):
+            (r"mutates the bank\s+(\w+)\s+ways", "selftest mutations", None)):
         whole, val = find(rx)
         if whole is None:
             continue
@@ -2309,17 +2362,12 @@ def selftest():
         for rel in ("demo/town.py", "demo/selftest_demo.py"):
             os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
             shutil.copy(os.path.join(ROOT, rel), os.path.join(d, rel))
-        # THE FARM MUST SATISFY EVERY OTHER CLAIM. The tracked-module count is
-        # measured with `git ls-files '*.py'` in the FARM, so a farm holding
-        # only the two demo scripts makes the README's module count false
-        # BEFORE any mutation -- C8 goes red for the fixture, and the control
-        # "passes" while testing nothing. Copy the same .py set the claim
-        # counts, so the only false number is the one this control injects.
-        if label == "tracked modules":
-            for py in sh_ls(ROOT):
-                dst = os.path.join(d, py)
-                os.makedirs(os.path.dirname(dst) or d, exist_ok=True)
-                shutil.copy(os.path.join(ROOT, py), dst)
+        # THE FARM MUST SATISFY EVERY OTHER CLAIM. A farm holding only the
+        # two demo scripts made the README's module count false BEFORE any
+        # mutation, so C8 went red for the fixture and the control "passed"
+        # while testing nothing. That arm is gone with the claim itself (the
+        # count is no longer stated in the README); the general rule stands
+        # and is why the two demo scripts are still copied here.
         shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
         p = os.path.join(d, "README.md")
         t = open(p, encoding="utf-8").read()
@@ -2353,6 +2401,62 @@ def selftest():
         c8 = dict((n, o) for n, o, _ in r8).get("C8 readme numbers")
         outcomes.append((f"C8 catches a stale {label} number", c8 == "FAIL"))
         shutil.rmtree(d)
+
+    # C8-required: a claim that carries NO number must still be caught when it
+    # is DELETED. This is the arm for README_REQUIRED_CLAIMS, and it exists
+    # because I shipped the opposite and MEASURED it: after removing the
+    # module-count claim, deleting the whole `.py` parses row left C8 at PASS.
+    # A presence-only entry that has never failed is not a check, so the arm
+    # deletes the row from the LIVE README rather than a hand-written fixture:
+    # a fixture would only prove the regex matches the fixture.
+    d = farm()
+    open(os.path.join(d, ".gitignore"), "w").write(
+        "__pycache__\n*.py[cod]\n*.log\n*.pid\n*.sqlite3\ncontrol-token\n")
+    # THE FARM MUST BE TRUTHFUL ABOUT EVERY OTHER CLAIM, and the first version
+    # of this arm was not: it copied only demo/town.py and selftest_demo.py,
+    # so the demo could not run (no bank/), _demo_pass_lines returned 0, and
+    # C8 was already red on 28-vs-0 BEFORE the deletion. The arm then passed
+    # for a reason unrelated to what it tests -- MEASURED by disabling the
+    # required-claim loop entirely and watching this arm still PASS. Copying
+    # the tree's whole .py set makes the deletion the only false thing here.
+    for rel in _py_files(ROOT):
+        dst = os.path.join(d, rel)
+        os.makedirs(os.path.dirname(dst) or d, exist_ok=True)
+        shutil.copy(os.path.join(ROOT, rel), dst)
+    _copy_data_deps(ROOT, d)
+    shutil.copy(os.path.join(ROOT, "README.md"), os.path.join(d, "README.md"))
+    p = os.path.join(d, "README.md")
+    t = open(p, encoding="utf-8").read()
+    import re as _re
+    rx = README_REQUIRED_CLAIMS[0][0]
+    m = _re.search(rx, t)
+    if not m:
+        # FAIL, not skip: the live README must carry the claim this entry
+        # protects, so an absence here means the regex and the README have
+        # drifted and the protection is imaginary.
+        outcomes.append((f"C8 required claim is present in the live README "
+                         f"(/{rx}/ matched nothing)", False))
+        shutil.rmtree(d)
+    else:
+        # delete the whole TABLE ROW the claim lives in, which is what a
+        # "the number was wrong so I removed the sentence" edit actually does
+        lines = t.splitlines(True)
+        kept = [ln for ln in lines if not _re.search(rx, ln)]
+        mutated = "".join(kept)
+        if mutated == t or len(kept) == len(lines):
+            outcomes.append(("C8 required-claim deletion actually deletes "
+                             "(no-op: the claim shares its line with nothing "
+                             "removable)", False))
+            shutil.rmtree(d)
+        else:
+            open(p, "w", encoding="utf-8").write(mutated)
+            _git(d, "add", "-f", ".")
+            _git(d, "commit", "-qm", "deleted the parses claim")
+            _, rq = run(d)
+            c8q = dict((n, o) for n, o, _ in rq).get("C8 readme numbers")
+            outcomes.append(("C8 FAILS when the number-free parses claim is "
+                             "DELETED", c8q == "FAIL"))
+            shutil.rmtree(d)
 
     # C10: deleting the paragraph that points at the correction graph must
     # FAIL. Measured before this control existed: on master, removing the
