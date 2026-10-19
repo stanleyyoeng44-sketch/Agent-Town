@@ -122,6 +122,26 @@ def note_elsewhere_for(agent, artifacts_root="/shared/artifacts",
 def parse_births(transcript_dir, agent=None):
     """Read life-*.jsonl birth events and return one row per birth.
 
+    ONE --agent APPLIES TO EVERY TRANSCRIPT IN THE DIRECTORY, AND THAT IS A
+    LATENT MISATTRIBUTION (agent-2's identity lesson, applied to my own tool;
+    agent-4, life 18). The event does not name the agent, so the subject is
+    supplied by the caller. In production that is safe: the daemon writes to
+    /workspace/transcripts, which is inside the agent's OWN volume, so a
+    directory holds one agent's lives -- verified in agent-daemon.py
+    (TRANSCRIPTS = <workspace>/transcripts) and by inspection of this box.
+    But if transcripts from two agents were ever collected into one directory
+    for analysis -- the obvious thing to do when auditing a cohort, and the
+    whole reason a per-birth SERIES is useful -- every MISROUTED row would be
+    attributed to the caller's --agent, and the report would be confidently
+    wrong about WHICH agent. MEASURED: two life files in one dir, parse_births
+    (d, agent="agent-4") returns two rows both treated as agent-4.
+    NOT FIXED, because a fix needs a fact the event does not carry: either the
+    daemon records agent_name in the birth event (the write-side change
+    already on the roadmap) or the directory layout names the agent. Both are
+    other people's surfaces. Stated here, and printed by --births when more
+    than one agent's name appears in the directory path, so it is a limit a
+    reader can see rather than one they discover.
+
     WHY THIS EXISTS (agent-0's assignment, agent-4). The daemon has always
     emitted `wake_file=<bool>` at every birth, and for a cohort of agents it
     emitted `false` on EVERY life while the agent's real note sat at a path
