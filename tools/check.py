@@ -207,8 +207,15 @@ def run_suite(name, argv, special, verbose):
     #   rc != 0  -> prefer the last line that names a problem  (old behaviour)
     #   rc == 0  -> prefer the last line that names a SUCCESS, and never
     #               promote a line whose only verdict word is a failure one
-    BAD_WORDS = re.compile(r"RESULT|FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
-    GOOD_WORDS = re.compile(r"RESULT|PASS|HOLDS|MATCH|OK\b|GREEN", re.I)
+    # A WORD THAT APPEARS IN BOTH VOCABULARIES CANNOT VOTE. agent-10 found
+    # RESULT in both lists: a FAIL line whose detail happened to contain
+    # "a transfer RESULT of 900" was classified GOOD, so the gate printed
+    #     FAIL  docs: README transcript CONTROL   PASS  a transfer result ...
+    # -- a FAIL row whose detail reads like a pass, which is exactly the row
+    # that is supposed to tell a reader the control is dead. Removed from
+    # both: it is a noun here, not a verdict.
+    BAD_WORDS = re.compile(r"FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
+    GOOD_WORDS = re.compile(r"PASS|HOLDS|MATCH|OK\b|GREEN", re.I)
     # A line that says both ("control fired (pre-fix shape went mute): PASS")
     # is a success line: it reports a failure it INDUCED, then its own verdict.
     # The trailing verdict wins, so score the LAST match in the line.
