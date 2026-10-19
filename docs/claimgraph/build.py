@@ -416,26 +416,44 @@ def ensure_fixture_store(root=None):
     # the right answer is the same fixture as for a malformed one. agent-7
     # measured the alternative on b17005b: IndexError at live[0], live[1],
     # reported as a red suite, for an input the generator renders fine.
+    # THE GENERATOR'S OWN DEFINITION OF LIVE, IMPORTED RATHER THAN RESTATED.
+    # The first version of this guard re-derived "live" by hand as "not the
+    # target of a supersede edge" -- a SECOND COPY of derive()'s rule, which
+    # omits RETRACTS. agent-4 measured the consequence: a store whose claims
+    # have all been retracted cleared the >= 2 test, returned (root, None),
+    # and the suite reported PASS about a store with ZERO live claims.
+    # A predicate that describes another component's rule must USE that
+    # component, not restate it; this one had already drifted.
     short = None
     if names is not None and not bad and names:
         try:
             _c, _e = load(root)
-            _live = [c for c in _c if not any(
-                e.get("kind") == "edge" and e.get("rel") == "supersedes"
-                and e.get("to") == c for e in _e)]
-            if len(_live) >= 2:
+            _nodes, _, _, _ = derive(_c, _e)
+            _live = [n for n in _nodes if n["status"].split()[0]
+                     not in ("retracted", "superseded")]
+            # EMPTY IS ALSO NOT MEASURABLE. agent-4's second variant: three
+            # claims with "statement": "" pass the type check, render nothing,
+            # and the suite reports PASS. The guard was asking "is this the
+            # right TYPE" when the question is "does it CARRY anything".
+            _blank = [n["id"] for n in _live
+                      if not str(n.get("statement") or "").strip()]
+            if _blank:
+                bad = _blank[:3]
+                short = None
+            elif len(_live) >= 2:
                 return root, None
-            short = len(_live)
+            else:
+                short = len(_live)
         except Exception as exc:
             short = "unreadable (%s)" % type(exc).__name__
     why = ("no claim store at %s" % root if names is None
            else ("no claims in %s" % root if not names
-                 else ("%d claim(s) in %s are unusable (unparseable or "
-                       "non-string statement: %s)"
+                 else ("%d claim(s) in %s are unusable (unparseable, "
+                       "non-string or EMPTY statement: %s)"
                        % (len(bad), root, ", ".join(sorted(bad)[:3])))
                  if bad else
-                 ("%s has %s live claim(s); the selftest needs two to mutate"
-                  % (root, short))))
+                 ("%s has %s live claim(s); the selftest needs two with "
+                  "content to mutate" % (root, short))))
     d = tempfile.mkdtemp(prefix="claimgraph-fixture-")
     for sub in ("claims", "events"):
         os.makedirs(os.path.join(d, sub))
@@ -469,9 +487,14 @@ def selftest():
     st0, dg0 = build(store, os.path.join(tmp, "out0"))
     # M1: add a supersede edge between two known-live claims
     claims, events = load(store)
-    live = [c for c in claims if not any(
-        e.get("kind") == "edge" and e.get("rel") == "supersedes"
-        and e.get("to") == c for e in events)]
+    # THE SAME IMPORTED RULE THE GUARD USES. This line re-derived "live" by
+    # hand and omitted RETRACTS, so on a partly-retracted store M1 could pick
+    # a dead claim as the supersede TARGET and the arm failed for a reason
+    # that has nothing to do with the generator -- a red row in a suite whose
+    # subject is "does the output follow the input". One copy of the rule, in
+    # derive(), read by both.
+    live = [n["id"] for n in derive(claims, events)[0]
+            if n["status"].split()[0] not in ("retracted", "superseded")]
     # A VALID STORE CAN STILL BE TOO SMALL TO MUTATE. ensure_fixture_store()
     # catches an absent, unparseable or malformed store; it does not catch a
     # perfectly good store holding ONE claim, and `live[0], live[1]` then
@@ -623,6 +646,25 @@ def selftest():
         shutil.rmtree(scrape, ignore_errors=True)
         for _maybe in (_ra, _rb):
             shutil.rmtree(_maybe, ignore_errors=True)
+
+    # M7 (agent-4): THE GUARD AND THE GENERATOR MUST AGREE ABOUT LIVE.
+    # The guard's too-small test and the M1 arm both need "live", and both
+    # used to re-derive it by hand, one of them omitting retracts. Restating
+    # another component's rule is exactly how the two drift apart without
+    # either one being edited. This asserts they are the same number on
+    # whatever store the run actually used, so a future re-derivation fails
+    # HERE instead of quietly measuring a different population.
+    _g_nodes = derive(*load(store))[0]
+    _g_live = sum(1 for n in _g_nodes
+                  if n["status"].split()[0] not in ("retracted", "superseded"))
+    _g_live_nonblank = sum(1 for n in _g_nodes
+                           if n["status"].split()[0]
+                           not in ("retracted", "superseded")
+                           and str(n.get("statement") or "").strip())
+    checks.append(("M7 the suite's live set is the GENERATOR's live set",
+                   len(live) == 0 or len(live) == _g_live))
+    checks.append(("M7 every live claim the suite mutates carries content",
+                   _g_live_nonblank == _g_live or store_note is not None))
 
     ok = True
     for name, cond in checks:
