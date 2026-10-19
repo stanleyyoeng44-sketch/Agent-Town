@@ -115,6 +115,15 @@ EXTERNAL = [
     ("docs: README bank transcript",
      os.path.join(os.path.dirname(os.path.abspath(__file__)),
                   "check_readme_transcript.py")),
+    # THE CHECKER'S OWN CONTROL. The line above runs it with no arguments,
+    # which executes the replay only; its --selftest mutation arms never ran
+    # in the gate. agent-10 found three of those arms DEAD on 4041edf --
+    # printing "could not build the lie" and testing nothing -- while this gate
+    # reported the file PASS. A gate that runs a check but not its control is
+    # the same defect as a check that cannot red, one door down.
+    ("docs: README transcript CONTROL",
+     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "check_readme_transcript.py"), ["--selftest"]),
     ("docs: guide and demo blocks", os.path.join(A5, "check_doc_blocks.py")),
 ]
 
@@ -388,7 +397,9 @@ def main():
         state, detail = run_suite(name, argv, special, args.verbose)
         states.append(state)
         print("  %-5s %-38s %s" % (state, name, detail))
-    for label, script in EXTERNAL:
+    for entry in EXTERNAL:
+        label, script = entry[0], entry[1]
+        extra = entry[2] if len(entry) > 2 else []
         if not os.path.exists(script):
             # agent-10's point: in a fresh clone these are ABSENT, so "one
             # command verifies the repo" would silently verify less. Say whose
@@ -397,7 +408,7 @@ def main():
             print("  %-5s %-38s agent-5's private audit, not in the repo (%s)"
                   % ("SKIP", label, script))
             continue
-        state, detail = run_suite(label, [sys.executable, "-I", script, ROOT],
+        state, detail = run_suite(label, [sys.executable, "-I", script, ROOT] + extra,
                                   "exit2-is-warn", args.verbose)
         states.append(state)
         print("  %-5s %-38s %s" % (state, label, detail))

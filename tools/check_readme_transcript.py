@@ -672,6 +672,14 @@ def main():
         # Each arm is (replacements, label); replacements is a list of
         # (old, new) applied once each, so an arm can keep the rest of the
         # transcript's arithmetic valid and red for ITS reason only.
+        # ANCHOR FROM THE README, NOT FROM A LITERAL. agent-10 measured three
+        # arms DEAD on 4041edf: this branch changed the README's launch line to
+        # carry BANK_TOKEN_DIR, so `DECAY_SECONDS=2 python3 bank/bank.py` no
+        # longer matched and the arms printed "could not build the lie" instead
+        # of testing anything. A dead control is not a passing control.
+        import re as _re
+        _launch = _re.search(r"\$ .*\bpython3 bank/bank\.py\s*$", text, _re.M)
+        LAUNCH = _launch.group(0) if _launch else "python3 bank/bank.py"
         decoy_lies = [
             ([("$ curl -s localhost:8941/balance/agent-2\n"
                '{"agent": "agent-2", "money": 1000, "exists": true}',
@@ -688,9 +696,8 @@ def main():
             # clock: a second balance of 999 (one tick at 5s) PASSED for a
             # transcript whose real launch line says 2. "First match wins" is
             # the whole-document defect again, one scope in.
-            ([("$ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py",
-               "$ SEED=agent-2:1000 DECAY_SECONDS=5 python3 bank/bank.py\n"
-               "$ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py"),
+            ([(LAUNCH,
+               LAUNCH.replace("DECAY_SECONDS=2", "DECAY_SECONDS=5") + "\n" + LAUNCH),
               ('{"agent": "agent-2", "money": 998, "exists": true}',
                '{"agent": "agent-2", "money": 999, "exists": true}'),
               ('"ok": true, "money": 991', '"ok": true, "money": 992')],
@@ -715,12 +722,20 @@ def main():
             print(f"  {'PASS' if caught else 'FAIL'}  {label} is caught")
             decoy_results.append(caught)
 
+        # ANCHOR FROM THE README, NOT FROM A LITERAL. agent-10 measured three
+        # arms DEAD on 4041edf: this branch changed the README's launch line
+        # to carry BANK_TOKEN_DIR, so `DECAY_SECONDS=2 python3 bank/bank.py`
+        # no longer matched and the arms printed "could not build the lie"
+        # instead of testing anything. A dead control is not a passing
+        # control. The anchor is now the README's ACTUAL launch line, found by
+        # regex; if that line cannot be found the arms still FAIL, but they
+        # fail for a reason the message states rather than a stale literal.
         clock_lies = [
-            ("DECAY_SECONDS=2 python3 bank/bank.py",
-             "DECAY_SECONDS=1 python3 bank/bank.py",
+            (LAUNCH,
+             LAUNCH.replace("DECAY_SECONDS=2", "DECAY_SECONDS=1"),
              "a launch line stating DECAY_SECONDS=1 (the balances are for 2)"),
-            (" DECAY_SECONDS=2 python3 bank/bank.py",
-             " python3 bank/bank.py",
+            (LAUNCH,
+             _re.sub(r"DECAY_SECONDS=\d+ ", "", LAUNCH),
              "a launch line with NO DECAY_SECONDS (the decay claim has no "
              "units)"),
             ("   ... 5 seconds later ...", "   ... 10 seconds later ...",
