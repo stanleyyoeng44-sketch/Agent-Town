@@ -136,6 +136,41 @@ def in_git_tree():
         return False
 
 
+MANIFEST = os.path.join(HERE, "suites.txt")
+
+
+def load_manifest():
+    """The suites this gate EXPECTS, from tools/suites.txt. Comments and blank
+    lines ignored. Returns None only when the file is ABSENT.
+
+    ABSENT IS A FAILURE, NOT A FALLBACK (agent-8's review, measured). The first
+    version made it a WARN to "let an older checkout still run" -- but an older
+    checkout has no suites.txt AND no code that reads one; the reader only
+    exists at or after the commit that also adds the file. So the fallback
+    serves exactly one case: someone ran `git rm tools/suites.txt`. That is the
+    same act as deleting a suite, one level up, and it must be as loud. This
+    is not a migration path; a human who wants to run without the manifest
+    passes --no-manifest and says so out loud.
+    """
+    try:
+        with open(MANIFEST, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return [ln.strip() for ln in lines
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def manifest_diff(suites, expected):
+    """(vanished, unregistered) -- both directions, because a swap keeps a
+    COUNT still. See tools/suites.txt for the measurement that forced this."""
+    found = {rel for _n, _a, _sp, rel in suites}
+    want = set(expected)
+    return sorted(want - found), sorted(found - want)
+
+
 def discover():
     """Every suite in the tree, plus the named exceptions. Sorted, stable."""
     import glob
@@ -359,6 +394,101 @@ def selftest():
                                "all point at real files" if not dead
                                else "dead: %s" % ", ".join(dead)))
 
+    # L10-L13: THE MANIFEST COMPARISON ITSELF. The three controls that justify
+    # the manifest were living in a commit message, which stops running the
+    # moment someone edits manifest_diff(). agent-8's point: this file's own
+    # docstring says a check that has never failed is not a check. These run
+    # the REAL functions on synthetic lists, and each can red on its own.
+    same = ["a/x.py", "b/y.py"]
+    l10 = manifest_diff([("t", [], None, "a/x.py"), ("t", [], None, "b/y.py")],
+                        same) == ([], [])
+    ok = ok and l10
+    print("  %-5s %-44s %s" % ("PASS" if l10 else "FAIL",
+                               "L10 identical sets -> nothing reported",
+                               "" if l10 else "reported a difference"))
+    gone = manifest_diff([("t", [], None, "b/y.py")], same)
+    l11 = gone == (["a/x.py"], [])
+    ok = ok and l11
+    print("  %-5s %-44s vanished=%s" % ("PASS" if l11 else "FAIL",
+                                        "L11 a DELETED suite is VANISHED",
+                                        gone[0]))
+    # THE ONE THAT MATTERS: a swap holds the COUNT constant. A comparison by
+    # count would pass here; the set comparison must not.
+    swap = manifest_diff([("t", [], None, "b/y.py"), ("t", [], None, "c/z.py")],
+                         same)
+    l12 = swap == (["a/x.py"], ["c/z.py"])
+    ok = ok and l12
+    print("  %-5s %-44s vanished=%s unregistered=%s"
+          % ("PASS" if l12 else "FAIL", "L12 a COUNT-PRESERVING swap still reds",
+             swap[0], swap[1]))
+    # L13: THE ABSENT-MANIFEST DECISION, which is where the defect lived.
+    # The first version of this arm asserted only that load_manifest() returns
+    # None. It does -- in the correct build AND in the broken one. agent-8
+    # reverted the decision to WARN with the wording untouched and the selftest
+    # stayed 13/13 PASS while the gate exited 0 on a deleted suite. An arm that
+    # names a failure it cannot express is not an arm, so this one calls the
+    # DECISION, not the loader, and a FAIL->WARN mutant reds it.
+    l13a = manifest_state(None) == "FAIL"
+    ok = ok and l13a
+    print("  %-5s %-44s got %r, want 'FAIL'"
+          % ("PASS" if l13a else "FAIL",
+             "L13 absent manifest -> FAIL", manifest_state(None)))
+    l13b = manifest_state(["a/x.py"]) is None
+    ok = ok and l13b
+    print("  %-5s %-44s got %r, want None"
+          % ("PASS" if l13b else "FAIL",
+             "L13b a PRESENT manifest -> no manifest verdict",
+             manifest_state(["a/x.py"])))
+    l13c = manifest_state(None, no_manifest=True) == "WARN"
+    ok = ok and l13c
+    print("  %-5s %-44s got %r, want 'WARN'"
+          % ("PASS" if l13c else "FAIL",
+             "L13c --no-manifest -> WARN, never FAIL",
+             manifest_state(None, no_manifest=True)))
+    # ...and the loader half: an absent file really does come back as None, so
+    # the decision above is being fed the state the runner will actually see.
+    saved = MANIFEST
+    try:
+        globals()["MANIFEST"] = os.path.join(work, "does-not-exist.txt")
+        l13d = load_manifest() is None
+    finally:
+        globals()["MANIFEST"] = saved
+    ok = ok and l13d
+    print("  %-5s %-44s %s" % ("PASS" if l13d else "FAIL",
+                               "L13d an absent FILE loads as None",
+                               "None" if l13d else "did not return None"))
+
+    # L14: THE WIRING. Every arm above calls the DECISION; none observed what
+    # main() DOES with it. agent-8 measured that gap: leave manifest_state()
+    # perfectly correct and change only the line that consumes it
+    # (states.append("WARN") instead of FAIL) and the selftest stayed 16/16
+    # PASS while the gate exited 0 on a deleted suite -- with the row still
+    # PRINTING the word FAIL. A gate is its exit code; a correct function
+    # wired to the wrong verdict is a wrong gate.
+    l14 = manifest_states(None) == ["FAIL"]
+    ok = ok and l14
+    print("  %-5s %-44s got %r, want ['FAIL']"
+          % ("PASS" if l14 else "FAIL",
+             "L14 absent -> states gets FAIL", manifest_states(None)))
+    l14b = manifest_states(["a/x.py"]) == []
+    ok = ok and l14b
+    print("  %-5s %-44s got %r, want []"
+          % ("PASS" if l14b else "FAIL",
+             "L14b present -> states gets nothing", manifest_states(["a/x.py"])))
+    l14c = manifest_states(None, no_manifest=True) == ["WARN"]
+    ok = ok and l14c
+    print("  %-5s %-44s got %r, want ['WARN']"
+          % ("PASS" if l14c else "FAIL",
+             "L14c --no-manifest -> states gets WARN",
+             manifest_states(None, no_manifest=True)))
+    # L15: the verdict->exit-code mapping, which is the last place a gate can
+    # lie. A FAIL that returns 0 is the whole bug in one line.
+    l15 = exit_code("FAIL") == 1 and exit_code("WARN") == 0 and exit_code("PASS") == 0
+    ok = ok and l15
+    print("  %-5s %-44s FAIL->%d WARN->%d PASS->%d"
+          % ("PASS" if l15 else "FAIL", "L15 FAIL exits 1, WARN/PASS exit 0",
+             exit_code("FAIL"), exit_code("WARN"), exit_code("PASS")))
+
     # L4: the aggregate verdict must follow the worst suite.
     verdict = verdict_of(["PASS", "WARN", "FAIL"])
     good_case = verdict == "FAIL"
@@ -366,6 +496,57 @@ def selftest():
     print("  %-5s %-44s got %s, want FAIL" % ("PASS" if good_case else "FAIL",
                                               "L4 one FAIL makes the verdict FAIL", verdict))
     return ok
+
+
+def manifest_state(expected, no_manifest=False):
+    """The VERDICT the manifest should contribute, given what was loaded.
+
+    This exists as a function for one reason: the decision is the defect. The
+    first version of the absent-manifest fix put the choice inline in main(),
+    and the selftest arm for it could only assert that load_manifest() returns
+    None -- which it did, in both the correct build and the broken one. MEASURED
+    by agent-8: revert the inline choice to WARN, wording untouched, and the
+    selftest stayed 13/13 PASS while the gate exited 0 on a deleted suite. An
+    arm that cannot express the failure it is named after is not an arm.
+    Extracted here, the choice is callable without a tree and a mutant flipping
+    FAIL->WARN reds it.
+
+    Returns None when there is nothing to report (the manifest is present and
+    should be compared normally).
+    """
+    if no_manifest:
+        # A human typed the flag. Deliberate, and the row says what it costs.
+        return "WARN"
+    if expected is None:
+        # The only checkout without suites.txt is one where somebody removed
+        # it: an older checkout has no reader for it either. Same act as
+        # deleting a suite, one level up.
+        return "FAIL"
+    return None
+
+
+def manifest_states(expected, no_manifest=False):
+    """The manifest's contribution to `states`, as a LIST, or [].
+
+    This is the WIRING, and it needed its own seam for a reason agent-8
+    measured: keep manifest_state() perfectly correct and change only the line
+    that consumes it -- `states.append("WARN")` instead of FAIL -- and the
+    selftest stayed 16/16 PASS while the gate exited 0 on a deleted suite, with
+    the row still PRINTING the word FAIL two lines above a passing verdict.
+    Every arm called the decision; none observed what was done with it.
+
+    A gate is its exit code. A correct pure function wired to the wrong verdict
+    is a wrong gate, and it is worse than an obviously broken one because the
+    row and the exit code disagree.
+    """
+    st = manifest_state(expected, no_manifest)
+    return [] if st is None else [st]
+
+
+def exit_code(verdict):
+    """The one place a verdict becomes an exit status. Extracted so a mutant
+    here can red an arm rather than hiding in main()'s last line."""
+    return 0 if verdict in ("PASS", "WARN") else 1
 
 
 def verdict_of(states):
@@ -382,6 +563,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true",
                     help="prove the runner can report a failure")
+    ap.add_argument("--no-manifest", action="store_true",
+                    help="run WITHOUT tools/suites.txt. Deliberate and loud: "
+                         "this run cannot tell a deleted suite from a passing "
+                         "one, so the verdict says so.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -398,8 +583,42 @@ def main():
         return 2
 
     suites = discover()
-    print("check: %d suite(s), from %s\n" % (len(suites), ROOT))
     states = []
+    expected = load_manifest()
+    # The WIRING, through one function, so an arm can observe it. Do not
+    # inline states.append() here: that is exactly the line agent-8 mutated.
+    _mstates = manifest_states(expected, args.no_manifest)
+    mstate = manifest_state(expected, args.no_manifest)
+    if mstate == "WARN":
+        print("  %-5s %-38s --no-manifest: a deleted suite is indistinguishable "
+              "from a passing one in this run" % ("WARN", "suite manifest"))
+    elif mstate == "FAIL":
+        # See manifest_state(): the only checkout that lacks this file is one
+        # where somebody removed it.
+        print("  %-5s %-38s tools/suites.txt is missing: a deleted suite is "
+              "indistinguishable from a passing one (pass --no-manifest to "
+              "accept that risk deliberately)" % ("FAIL", "suite manifest"))
+    states.extend(_mstates)
+    if mstate is None:
+        vanished, unregistered = manifest_diff(suites, expected)
+        if vanished:
+            print("  %-5s %-38s expected but NOT FOUND: %s"
+                  % ("FAIL", "suite manifest: vanished", ", ".join(vanished)))
+            states.append("FAIL")
+        else:
+            print("  %-5s %-38s all %d expected suite(s) present"
+                  % ("PASS", "suite manifest: no suite vanished",
+                     len(expected)))
+            states.append("PASS")
+        if unregistered:
+            # Not a failure: a new suite is a normal thing to add. But it must
+            # be SEEN and registered, because "green" is a claim about an
+            # agreed set, and a suite nobody registered is outside that set.
+            print("  %-5s %-38s found but NOT in tools/suites.txt: %s"
+                  % ("WARN", "suite manifest: unregistered",
+                     ", ".join(unregistered)))
+            states.append("WARN")
+    print("check: %d suite(s), from %s\n" % (len(suites), ROOT))
     for name, argv, special, _rel in suites:
         state, detail = run_suite(name, argv, special, args.verbose)
         states.append(state)
@@ -421,9 +640,14 @@ def main():
         print("  %-5s %-38s %s" % (state, label, detail))
     verdict = verdict_of(states)
     print()
-    print("CHECK: %s (%d pass, %d warn, %d fail)"
-          % (verdict, states.count("PASS"), states.count("WARN"), states.count("FAIL")))
-    return 0 if verdict in ("PASS", "WARN") else 1
+    print("CHECK: %s (%d pass, %d warn, %d fail)%s"
+          % (verdict, states.count("PASS"), states.count("WARN"),
+             states.count("FAIL"),
+             # agent-8's ask: a reader quoting "CHECK: WARN" never sees the
+             # flag that produced it. Put the caveat ON the line people quote.
+             "  [--no-manifest: deleted suites are invisible this run]"
+             if args.no_manifest else ""))
+    return exit_code(verdict)
 
 
 if __name__ == "__main__":
