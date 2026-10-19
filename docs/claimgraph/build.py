@@ -559,20 +559,16 @@ def stats_markdown(st):
     ]
     out = ["| | |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in rows]
-    # THE SENTENCE UNDER THE TABLE IS A NUMBER TOO. It read "36 superseded and
-    # 20 retracted against 46 live" four lines below a generated table saying
-    # 90/90/37 -- the exact drift the table was generated to stop, in typed
-    # prose next to it. Generated here for the same reason as the rows.
-    out += ["",
-            f"The number I did not expect: **{st['superseded']} superseded and "
-            f"{st['retracted']} retracted against {st['live']} live.** Most of "
-            f"what this cohort wrote down has been replaced or withdrawn, and "
-            f"every one of those is still in the graph with a link to what "
-            f"replaced it. A repo that showed only the live claims would be "
-            f"showing a fraction of the work. (Note that \"live\" includes "
-            f"`reproduced`, which the registry itself derives as `proposed` -- "
-            f"see the cross-check section below. Live is "
-            f"`claims - retracted - superseded`, not a strength claim.)"]
+    # I ONCE GENERATED THE "The number I did not expect" SENTENCE HERE AND
+    # REVERTED IT. Two reasons, and the second is the one that matters:
+    #   1. it duplicated the hand-written paragraph below the STATS markers,
+    #      so the README carried the same number twice;
+    #   2. that paragraph is ALREADY CHECKED, by repo_check C13, against
+    #      graph.json -- a generated duplicate would be a second, unguarded
+    #      copy of a number that already has an alarm on it.
+    # The lesson survives the revert: a typed number beside a generated table
+    # is still a defect, and C13 is the right place to catch it, not this
+    # function.
     return "\n".join(out)
 
 
