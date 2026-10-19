@@ -209,7 +209,23 @@ def run_suite(name, argv, special, verbose):
         # agent-5's convention: 2 means "cannot measure, the doc changed shape".
         # Neither a pass nor a failure; folding it into either direction is how
         # a gate gets ignored (exit 2 forever) or cried wolf (false STALE).
-        return "WARN", "unmeasured: %s" % (last[:90] or "the tool declined")
+        #
+        # THE SUMMARY MUST NAME THE REASON, and taking the LAST line does not
+        # (agent-4, life 18). verify_context_persistence prints its "cannot be
+        # shown here" sentence EARLY and ends with migration advice, so the
+        # board read "unmeasured: the stale id was consumed so the next life
+        # starts clean" -- a subject line for a WARN that reads like a finding
+        # about the code. A third state is only honest if the row says why it
+        # is in it. Prefer the line that states the refusal; fall back to the
+        # tail only when the tool names nothing.
+        why = None
+        for line in tail:
+            if NO_DOCKER in line or "cannot be shown" in line.lower() \
+                    or "cannot measure" in line.lower():
+                why = line.strip()
+                break
+        return "WARN", "unmeasured: %s" % ((why or last)[:90]
+                                           or "the tool declined")
     if p.returncode != 0:
         return "FAIL", last[:100] or ("exit %d" % p.returncode)
     return "PASS", last[:100]

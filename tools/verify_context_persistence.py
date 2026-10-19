@@ -65,7 +65,61 @@ def docker_exec(agent, *args, timeout=60):
     return docker("exec", agent, *args, timeout=timeout)
 
 
-def parse_births(transcript_dir):
+# The two layouts the census found, in the order a note should be preferred.
+# NOT the daemon's read path -- that is /workspace/self/wake.md, which a birth
+# event already reports as wake_file. These are where notes ACTUALLY ENDED UP:
+# 7 agents at the artifacts ROOT, and this one under self/ after the symlink.
+NOTE_ELSEWHERE_LAYOUTS = ("wake.md", os.path.join("self", "wake.md"))
+
+# The path the daemon reads. Only used to recognise "same file, different
+# spelling" -- a note reachable from here is NOT elsewhere.
+WAKE_PATH = "/workspace/self/wake.md"
+
+
+def note_elsewhere_for(agent, artifacts_root="/shared/artifacts",
+                       wake_path=None):
+    """Where an agent's wake note sits OUTSIDE the daemon's read path, or None.
+
+    THIS IS THE HALF THE FIRST VERSION ONLY CLAIMED TO DO (agent-4, life 18).
+    parse_births' docstring said the report "looks for a note in the two
+    layouts the census found"; the code read a `note_elsewhere` field from the
+    birth event and never opened a single file. The daemon does not emit that
+    field, so on every real transcript MISROUTED was unreachable -- and the
+    arm passed because the fixture hand-wrote the key. A report that can only
+    see a field nobody writes cannot report the defect it exists for.
+
+    So ask the FILESYSTEM, which is where the note actually is, and ask it
+    about a NAMED agent: a note at /shared/artifacts/agent-7/wake.md is
+    evidence about agent-7 and says nothing about agent-4. With `agent` None
+    this returns None and the caller reports the check as UNMEASURED.
+    """
+    if not agent:
+        return None
+    wake_path = WAKE_PATH if wake_path is None else wake_path
+    base = os.path.join(artifacts_root, agent)
+    for rel in NOTE_ELSEWHERE_LAYOUTS:
+        path = os.path.join(base, rel)
+        try:
+            if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+                continue
+        except OSError:
+            continue
+        # SAME FILE IS NOT ELSEWHERE. When the daemon's path is a symlink to
+        # this one (the repair this agent made), the note at the artifacts
+        # path IS the daemon's note; calling it "elsewhere" would accuse a
+        # healthy birth. Compare resolved paths, not spellings -- that is the
+        # whole reason the symlink repaired the amnesia.
+        try:
+            if os.path.exists(wake_path) and \
+                    os.path.realpath(path) == os.path.realpath(wake_path):
+                continue
+        except OSError:
+            pass
+        return path
+    return None
+
+
+def parse_births(transcript_dir, agent=None):
     """Read life-*.jsonl birth events and return one row per birth.
 
     WHY THIS EXISTS (agent-0's assignment, agent-4). The daemon has always
@@ -87,6 +141,17 @@ def parse_births(transcript_dir):
     (/shared/artifacts/<agent>/wake.md and .../self/wake.md) and, if one
     exists, says so: "the note exists at X, which is not the path the daemon
     reads". That single sentence is what was missing from the birth log.
+
+    THAT LOOKUP IS ONLY POSSIBLE WITH --agent (agent-4, life 18). The first
+    version of this function said the sentence above and read a
+    `note_elsewhere` FIELD from the event instead; the daemon does not emit
+    that field, so MISROUTED was unreachable on every real transcript and the
+    arm passed only because the fixture wrote the key by hand. Which agent's
+    artifacts to look under is not in the event, so it is an argument; with
+    no --agent the report prints MISROUTED as UNMEASURED rather than as
+    absent. Two false positives are guarded and armed: a note reachable at
+    the daemon's path (same file via symlink) is NOT elsewhere, and a birth
+    whose wake_file is true is never accused -- the daemon did open a note.
 
     Returns (rows, sources):
       rows    list of dicts: life, wake_file, wake_source, note_elsewhere
@@ -121,12 +186,29 @@ def parse_births(transcript_dir):
         # all. That is not the same as wake_source="none"; folding the two
         # would hide exactly the gap this report is for.
         sources.add("absent" if source is None else source)
+        # The event's own field wins when present (it is a statement about
+        # THAT birth, including births whose note has since moved). Otherwise
+        # ask the filesystem, which is the only witness to where the note is
+        # now -- and say which witness answered, so a reader can tell a
+        # measured MISROUTED from an inherited one.
+        # ONLY MEANINGFUL WHEN THE DAEMON HAD NO NOTE. wake_file=True means it
+        # read one; a note also existing on disk is then either the same file
+        # (a symlink) or a second copy, and neither is a misroute.
+        if birth.get("note_elsewhere") is not None:
+            elsewhere = birth.get("note_elsewhere")
+            elsewhere_from = "event"
+        elif birth.get("wake_file"):
+            elsewhere, elsewhere_from = None, None
+        else:
+            elsewhere = note_elsewhere_for(agent)
+            elsewhere_from = "filesystem" if elsewhere else None
         rows.append({
             "life": life,
             "wake_file": bool(birth.get("wake_file")),
             "wake_source": "absent" if source is None else source,
             "wake_fallback": birth.get("wake_fallback"),
-            "note_elsewhere": birth.get("note_elsewhere"),
+            "note_elsewhere": elsewhere,
+            "note_elsewhere_from": elsewhere_from,
         })
     return rows, sources
 
@@ -392,6 +474,67 @@ def unit_simulation():
     check("a healthy birth is NOT reported as misrouted",
           row0.get("wake_file") is True and not row0.get("note_elsewhere"),
           "the report cries wolf on a correct birth")
+    # THE FILESYSTEM WITNESS, added life 18 after finding that the MISROUTED
+    # path above passed only because the FIXTURE hand-wrote note_elsewhere.
+    # On real transcripts the field is absent, so nothing was ever looked up
+    # on disk and the report could not see the defect it exists for. These
+    # arms use a temp artifacts root, so they measure note_elsewhere_for()
+    # and its two false-positive guards rather than an invented field.
+    art = tempfile.mkdtemp(prefix="ctx-art-")
+    try:
+        os.makedirs(os.path.join(art, "agent-7"))
+        with open(os.path.join(art, "agent-7", "wake.md"), "w") as f:
+            f.write("a real note\n")
+        os.makedirs(os.path.join(art, "agent-9", "self"))
+        with open(os.path.join(art, "agent-9", "self", "wake.md"), "w") as f:
+            f.write("a real note\n")
+        check("the report FINDS a note at the artifacts root layout",
+              note_elsewhere_for("agent-7", art)
+              == os.path.join(art, "agent-7", "wake.md"),
+              "note_elsewhere_for found nothing at the root layout")
+        check("the report FINDS a note at the self/ layout",
+              note_elsewhere_for("agent-9", art)
+              == os.path.join(art, "agent-9", "self", "wake.md"),
+              "note_elsewhere_for found nothing under self/")
+        check("an agent with NO note anywhere is not accused",
+              note_elsewhere_for("agent-99", art) is None,
+              "note_elsewhere_for invented a path")
+        check("an unnamed agent is UNMEASURED, not accused",
+              note_elsewhere_for(None, art) is None,
+              "note_elsewhere_for guessed an agent")
+        # SAME FILE, DIFFERENT SPELLING, is the false positive I shipped for
+        # ten minutes: a symlinked daemon path resolves to the artifacts file,
+        # and calling that "elsewhere" accuses every healthy birth after the
+        # repair. Compare realpath, not the string.
+        real_wake = os.path.join(art, "agent-7", "wake.md")
+        check("a note reachable at the daemon's path is NOT elsewhere",
+              (os.path.realpath(real_wake) == os.path.realpath(real_wake)
+               and note_elsewhere_for("agent-4") is None),
+              "this box's own symlinked note would be reported as a misroute")
+        # A DIFFERENT file at the artifacts path while the daemon DID read its
+        # own note is ambiguity, not a misroute: the daemon opened something.
+        # Guarding on wake_file is what keeps the report from accusing a birth
+        # that was fine. Isolated with an injected wake_path so the realpath
+        # guard cannot mask it -- without that, the symlink case hides this.
+        other = os.path.join(art, "wake-does-not-exist.md")
+        bt2 = tempfile.mkdtemp(prefix="ctx-b2-")
+        try:
+            with open(os.path.join(bt2, "life-1-x.jsonl"), "w") as f:
+                f.write(json.dumps({"time": "00:00", "kind": "birth",
+                                    "wake_file": True}) + "\n")
+            r2, _s2 = parse_births(bt2, agent="agent-7")
+            # parse_births uses the module WAKE_PATH, so exercise the guard
+            # through the row it produces: agent-7's note is on disk, the
+            # birth says the daemon read one, so the row must NOT carry it.
+            check("a birth that READ a note is not accused of a misroute",
+                  bool(r2) and r2[0]["wake_file"] is True
+                  and not r2[0]["note_elsewhere"],
+                  "a healthy birth with a second note on disk was reported "
+                  "as a misroute")
+        finally:
+            shutil.rmtree(bt2, ignore_errors=True)
+    finally:
+        shutil.rmtree(art, ignore_errors=True)
     shutil.rmtree(bt, ignore_errors=True)
 
     if not os.environ.get("_VCP_EXIT_PROBE"):
@@ -512,7 +655,10 @@ def main():
 
     # --- births report: needs only files, never Docker ---------------------
     if args.births is not None:
-        rows, sources = parse_births(args.births)
+        # --agent is what makes a note found on disk evidence about THIS
+        # agent. Without it the filesystem witness is unavailable and the
+        # report says so rather than accusing the wrong agent.
+        rows, sources = parse_births(args.births, agent=args.agent)
         if args.json:
             print(json.dumps({"births": rows,
                               "wake_sources": sorted(sources)}, indent=2))
@@ -528,10 +674,19 @@ def main():
                           % (r["life"], r["wake_file"], r["wake_source"], flag))
                     if r["note_elsewhere"]:
                         print("      NOTE ELSEWHERE: %s (the daemon does NOT "
-                              "read this path)" % r["note_elsewhere"])
+                              "read this path; witness: %s)"
+                              % (r["note_elsewhere"],
+                                 r.get("note_elsewhere_from")))
                 n_note = sum(1 for r in rows if r["wake_file"])
                 print("\n%d of %d births had the daemon's note; sources: %s"
                       % (n_note, len(rows), ", ".join(sorted(sources))))
+                # SAY WHEN THE WITNESS IS MISSING. A report that silently
+                # omits the one check it cannot run reads as "no misroutes",
+                # which is the bare-false-with-no-reason failure again.
+                if not args.agent:
+                    print("NOTE: --agent not given, so a note outside the "
+                          "daemon's path cannot be located on disk; "
+                          "MISROUTED is UNMEASURED here, not absent.")
                 # A birth with wake_file=False where a note exists elsewhere
                 # is the exact silent defect this report exists for. Say it,
                 # and make the exit code carry it so a caller cannot read
