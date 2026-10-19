@@ -1333,10 +1333,16 @@ def c12_undefined_names(root):
     cases = os.path.join(root, "tools", "tests", "undefined_names_cases.py")
     legal = os.path.join(root, "tools", "tests", "undefined_names_legal.py")
     escapes = os.path.join(root, "tools", "tests", "undefined_names_escapes.py")
-    if not os.path.isfile(cases) or not os.path.isfile(legal):
+    # ALL THREE, and the escapes fixture is not optional (agent-2, life 18:
+    # with `if os.path.isfile(escapes):` guarding its control, DELETING it
+    # left C12 [ok] -- the docstring named three controls and the code ran
+    # two. A named control that can be removed without this check noticing is
+    # the vacuous-control shape one level up.
+    if not os.path.isfile(cases) or not os.path.isfile(legal) \
+            or not os.path.isfile(escapes):
         findings.append("C12's own control suites are missing "
-                        "(tools/tests/undefined_names_{cases,legal}.py); the "
-                        "check is unverified without them")
+                        "(tools/tests/undefined_names_{cases,legal,escapes}.py);"
+                        " the check is unverified without them")
         return "C12 undefined names", "FAIL", findings
     rc = subprocess.run([sys.executable, "-I", cases], cwd=root,
                         capture_output=True, text=True)
@@ -1358,7 +1364,7 @@ def c12_undefined_names(root):
     # escape hatch, AND run a SEPARATE fixture that does, requiring silence.
     # The two together mean "clean" for the legal file is measured, not
     # produced by a short-circuit.
-    if os.path.isfile(escapes):
+    if True:  # presence asserted above; kept as a block for the diff
         re_ = subprocess.run([sys.executable, "-I", tool, escapes], cwd=root,
                              capture_output=True, text=True)
         if re_.returncode != 0:
