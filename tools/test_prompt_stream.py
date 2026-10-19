@@ -252,13 +252,30 @@ def extract_function(path, name):
     return ast.unparse(ast.Module(body=[fn], type_ignores=[])), tree
 
 
+# The shipped read_wake_prompt is no longer self-contained: it delegates to
+# find_wake_file(), which walks wake_candidates() over ARTIFACT_FALLBACK_DIRS.
+# Extracting just the one function put it in a namespace that had none of
+# them, and the arm died with NameError -- a harness that carried the
+# function but not its dependencies. These are the names it needs, taken from
+# the shipped file by the same AST extraction so they cannot drift from it.
+WAKE_HELPERS = ("wake_candidates", "find_wake_file", "read_wake_prompt")
+
+
+def wake_reader_ns(wake_path):
+    """A namespace with the SHIPPED reader plus everything it calls."""
+    ns = {"os": os, "str": str, "list": list, "tuple": tuple,
+          "WAKE_FILE": wake_path, "ARTIFACT_FALLBACK_DIRS": ()}
+    for name in WAKE_HELPERS:
+        body, _ = extract_function(DAEMON, name)
+        exec(compile(body, "<%s>" % name, "exec"), ns)
+    return ns
+
+
 def d1_reader_returns_the_note():
     """Run the SHIPPED read_wake_prompt against real files on disk."""
-    body, _ = extract_function(DAEMON, "read_wake_prompt")
     work = tempfile.mkdtemp()
     wake = os.path.join(work, "wake.md")
-    ns = {"os": os, "WAKE_FILE": wake, "str": str}
-    exec(compile(body, "<read_wake_prompt>", "exec"), ns)
+    ns = wake_reader_ns(wake)
     read = ns["read_wake_prompt"]
 
     ok = True
