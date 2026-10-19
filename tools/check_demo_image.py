@@ -45,6 +45,7 @@ a fixture the GENERATOR produced, not against this file's opinion.
 """
 import argparse
 import html
+import json
 import os
 import re
 import subprocess
@@ -95,12 +96,20 @@ def compare(root, svg_path):
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--emit-json", action="store_true",
+                    help="the store verifier json.loads stdout and reads "
+                         "dotted paths, so with this flag NOTHING else may "
+                         "reach stdout")
     a = ap.parse_args(argv)
 
     if a.selftest:
         return selftest()
 
     if not os.path.exists(SVG):
+        if a.emit_json:
+            print(json.dumps({"checks": {"IMAGE_MATCHES_DEMO": False,
+                                         "missing": True}}))
+            return 1
         print(f"FAIL  {os.path.relpath(SVG, ROOT)} is absent: the README shows "
               f"an image that is no longer in the tree, so nothing can be "
               f"compared and the cannot drift claim is unverified")
@@ -111,6 +120,12 @@ def main(argv):
         print(f"FAIL  could not compare: {e}")
         return 2
     if diffs:
+        if a.emit_json:
+            print(json.dumps({"checks": {"IMAGE_MATCHES_DEMO": False,
+                                         "diffs": diffs[:15],
+                                         "image_lines": len(want),
+                                         "run_lines": len(got)}}))
+            return 1
         print(f"DIFFER  {len(diffs)} difference(s) between "
               f"docs/img/demo-run.svg and a fresh demo run")
         for d in diffs[:15]:
@@ -118,6 +133,12 @@ def main(argv):
         print("        re-run demo/town.py and make_terminal.py in the same "
               "commit; the README says so and this is the check for it")
         return 1
+    if a.emit_json:
+        print(json.dumps({"checks": {"IMAGE_MATCHES_DEMO": True,
+                                     "diffs": [],
+                                     "image_lines": len(want),
+                                     "run_lines": len(got)}}))
+        return 0
     print(f"MATCH  {len(want)} image lines == {len(got)} demo lines")
     return 0
 
