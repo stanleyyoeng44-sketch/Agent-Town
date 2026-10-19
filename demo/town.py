@@ -64,11 +64,32 @@ def free_port():
     return port
 
 
+# Per-sender credentials. The bank now authenticates EVERY sender, not only
+# agent-0 (see bank/SENDER_AUTH.md), so a client that sends no header gets 503
+# and the demo can no longer transfer at all. agent-10 measured exactly that:
+# branch demo -> HTTPError 503, master -> PASS. Both halves are needed -- a
+# provisioned token directory AND a header on every transfer -- because
+# provisioning alone turns the 503 into a 403.
+#
+# SEED_TOKEN is a demo value in a temp directory, never a real secret; the
+# bank only ever compares a header to the file's contents.
+CREDS = {}                      # agent name -> secret, filled in main()
+
+def _cred_header(sender):
+    secret = CREDS.get(sender)
+    return {"X-Bank-Sender-Token": secret} if secret else {}
+
+
 def http(method, url, body=None, timeout=5):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data:
         req.add_header("Content-Type", "application/json")
+    # A transfer is authenticated as its `from`. Nothing else needs a
+    # credential, and sending one on a read would be noise, not security.
+    if method == "POST" and isinstance(body, dict) and "from" in body:
+        for k, v in _cred_header(body["from"]).items():
+            req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
@@ -162,8 +183,21 @@ def main():
     # SEED funds exactly the names this demo provisions. Accounts are created
     # at 0 by design (a new balance must never be a grant -- see bank.py
     # ensure_account), so without SEED the two agents would start broke.
+    # PROVISION the credential the demo client will present. The bank resolves
+    # BANK_TOKEN_DIR (bank.py:90) and reads one file per sender; without this
+    # directory a per-sender bank answers 503 to every transfer, which is how
+    # the demo broke at 4610825. Written inside `work`, so it is a temp secret
+    # and dies with the run.
+    tokens = os.path.join(work, "bank-tokens")
+    os.makedirs(tokens, exist_ok=True)
+    for _name in ("agent-1", "agent-2"):
+        CREDS[_name] = "demo-" + _name + "-secret"
+        with open(os.path.join(tokens, _name), "w", encoding="utf-8") as _f:
+            _f.write(CREDS[_name] + "\n")
+
     env = dict(os.environ, PORT=str(port), START_MONEY="100",
-               SEED="agent-1:100,agent-2:100", DECAY_SECONDS="3600")
+               SEED="agent-1:100,agent-2:100", DECAY_SECONDS="3600",
+               BANK_TOKEN_DIR=tokens)
     src = open(BANK, encoding="utf-8").read()
     env_name = None
     for cand in ("BANK_DATA", "DATA", "LEDGER"):

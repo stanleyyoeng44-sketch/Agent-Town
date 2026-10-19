@@ -45,7 +45,29 @@ SHARED = "/shared"
 MAILBOX = os.path.join(SHARED, "mailbox")
 HUMAN_OUTBOX = "/workspace/human/outbox"
 BANK_URL = os.environ.get("BANK_URL", "http://host.docker.internal:8790")
+# Where this agent's own bank credential is mounted. The bank reads the SAME
+# name from its BANK_TOKEN_DIR; these are two mounts of one secret, which is
+# the point -- the bank cannot read an agent's container, so the operator
+# provisions both ends of the same file.
+SENDER_TOKEN_DIR = os.environ.get("BANK_TOKEN_DIR", "/app/bank-tokens")
 AGENT_NAME_RE = re.compile(r"^(?:agent-[0-9]+|glm-agent)$")
+
+
+def _read_credential(paths):
+    """The first existing, non-empty credential among `paths`, or None.
+
+    Empty counts as absent: an empty secret would match an empty header, and
+    'both sides are the empty string' is not authentication.
+    """
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                secret = f.read().strip()
+        except OSError:
+            continue
+        if secret:
+            return secret
+    return None
 
 
 def peers(my_name):
@@ -228,13 +250,34 @@ def main():
             payload = json.dumps({"from": my_name, "to": recipient,
                                   "amount": amount}).encode()
             headers = {"Content-Type": "application/json"}
+            # PRESENT THIS AGENT'S OWN CREDENTIAL. Until bank-per-sender-auth
+            # the bank authenticated ONLY sender == "agent-0", so this client
+            # sent a credential only for agent-0 and every other agent spent
+            # coins with no proof at all -- which is the hole itself, seen from
+            # the client side.
+            #
+            # Both routes are sent when both exist, because the bank accepts
+            # either for agent-0 and only the per-sender file for anyone else.
+            # A missing credential is reported BEFORE the request: the bank
+            # would answer 503 anyway, and "credential unavailable" tells the
+            # agent what to ask the operator for, where "transfer failed: 503"
+            # does not.
+            bank_token = _read_credential(
+                [os.path.join(SENDER_TOKEN_DIR, my_name),
+                 "/app/bank-tokens/%s" % my_name])
+            if bank_token:
+                headers["X-Bank-Token"] = bank_token
             if is_delegate:
-                try:
-                    with open("/app/agent0-transfer-token", encoding="utf-8") as f:
-                        headers["X-Agent0-Token"] = f.read().strip()
-                except OSError:
-                    return CallToolResult(content=[TextContent(
-                        type="text", text="delegate transfer credential unavailable")])
+                legacy = _read_credential(["/app/agent0-transfer-token"])
+                if legacy:
+                    headers["X-Agent0-Token"] = legacy
+            if not bank_token and not headers.get("X-Agent0-Token"):
+                return CallToolResult(content=[TextContent(
+                    type="text",
+                    text=("transfer credential unavailable for '%s': no "
+                          "/app/bank-tokens/%s and no legacy token. Ask the "
+                          "operator to mount one; the bank will refuse an "
+                          "unauthenticated transfer." % (my_name, my_name)))])
             req = urllib.request.Request(
                 f"{BANK_URL}/transfer", data=payload, method="POST",
                 headers=headers)

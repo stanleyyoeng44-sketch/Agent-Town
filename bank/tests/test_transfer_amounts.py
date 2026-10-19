@@ -99,6 +99,26 @@ def build(fixed, seed=""):
                              "knows how to redirect; live mail would be written")
     assert box in src, "mailbox redirect did not take effect"
 
+    # --- redirect the per-sender credential directory ---------------------
+    # ADDED WITH bank-per-sender-auth. Before it, /transfer authenticated only
+    # agent-0 and this suite transferred as `victim`/`agent-1` with no header.
+    # Once every sender must prove itself, those transfers get a 503 and the
+    # suite dies at its first seed -- a test breaking on a GOOD change, which
+    # is the failure mode the MAILBOX comment above already warns about, so it
+    # gets the same treatment: redirect, then provision the credentials the
+    # suite's own senders need.
+    tokens = os.path.join(work, "tokens")
+    os.makedirs(tokens)
+    tok_lit = ('TOKEN_DIR = os.environ.get("BANK_TOKEN_DIR", '
+               '"/run/secrets/bank-tokens")')
+    if tok_lit in src:
+        src = src.replace(tok_lit, "TOKEN_DIR = %r" % tokens)
+        assert tokens in src, "token-dir redirect did not take effect"
+        # every name this suite transfers AS gets a credential
+        for who, secret in (("victim", "t-victim"), ("agent-1", "t-a1"),
+                            ("fresh-b", "t-fresh"), ("ghost-a", "t-ghost")):
+            open(os.path.join(tokens, who), "w").write(secret + "\n")
+
     # --- choose the behaviour under test -----------------------------------
     if fixed:
         assert FIXED_ACCOUNT in src, (
@@ -149,11 +169,21 @@ def serve(work, path, port, seed):
     raise AssertionError("bank never came up on port %d" % port)
 
 
-def call(port, method, route, body=None):
+def call(port, method, route, body=None, token=None):
+    """HTTP call. `token` is sent as X-Bank-Token.
+
+    ADDED WITH bank-per-sender-auth: /transfer now authenticates EVERY sender,
+    not just agent-0. A transfer call must present its sender's credential, so
+    the suite passes it explicitly at the transfer sites. Reads and /accounts
+    still take no token -- this fix intentionally did not touch them (that is a
+    separate question, and agent-2's snapshot shows /accounts stays readable).
+    """
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Bank-Token"] = token
     req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, route),
-                                 data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
@@ -201,30 +231,39 @@ def exercise(fixed, port):
         done["A2 reads create no accounts"] = (after_accounts == before_accounts)
         done["A2 reads do not grow the ledger"] = (after_size == before_size)
 
+        before_ghost = dict(call(port, "GET", "/accounts")[1]["accounts"])
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "ghost-b", "to": "victim", "amount": 1000})
-        done["A: a fresh SENDER is refused"] = (st == 400)
+                     {"from": "ghost-b", "to": "victim", "amount": 1000}, token="t-ghost")
+        after_ghost = dict(call(port, "GET", "/accounts")[1]["accounts"])
+        # ASSERT THE INTENT, NOT THE STATUS CODE. With per-sender auth the
+        # refusal now happens at AUTHORISATION (503: ghost-b has no credential
+        # provisioned) rather than at the ledger (400: unknown sender). Both
+        # are the transfer being refused; pinning 400 alone made this check
+        # fail on a strictly better bank. What must be true either way is that
+        # the request was refused AND changed nothing.
+        done["A: a fresh SENDER is refused"] = (
+            st in (400, 401, 403, 503) and after_ghost == before_ghost)
 
         # B is the one a sender-only guard misses. Pay a fresh name 1 coin,
         # then try to spend its (pre-fix) 1000 starting balance.
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "victim", "to": "fresh-b", "amount": 1})
+                     {"from": "victim", "to": "fresh-b", "amount": 1}, token="t-victim")
         assert st == 200, "seeding the recipient failed: %r" % (st,)
         bal = call(port, "GET", "/balance/fresh-b")[1]["money"]
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "fresh-b", "to": "victim", "amount": 900})
+                     {"from": "fresh-b", "to": "victim", "amount": 900}, token="t-fresh")
         done["B: a fresh RECIPIENT cannot spend a grant"] = (st == 400)
         done["B: ...and its balance is only what it was paid"] = (bal == 1)
 
         # ---- legitimate behaviour that must survive ----------------------
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "agent-1", "to": "victim", "amount": 10})
+                     {"from": "agent-1", "to": "victim", "amount": 10}, token="t-a1")
         done["L1 an existing funded agent can transfer"] = (st == 200)
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "agent-1", "to": "victim", "amount": 99999})
+                     {"from": "agent-1", "to": "victim", "amount": 99999}, token="t-a1")
         done["L2 an overdraft is still refused"] = (st == 400)
         st, _ = call(port, "POST", "/transfer",
-                     {"from": "agent-1", "to": "brand_new", "amount": 5})
+                     {"from": "agent-1", "to": "brand_new", "amount": 5}, token="t-a1")
         done["L3 a fresh recipient still RECEIVES"] = (st == 200)
         done["L4 ...at exactly what was sent"] = (
             call(port, "GET", "/balance/brand_new")[1]["money"] == 5)
@@ -244,14 +283,14 @@ def exercise(fixed, port):
         in_mem_before = dict(call(port, "GET", "/accounts")[1]["accounts"])
         for i in range(5):
             call(port, "POST", "/transfer",
-                 {"from": "agent-1", "to": "junk-%d" % i, "amount": 999999})
+                 {"from": "agent-1", "to": "junk-%d" % i, "amount": 999999}, token="t-a1")
         in_mem_after = dict(call(port, "GET", "/accounts")[1]["accounts"])
         done["R: a refused transfer does not create accounts"] = (
             set(in_mem_after) == set(in_mem_before))
         # a legitimate transfer flushes state to disk; the refused names must
         # not ride along
         call(port, "POST", "/transfer",
-             {"from": "agent-1", "to": "victim", "amount": 1})
+             {"from": "agent-1", "to": "victim", "amount": 1}, token="t-a1")
         on_disk = set(json.load(open(ledger_path))["accounts"])
         done["R: refused names are not flushed on the next save"] = (
             not any(n.startswith("junk-") for n in on_disk))

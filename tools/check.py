@@ -82,7 +82,16 @@ SUITE_GLOBS = ["demo/town.py", "demo/selftest_demo.py",
                # agreement between two implementations is the only thing that
                # makes a text comparison believable. It exits 0 on match, 1 on
                # differ, 2 when it cannot measure -- the convention holds.
-               "tools/flagcheck.py"]
+               "tools/flagcheck.py",
+               # repo_check was NOT in this list, so the gate that is quoted
+               # as "one command runs everything" did not run the repo's
+               # self-check -- and agent-10 found a RED row (README said 29
+               # tracked .py, the tree had 31) that this gate reported as a
+               # clean 17/1/1. A gate with a hole in it is worse than no gate,
+               # because its green is quoted. The hole was invisible because
+               # adding one test file changes a NUMBER in the README, and
+               # nothing in SUITE_GLOBS counted.
+               "tools/repo_check.py"]
 
 
 NO_DOCKER = "NO DOCKER DAEMON"
@@ -91,7 +100,30 @@ EXTERNAL = [
     # (label, path, args) -- audits that live outside the repo but attest to it.
     # They take the tree path as argv[1] so they measure the tree under test,
     # not the live one.
-    ("docs: README bank transcript", os.path.join(A5, "check_readme_transcript.py")),
+    #
+    # THE TRANSCRIPT CHECK NOW RUNS FROM THE REPO. It used to run agent-5's
+    # frozen copy at /shared/artifacts/agent-5/repo_audit/, which is a
+    # SNAPSHOT: it still replays README curls with no credential, so a bank
+    # that correctly authenticates every sender makes it report "the bank in
+    # this tree is broken" -- a red about the instrument, not the tree. The
+    # repo's tools/check_readme_transcript.py is the maintained descendant
+    # (it has the same --selftest mutation control, plus header-aware replay
+    # and a credential-setup replay), so the gate measures the tree's own
+    # checker. The frozen copy is kept only because a gate that reads outside
+    # the tree is this repo's stated practice for INDEPENDENT witnesses --
+    # check_doc_blocks.py below still is one.
+    ("docs: README bank transcript",
+     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "check_readme_transcript.py")),
+    # THE CHECKER'S OWN CONTROL. The line above runs it with no arguments,
+    # which executes the replay only; its --selftest mutation arms never ran
+    # in the gate. agent-10 found three of those arms DEAD on 4041edf --
+    # printing "could not build the lie" and testing nothing -- while this gate
+    # reported the file PASS. A gate that runs a check but not its control is
+    # the same defect as a check that cannot red, one door down.
+    ("docs: README transcript CONTROL",
+     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                  "check_readme_transcript.py"), ["--selftest"]),
     ("docs: guide and demo blocks", os.path.join(A5, "check_doc_blocks.py")),
 ]
 
@@ -175,8 +207,15 @@ def run_suite(name, argv, special, verbose):
     #   rc != 0  -> prefer the last line that names a problem  (old behaviour)
     #   rc == 0  -> prefer the last line that names a SUCCESS, and never
     #               promote a line whose only verdict word is a failure one
-    BAD_WORDS = re.compile(r"RESULT|FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
-    GOOD_WORDS = re.compile(r"RESULT|PASS|HOLDS|MATCH|OK\b|GREEN", re.I)
+    # A WORD THAT APPEARS IN BOTH VOCABULARIES CANNOT VOTE. agent-10 found
+    # RESULT in both lists: a FAIL line whose detail happened to contain
+    # "a transfer RESULT of 900" was classified GOOD, so the gate printed
+    #     FAIL  docs: README transcript CONTROL   PASS  a transfer result ...
+    # -- a FAIL row whose detail reads like a pass, which is exactly the row
+    # that is supposed to tell a reader the control is dead. Removed from
+    # both: it is a noun here, not a verdict.
+    BAD_WORDS = re.compile(r"FAIL|STALE|ERROR|DIFFER|TIMEOUT", re.I)
+    GOOD_WORDS = re.compile(r"PASS|HOLDS|MATCH|OK\b|GREEN", re.I)
     # A line that says both ("control fired (pre-fix shape went mute): PASS")
     # is a success line: it reports a failure it INDUCED, then its own verdict.
     # The trailing verdict wins, so score the LAST match in the line.
@@ -365,7 +404,9 @@ def main():
         state, detail = run_suite(name, argv, special, args.verbose)
         states.append(state)
         print("  %-5s %-38s %s" % (state, name, detail))
-    for label, script in EXTERNAL:
+    for entry in EXTERNAL:
+        label, script = entry[0], entry[1]
+        extra = entry[2] if len(entry) > 2 else []
         if not os.path.exists(script):
             # agent-10's point: in a fresh clone these are ABSENT, so "one
             # command verifies the repo" would silently verify less. Say whose
@@ -374,7 +415,7 @@ def main():
             print("  %-5s %-38s agent-5's private audit, not in the repo (%s)"
                   % ("SKIP", label, script))
             continue
-        state, detail = run_suite(label, [sys.executable, "-I", script, ROOT],
+        state, detail = run_suite(label, [sys.executable, "-I", script, ROOT] + extra,
                                   "exit2-is-warn", args.verbose)
         states.append(state)
         print("  %-5s %-38s %s" % (state, label, detail))

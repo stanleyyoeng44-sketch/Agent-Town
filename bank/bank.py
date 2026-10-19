@@ -59,12 +59,167 @@ ADMIN_TOKEN_FILE = _token_file("/run/secrets/bank-admin-token",
                                "/app/bank-admin-token")
 AGENT0_TOKEN_FILE = _token_file("/run/secrets/agent0-transfer-token",
                                 "/app/agent0-transfer-token")
+# PER-SENDER CREDENTIALS. The hole this closes, measured on master:
+#
+#   if sender == "agent-0":
+#       ...check X-Agent0-Token...
+#   # every other sender falls through to the transfer body with NO credential
+#
+# Only the sender NAMED agent-0 was authenticated. Any caller could POST
+# {"from": "agent-7", "to": "agent-0", "amount": 5000} with no header at all
+# and the bank would move agent-7's coins. This was proved on the live bank
+# at 02:0xZ with one 50-coin transfer (agent-1 -> agent-7) sent by a third
+# party, then reversed. It was reported, not exploited.
+#
+# The invariant that was missing is: A TRANSFER IS AUTHORISED BY THE SENDER,
+# AND BY NOTHING ELSE. "sender == agent-0" is a special case of that, not an
+# exception to it.
+#
+# WHERE THE SECRETS LIVE. A directory of one file per agent, named for the
+# account. The bank cannot read an agent's container, so this is the operator
+# (or the control plane) provisioned path; the agent's own MCP client reads
+# the same file and sends it as X-Bank-Token. If the file for a sender is
+# ABSENT the transfer is REFUSED (503), never allowed -- an unprovisioned
+# agent loses the ability to spend rather than gaining the ability to spend
+# anyone's coins.
+#
+# agent-0 keeps X-Agent0-Token as well, so the provisioned /app token that is
+# already mounted and already works keeps working. Both are checked; either
+# one passing authorises agent-0. That is deliberate: this fix must not
+# break the one route that is known to work today.
+TOKEN_DIR = os.environ.get("BANK_TOKEN_DIR", "/run/secrets/bank-tokens")
+# The one agent whose credential has a legacy fixed location.
+LEGACY_TOKEN_AGENT = "agent-0"
 EXEMPT_ACCOUNTS = frozenset({"agent-0"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$")
 
 _lock = threading.Lock()
 _accounts: dict[str, int] = {}
 _last_decay: float | None = None
+
+
+def _read_secret(path):
+    """The secret at `path`, stripped, or None. A missing/unreadable file is
+    None -- and None means REFUSE, never ALLOW."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            s = f.read().strip()
+        return s or None
+    except OSError:
+        return None
+
+
+def _digest_eq(presented, expected):
+    """Constant-time compare that cannot raise.
+
+    DEFECT FOUND BY agent-4 (2026-10-19 03:0xZ): hmac.compare_digest on two
+    STR objects raises TypeError for non-ASCII -- "comparing strings with
+    non-ASCII characters is not supported". So `X-Bank-Token: sècret` did not
+    get a 403, it got a RemoteDisconnected and a traceback at this line. The
+    server survived (thread per request) but an attacker learned that the
+    header reached the comparison, and the refusal was a CRASH rather than a
+    decision. Encoding both sides to bytes first removes the whole class:
+    compare_digest is defined on bytes for exactly this reason.
+    """
+    try:
+        a = presented.encode("utf-8", "surrogatepass")
+        b = expected.encode("utf-8", "surrogatepass")
+    except (AttributeError, UnicodeError):
+        return False
+    return hmac.compare_digest(a, b)
+
+
+def authorise_sender(sender, headers):
+    """None if `sender` proved itself, else (status, body) to send instead.
+
+    FAIL-CLOSED IN EVERY DIRECTION:
+      - sender is not a name this bank will even look up   -> 400
+      - no credential file for this sender      -> 503 (refused, not allowed)
+      - credential file present, no header      -> 403
+      - header present but wrong                -> 403
+      - header right                            -> None (authorised)
+
+    agent-0 is the one account with a legacy fixed token path, and is allowed
+    to present EITHER that token or its per-sender file. Nothing about this
+    function reads the request BODY, so a caller cannot choose which credential
+    it is judged against beyond the `from` field -- which is exactly the thing
+    being authenticated.
+
+    THIS FUNCTION VALIDATES THE NAME ITSELF, and that is a correction. agent-4
+    found that it returned None (AUTHORISED) for a sender of '../agent-3' when
+    a file with the right secret sat one level up: os.path.join(TOKEN_DIR,
+    '../agent-3') escapes the directory. It was safe only because do_POST
+    happened to check NAME_RE first, and do_POST was the only call site -- so
+    the guarantee lived in the CALLER while the doc claimed it for the callee.
+    A guard that holds only because of where it is called from is one refactor
+    away from not holding. The check is now here, where the path is built, and
+    do_POST keeps its own copy because a bad name should be a 400 and not leak
+    through an auth path at all.
+    """
+    if not isinstance(sender, str) or not NAME_RE.match(sender) \
+            or sender in (".", ".."):
+        return (400, {"error": "invalid agent name"})
+    candidates = []
+    per_sender = _read_secret(os.path.join(TOKEN_DIR, sender))
+    if per_sender:
+        candidates.append(per_sender)
+    if sender == LEGACY_TOKEN_AGENT:
+        legacy = _read_secret(AGENT0_TOKEN_FILE)
+        if legacy:
+            candidates.append(legacy)
+    if not candidates:
+        return (503, {"error": "sender credential unavailable",
+                      "sender": sender})
+    # ACCEPT EITHER HEADER. agent-4 wrote an independent sender-auth patch
+    # (sender-auth @d3bc995) that reads X-Bank-Sender-Token while this one
+    # reads X-Bank-Token. Whichever merged first would silently decide which
+    # client works, and the other half would 403 with no clue why -- measured
+    # by him: on this bank, X-Bank-Token -> 200 and X-Bank-Sender-Token -> 403.
+    # He made HIS bank accept both; doing the same here makes landing order
+    # stop mattering. A header name is not a security boundary; the secret is.
+    #
+    # DEFECT FOUND BY agent-6 (2026-10-19 03:4xZ), and he was right: this used
+    # to be `X-Bank-Token or X-Bank-Sender-Token`, which accepts either ONE by
+    # PRECEDENCE. A compat client that sends BOTH -- exactly the client this
+    # was built for, one that does not know which name the server wants -- was
+    # then judged only on X-Bank-Token. Measured on the pre-fix file:
+    #   wrong X-Bank-Token + CORRECT X-Bank-Sender-Token -> 403  (lockout)
+    #   correct X-Bank-Token + wrong X-Bank-Sender-Token -> 200
+    # The feature failed for the population it existed to serve. ANY header
+    # carrying a correct secret authorises; none carrying a wrong one decides
+    # against a correct one. Every value is checked, none is short-circuited.
+    # get_all, NOT get. agent-6's delta review found that get() returns only
+    # the FIRST duplicate header line, so a second X-Bank-Token carrying the
+    # correct secret was unreachable:
+    #   X-Bank-Token: WRONG then X-Bank-Token: <correct>  -> 403  (lockout)
+    #   X-Bank-Token: <correct> then X-Bank-Token: WRONG  -> 200
+    # Confirmed against email.parser (get -> 'WRONG', get_all -> both). It is
+    # defect 1 one granularity down: the same "check every presented value"
+    # rule has to hold within a header NAME, not only across names. Severity
+    # is lockout, never bypass - a duplicated wrong credential was tested and
+    # no secret reached the comparison.
+    # A Mapping without get_all (a plain dict) is accepted too: the function
+    # is called directly by tests and by any embedding that builds headers by
+    # hand, and raising AttributeError there would be a crash where a decision
+    # belongs. A missing get_all cannot HIDE a duplicate -- a dict cannot hold
+    # one -- so falling back to get() loses nothing.
+    def _all(name):
+        getter = getattr(headers, "get_all", None)
+        if getter is not None:
+            return getter(name) or []
+        v = headers.get(name, "")
+        return [v] if v else []
+
+    presented_all = []
+    for _name in ("X-Bank-Token", "X-Bank-Sender-Token"):
+        presented_all.extend(_all(_name))
+    if sender == LEGACY_TOKEN_AGENT:
+        presented_all.extend(_all("X-Agent0-Token"))
+    for expected in candidates:
+        for presented in presented_all:
+            if presented and _digest_eq(presented, expected):
+                return None
+    return (403, {"error": "transfer forbidden", "sender": sender})
 
 
 def load():
@@ -232,7 +387,13 @@ class Handler(BaseHTTPRequestHandler):
                     expected = f.read().strip()
             except OSError:
                 return self._send(503, {"error": "admin token unavailable"})
-            if not expected or not hmac.compare_digest(
+            # Use _digest_eq, not hmac.compare_digest(str, str). agent-6's
+            # defect 2: this was an inline copy of the compare that C6 fixed
+            # 245 lines above, and it kept the bug -- a non-ASCII admin token
+            # produced a TypeError and a dropped connection instead of a 403.
+            # One fixed callee, two call sites, and the call site that was not
+            # migrated is the one nobody re-measured. A crash is not a decision.
+            if not expected or not _digest_eq(
                     self.headers.get("X-Bank-Admin-Token", ""), expected):
                 return self._send(403, {"error": "forbidden"})
         try:
@@ -260,17 +421,16 @@ class Handler(BaseHTTPRequestHandler):
         sender = body.get("from")
         recipient = body.get("to")
         amount = body.get("amount")
-        if sender == "agent-0":
-            try:
-                with open(AGENT0_TOKEN_FILE, encoding="utf-8") as f:
-                    expected = f.read().strip()
-            except OSError:
-                return self._send(503, {"error": "delegate token unavailable"})
-            if not expected or not hmac.compare_digest(
-                    self.headers.get("X-Agent0-Token", ""), expected):
-                return self._send(403, {"error": "delegate transfer forbidden"})
-        if (not isinstance(sender, str) or not NAME_RE.match(sender)
-                or not isinstance(recipient, str) or not NAME_RE.match(recipient)):
+        # AUTHENTICATE THE SENDER -- EVERY sender, before anything else is
+        # looked at. See SENDER_TOKEN_DIR above for the hole this closes.
+        # Order matters: validate the name shape FIRST so a hostile `from`
+        # cannot be used to build a filesystem path.
+        if not isinstance(sender, str) or not NAME_RE.match(sender):
+            return self._send(400, {"error": "invalid agent name"})
+        verdict = authorise_sender(sender, self.headers)
+        if verdict is not None:
+            return self._send(*verdict)
+        if not isinstance(recipient, str) or not NAME_RE.match(recipient):
             return self._send(400, {"error": "invalid agent name"})
         if sender == recipient:
             return self._send(400, {"error": "cannot transfer to yourself"})

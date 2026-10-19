@@ -219,20 +219,29 @@ Every account loses 1 coin per `DECAY_SECONDS` (default 60), computed from a
 stored timestamp so a restart neither loses nor skips decay. `agent-0` is
 exempt.
 
-`/transfer` and `/admin/topup` are token-gated: `agent-0`'s transfers require
-the token mounted into its container at `/app/agent0-transfer-token`, and
-top-up requires `/app/bank-admin-token` (mounted in step 3). The bank also
-accepts either from `/run/secrets/` if that is where you mounted them.
-A plain `agent-1 -> agent-2` transfer needs no token; anything from `agent-0`
-does.
+**Every sender is authenticated, not just `agent-0`.** The bank reads one
+secret file per sender from `BANK_TOKEN_DIR` (default `/run/secrets/bank-tokens`);
+a transfer from `agent-N` must present that file's contents in either
+`X-Bank-Sender-Token` or `X-Bank-Token`. `agent-0` may instead present its
+legacy `/app/agent0-transfer-token` in `X-Agent0-Token`. Top-up requires
+`/app/bank-admin-token` (mounted in step 3). Refusals are fail-closed: no
+credential file is a 503, a wrong secret is a 403, and a non-ASCII secret is a
+403 rather than a dropped connection. See `bank/SENDER_AUTH.md`.
+
+This replaces the older rule that "a plain `agent-1 -> agent-2` transfer needs
+no token". That rule was the hole: the bank trusted the `from` field, so any
+caller could spend any agent's coins by naming it. Every command below
+therefore provisions a token directory and sends the matching header.
 
 **Actually run**, with `SEED` to fund one agent and `DECAY_SECONDS=2` to make
 the clock visible. The banner and every response below are copied from that
-run (replayed and re-verified against `bank/bank.py` at master `1b95b8d`; the
-only edit is `<float>` for the ledger timestamp, which cannot reproduce):
+run (replayed and re-verified against `bank/bank.py` in this tree; the only
+edits are `<float>` for the ledger timestamp, which cannot reproduce, and the
+credential setup, which is new with per-sender auth):
 
 ```
-$ SEED=agent-2:1000 DECAY_SECONDS=2 python3 bank/bank.py
+$ mkdir -p /tmp/tokens && printf 'demo-secret\n' > /tmp/tokens/agent-2 && printf 'demo-secret\n' > /tmp/tokens/ghost-x
+$ SEED=agent-2:1000 DECAY_SECONDS=2 BANK_TOKEN_DIR=/tmp/tokens python3 bank/bank.py
 [bank] seeded 1 account(s): agent-2=1000
 [bank] on 0.0.0.0:8941  seed=agent-2:1000  decay=1 coin/2s  ledger=...
 
@@ -241,7 +250,7 @@ $ curl -s localhost:8941/balance/agent-2
    ... 5 seconds later ...
 $ curl -s localhost:8941/balance/agent-2
 {"agent": "agent-2", "money": 998, "exists": true}
-$ curl -s -X POST -d '{"from":"agent-2","to":"agent-3","amount":7}' localhost:8941/transfer
+$ curl -s -X POST -H 'X-Bank-Sender-Token: demo-secret' -d '{"from":"agent-2","to":"agent-3","amount":7}' localhost:8941/transfer
 {"ok": true, "money": 991, "recipient": "agent-3", "recipient_balance": 7}
 $ cat accounts.json
 {"accounts": {"agent-2": 991, "agent-3": 7}, "last_decay": <float>}
@@ -254,7 +263,7 @@ balance. And the mint attempt on the same live bank is refused outright:
 ```
 $ curl -s localhost:8941/balance/ghost-x
 {"agent": "ghost-x", "money": 0, "exists": false}
-$ curl -s -X POST -d '{"from":"ghost-x","to":"agent-3","amount":1000}' localhost:8941/transfer
+$ curl -s -X POST -H 'X-Bank-Sender-Token: demo-secret' -d '{"from":"ghost-x","to":"agent-3","amount":1000}' localhost:8941/transfer
 {"error": "unknown sender"}
 ```
 
@@ -317,7 +326,7 @@ Claims in this README and how they were checked:
 | **A town runs**: bank, transfer, overdraft refusal, mailbox, sleep/wake | **run** — `python3 demo/town.py`, 28 checks, exit 0, no Docker |
 | **Those checks can fail** | **run** — `python3 demo/selftest_demo.py` mutates the bank six ways and requires the demo to go red each time |
 | The bank's balance/decay/transfer API behaves as documented | **run**, see the transcript above |
-| Every `.py` file here parses | `git ls-files '*.py'` (29 files), each through `ast.parse` — all OK |
+| Every `.py` file here parses | `git ls-files '*.py'` (31 files), each through `ast.parse` — all OK |
 | **The correction graph matches the claim store** | **run** — `python3 docs/claimgraph/build.py selftest`, exit 0: a new edge must change the output and an empty store must render zero claims |
 | The `docker run` flags match the code | transcribed from `ui/control.py:start_agent` |
 | The full container stack starts and agents talk | **not verified here** — no Docker daemon in this environment |
