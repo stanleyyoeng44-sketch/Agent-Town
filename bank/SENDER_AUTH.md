@@ -82,25 +82,44 @@ The two suites that existed before also pass, unchanged in intent:
    rather than a status code that changed for a good reason. Pinning 400 alone
    made a correct check fail on a strictly better bank.
 
-## What is NOT done, and blocks deployment
+## Deployment: BOTH HALVES ARE IN THIS COMMIT
 
-**`/app/mcp-stdio.py` attaches a credential only when the caller is agent-0.**
-Lines ~231-237 read `/app/agent0-transfer-token` under `if is_delegate`.
-Every other agent sends no header. After this fix lands, **every non-agent-0
-agent's `send_money` gets a 503** until the client changes too.
+**Corrected 03:2xZ.** An earlier version of this section said the client change
+was out of reach and that a non-agent-0 `send_money` would get a **503**. Both
+were wrong:
 
-That file is baked into the container image and I cannot edit it from here. The
-required client change is small:
+- `agent/mcp-stdio.py` IS tracked in this repo, so the client change ships with
+  the bank change in this same commit. They cannot land apart.
+- The status is **403, not 503**. Measured by agent-4's `deploy_check.py`, which
+  pairs the real client slice with the real bank: the bank FINDS the sender's
+  credential file and then rejects a missing header, which is the 403 branch.
+  503 means "no credential file for this sender". Getting this wrong is the
+  kind of number someone debugs at 4am.
 
-    headers["X-Bank-Token"] = read(f"/app/bank-tokens/{my_name}").strip()
+What the client now does: reads `<BANK_TOKEN_DIR>/<agent name>` (default
+`/app/bank-tokens`), sends it as `X-Bank-Token`, and still sends the agent-0
+legacy token when it exists. An empty file counts as absent, because
+"both sides empty" is not authentication.
 
-and the operator must mount `/run/secrets/bank-tokens/<agent>` (or
-`/app/bank-tokens/<agent>`) for each agent. Until both exist, this branch is a
-correct fix that would break the economy if merged alone. **Merge it WITH the
-client change and the mounts, or not at all.** That is a deployment decision
-for Stanley, not for me.
+Verified end to end outside a container: the client's own `_read_credential`
+supplies the secret, and the real bank answers **200 with it, 403 without,
+403 for a wrong token**.
 
-## Review status
+The bank accepts **either** `X-Bank-Token` or `X-Bank-Sender-Token`, because
+agent-4's independent patch used the other name; accepting both makes merge
+order irrelevant.
+
+### What the OPERATOR must still do
+
+Mount the SAME secret at both ends: `<bank token dir>/<agent>` in the bank
+container and `/app/bank-tokens/<agent>` in each agent container. Nothing in
+either file can enforce that they match, so `agent/tests/test_bank_credential_paths.py`
+reads both sources and asserts they agree on the header names and on the
+empty-file rule.
+
+Without the mounts this is a correct fix that refuses every non-agent-0
+transfer (403). The code halves now ship together; the MOUNTS are the remaining
+operator step, and that is Stanley's, not mine.
 
 ## Review round 1 — agent-4, 2026-10-19 03:0xZ
 

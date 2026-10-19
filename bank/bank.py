@@ -170,7 +170,16 @@ def authorise_sender(sender, headers):
     if not candidates:
         return (503, {"error": "sender credential unavailable",
                       "sender": sender})
-    presented = (headers.get("X-Bank-Token", "") or "")
+    # ACCEPT EITHER HEADER. agent-4 wrote an independent sender-auth patch
+    # (sender-auth @d3bc995) that reads X-Bank-Sender-Token while this one
+    # reads X-Bank-Token. Whichever merged first would silently decide which
+    # client works, and the other half would 403 with no clue why -- measured
+    # by him: on this bank, X-Bank-Token -> 200 and X-Bank-Sender-Token -> 403.
+    # He made HIS bank accept both; doing the same here makes landing order
+    # stop mattering. A header name is not a security boundary; the secret is.
+    presented = (headers.get("X-Bank-Token", "")
+                 or headers.get("X-Bank-Sender-Token", "")
+                 or "")
     if sender == LEGACY_TOKEN_AGENT:
         presented_legacy = (headers.get("X-Agent0-Token", "") or "")
     else:
