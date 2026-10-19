@@ -115,12 +115,30 @@ def run_arms(mod):
     """Every arm, against an already-configured module. Returns pass count."""
     results = []
 
-    # A -- SELF_DIR wins and is verbatim
+    # A -- A SELF_DIR note is returned VERBATIM (surrounding whitespace and all).
+    #
+    # IT WRITES ONLY THE SELF NOTE, AND THAT IS THE FIX, NOT A WEAKENING.
+    # As shipped, A wrote TWO notes -- self, then root, back to back -- and
+    # expected the SELF one. find_wake_file() sorts NEWEST MTIME FIRST
+    # (agent-7's rule, and D pins it), so the root note, written second, is
+    # newer and wins. A passed only when both writes landed in the same clock
+    # tick, because Python's sort is stable and insertion order then decided.
+    # MEASURED: 400 back-to-back write pairs -> 391 tie, **9 root-newer, 0
+    # self-newer**. There is no configuration in which A's expectation is what
+    # the code does; the filesystem race was the only thing making it look
+    # green, about 1 run in 40.
+    #
+    # So A was not a flaky probe of the rule. It asserted the OPPOSITE of the
+    # rule that D pins on purpose, and it duplicated D's setup to do it. A now
+    # tests exactly one thing -- that read_wake_prompt() returns the SELF_DIR
+    # note verbatim -- and D remains the only arm that owns "both present".
+    # This settles NO question of intent: if "SELF_DIR wins REGARDLESS of
+    # time" were the intended rule, D would be wrong too, and that is a
+    # design decision for whoever owns find_wake_file().
     sb = Sandbox()
     sb.apply(mod)
     try:
         sb.write("self", "  NOTE-AT-SELF  \n")
-        sb.write("root", "NOTE-AT-ROOT")
         got = mod.read_wake_prompt()
         results.append(check("A  SELF_DIR note returned verbatim",
                              got == "NOTE-AT-SELF", repr(got)))
@@ -129,6 +147,13 @@ def run_arms(mod):
         # The rule is newest-mtime, not path order: agent-7's box had the
         # durable copy be the stale one, and path order would have reverted
         # them by a life.
+        #
+        # D CREATES ITS OWN ROOT NOTE. It used to inherit the one A wrote,
+        # which made D's setup an accident of A's -- and when A was corrected
+        # to write only the SELF note, D crashed on a missing file. An arm
+        # that depends on another arm's fixture fails for the other arm's
+        # reasons.
+        sb.write("root", "NOTE-AT-ROOT")
         old = os.path.getmtime(os.path.join(sb.art_root, "wake.md"))
         os.utime(os.path.join(sb.self_dir, "wake.md"), (old + 60, old + 60))
         path, rejected = mod.find_wake_file()
