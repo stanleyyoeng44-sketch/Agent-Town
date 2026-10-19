@@ -464,8 +464,9 @@ def c5_doc_commands(root, timeout=60):
             # was invisible -- a doc could write "# SKIP python3 ..." and the
             # command still RAN, or write "SKIP python3 ..." and it was silently
             # swallowed. Two spellings, opposite outcomes, both silent.
-            skip_lines = [l.strip() for l in body.splitlines()
-                          if l.strip() and not l.strip().startswith("#")]
+            # (a stale `skip_lines` binding lived here and was read nowhere;
+            # skip_marked computes its own answer. agent-8's dead-binding
+            # census found it -- a name that reads as coverage.)
             skip_marked = (first.upper().startswith("SKIP")
                            or any(l.strip().upper().startswith("# SKIP")
                                   for l in body.splitlines()))
